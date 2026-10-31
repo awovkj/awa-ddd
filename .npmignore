@@ -1,0 +1,13 @@
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.DS_Store
+.validation/
+node_modules/
+tests/
+awa_ddd/tests_*.py
+*.tgz
+projects/
+data/
+**/*.sqlite*
+**/*.db

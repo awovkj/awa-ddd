@@ -1,0 +1,32 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Synthetic discovery example", "version": "1.0.0"},
+  "servers": [{"url": "/api"}],
+  "paths": {
+    "/orders": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["amount", "ownerId", "items"],
+                "properties": {
+                  "amount": {"type": "number"},
+                  "ownerId": {"type": "string"},
+                  "items": {"type": "array", "items": {"$ref": "#/components/schemas/Item"}}
+                }
+              }
+            }
+          }
+        },
+        "responses": {"201": {"description": "Synthetic declaration only"}}
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Item": {"type": "object", "required": ["sku"], "properties": {"sku": {"type": "string"}}}
+    }
+  }
+}

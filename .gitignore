@@ -1,0 +1,12 @@
+node_modules/
+.validation/
+__pycache__/
+*.py[cod]
+*.tgz
+*.egg-info/
+build/
+dist/
+.venv/
+projects/
+*.sqlite*
+*.db
