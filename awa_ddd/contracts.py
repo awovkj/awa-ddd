@@ -23,8 +23,11 @@ MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100000
 
 
-def _entry(required=(), fields=None, notes=(), example=None):
-    return {"required": list(required), "fields": fields or {}, "notes": list(notes), "example": example}
+def _entry(required=(), fields=None, notes=(), example=None, output=None):
+    entry = {"required": list(required), "fields": fields or {}, "notes": list(notes), "example": example}
+    if output is not None:
+        entry["output"] = output
+    return entry
 
 
 PAGINATION = {"offset": "nonnegative integer; default 0", "limit": "integer 1..100; default 25"}
@@ -45,6 +48,31 @@ TSCANPLUS_READ_FIELDS = {
     "scanner_project": "omit to use recorded nondefault namespace, or supply the exact recorded namespace; at most 20 normalized characters; old longer bindings require an explicit short-name re-probe before any network request",
     "timeout": "5..120 seconds; default 30; one overall MCP deadline",
 }
+BROWSER_TESTING_OUTPUT = {
+    "requirement": "required | assisted | not_needed; assisted is mandatory when browser use materially helps",
+    "must_call_playwright": "true for both required and assisted; not an optional recommendation",
+    "call_needed": "whether fresh runtime work remains; not permission to skip controls or blocked prerequisites",
+    "invoke_now": "whether this stage should invoke Playwright now; capture_controls/prepare/blocked may still have call_needed true",
+    "stage": "not_needed | prepare | capture_controls | identify_consumer | browser_runtime | browser_assist | observe_page | interact_function | review_existing | blocked; offline stage, not vulnerability proof",
+    "preferred_provider": "host_playwright_mcp when testing is needed, otherwise null; discover actual host tools before selecting navigation/interaction capabilities",
+    "native_fallback": ["browser.probe", "browser.visit"],
+    "unsupported_by_native": "returned provider capability limits; never bypass guards or interpret local probe failure as host MCP unavailability",
+}
+BROWSER_TESTING_SUMMARY_OUTPUT = {
+    "required_total": "nonnegative full-queue required task count",
+    "assisted_total": "nonnegative full-queue assisted task count; assisted still mandates Playwright",
+    "call_needed_total": "nonnegative task count requiring fresh runtime work",
+    "invoke_now_total": "nonnegative task count whose present stage invokes Playwright",
+    "blocked_total": "nonnegative blocked browser task count",
+    "native_unsupported_total": "nonnegative task count with native provider limitations",
+    "followup_total": "nonnegative full browser-followup task count",
+    "task_total": "nonnegative full queue/followup task count, not completed security coverage",
+}
+BROWSER_TESTING_NOTES = (
+    "Returned browser_testing annotations are offline output only, not writable action arguments, target authorization, tool execution or a new oracle. required and assisted both mandate actual Playwright use for needed runtime work; call_needed and invoke_now are separate. capture_controls/prepare/identify_consumer precede invocation, blocked prerequisites cannot be bypassed, and qualified existing material enters review_existing offline without replay.",
+    "Required browser context includes XSS/DOM, client routes/state, CSRF/CORS, clickjacking/CSP, cookie SameSite/HttpOnly/Secure, postMessage, OAuth/OIDC and browser-only conclusions. Materially helpful UI/login/dynamic-token/multi-role/upload-preview/business workflows also require Playwright. Pure backend SQL metadata/SSRF/XXE need not be browserized; not_needed has no preferred provider and an empty fallback list, and never declares a whole family N/A.",
+    "Prefer actual host Playwright MCP discovery/navigation/snapshots/necessary interactions and save real outputs with browser.import_mcp. Only native fallback probes locally first; local unavailability does not negate host MCP. Scope, identity, write authorization and test-resource boundaries remain unchanged. Imported MCP observations do not bind session/actor or replace authenticated XSS typed closure.",
+)
 CONTRACTS = {
     "project.create": _entry(("project_id", "target"), {"scope": "array of authorized HTTP(S) URL prefixes; default target", "exclude": "excluded URL prefixes", "allow_mutation": "boolean; default false"}),
     "project.list": _entry(notes=("Local project names only. Does not create or inspect target traffic.",)),
@@ -70,9 +98,16 @@ CONTRACTS = {
     "identity.session": _entry(fields={"actor_id": "required when creating", "session_id": "required for renewal", "headers": "credential header object when creating", "headers_file": "UTF-8 JSON credential file instead of headers", "credential_header_names": "optional explicit registered auth header names; conventional cookie/authorization/x-api-key/x-auth-token/x-session-token by default; declare custom X-Actor etc explicitly", "ttl_seconds": "integer 1..86400; default 7200", "renew": "true keeps credentials/generation/classification; omit headers, headers_file and credential_header_names"}, example={"session_id": "S-example", "renew": True, "ttl_seconds": 7200}),
     "identity.verify": _entry(("operation_id", "session_id", "subject_selector"), {"subject_selector": "JSON Pointer to server subject", "tenant_selector": "required if actor declares tenant_id", "roles_selector": "required for declared roles and all restricted-role authorization comparisons, including a verified empty role set"}, ("Do not invent default tenants or role claims. roles=[] without roles_selector is unknown, not proven role denial.",)),
     "identity.resource": _entry(("operation_id", "owner_actor_id", "external_id", "request_binding"), {"request_binding": "{location:path|query|body,selector}; select one unambiguous value: JSON arrays use /0/field; multipart uses exact field name; repeated query/disposition/field names or broad multipart aliases matching multiple parts are rejected", "external_id": "nonempty exact request value (JSON structure may be represented as a JSON string)", "state": "fixture state metadata", "resource_id": "optional stable ID; binding changes invalidate associated old evidence"}),
-    "browser.probe": _entry(notes=("Local browser/runtime capability check, not a target test.",)),
-    "browser.visit": _entry(("url",), {"session_id": "optional server-verified session", "actions": "bounded click/fill/press/wait/waitForSelector steps", "allow_write": "boolean; writes also require project permission and same origin", "timeout": "1..60 seconds", "html": "optional capture", "screenshot": "optional capture"}, ("Scope/method guards remain active. A real runtime observation is required for XSS execution proof.",)),
-    "browser.import_mcp": _entry(("path",), {"path": "saved actual MCP observation JSON"}, ("Externally imported, not machine-authenticated local browser execution.",)),
+    "browser.probe": _entry(notes=("Only the native fallback checks local browser/runtime capability; this is not a target test or host Playwright MCP availability check. A local failure does not negate an available host MCP provider.",)),
+    "browser.visit": _entry(("url",), {"session_id": "optional server-verified session; local runtime records the verified identity binding", "actions": "bounded click | fill | press | wait | waitForSelector steps only; no upload/evaluate/tab action", "allow_write": "boolean; writes also require project permission and same origin", "timeout": "1..60 seconds", "html": "optional capture", "screenshot": "optional capture"}, (
+        "Native Playwright fallback after browser.probe; prefer actual host Playwright MCP tools when available. Required and assisted browser work both mandate a real Playwright call when needed, not only a probe or static page registration.",
+        "Scope/method guards remain active. Native actions do not expose uploads, arbitrary evaluate, independent multi-context control or download testing; redirects, WebSockets, service workers and cross-origin writes remain blocked. Browser need never expands scope or write authorization. Host tabs are not isolated contexts; unsafe run_code is not a default safe entry.",
+        "XSS runtime must be application-triggered and bound to same-origin normal/attack HTTP controls plus the actual consumer/identity. Manual evaluate(alert(...)) or inserted DOM markers are not application proof; no dialog or a blank/login/unrelated page is not a negative. Non-XSS conclusions still need accepted backend request/state evidence; no new oracle.",
+    )),
+    "browser.import_mcp": _entry(("path",), {"path": "bounded actual saved Playwright MCP observation JSON; fields come from real provider output"}, (
+        "Externally imported, not machine-authenticated local execution or enforced scope. Imports do not bind session_id/actor; adding them to JSON cannot replace authenticated XSS typed closure, which needs the locally recorded verified-session runtime required by that proof.",
+        "Required observation fields: url, finalUrl, status, structural signals, network; optional actions/dialogs/console/source_meta. Imported actions remain click | fill | press | wait | waitForSelector with actual explicit boolean ok. Upload/evaluate/tab output must never be disguised as click or invented interactions; unsupported raw material stays unverified outside that action enum.",
+    )),
     "page.register": _entry(("url",), {"page_id": "optional stable ID", "name": "display name", "source": "source declaration"}),
     "page.adopt": _entry(("page_visit_id",), {"page_visit_id": "saved successful observation ID", "url": "optional single URL from the actual navigation trail"}, ("Offline, transactionally verifies the original visit and marks only actually reached pages; functions and HTTP security tests remain incomplete. Successful local visits are adopted automatically; imported MCP provenance is unchanged.",)),
     "page.function": _entry(("page_id",), {"name": "function name", "function_id": "optional stable ID", "trigger": "declared interaction", "apis": "array of related operation/API references"}),
@@ -85,8 +120,8 @@ CONTRACTS = {
     "candidate.reopen": _entry(("candidate_id", "reason")),
     "plan.build": _entry(fields=PAGINATION, notes=("Builds obligations offline. obligations stays an integer count; obligation_items is the bounded page. Registration is not testing.",)),
     "plan.list": _entry(fields=PAGINATION, notes=("Follow next_offset for all gaps. Metrics come from the same evaluator as report.coverage.",)),
-    "plan.next": _entry(fields={"limit": "integer 1..25; default 10", "offset": "nonnegative queue offset", "include_blocked": "boolean; default false"}, notes=("Prioritized handoff with readiness, missing prerequisites, concrete action templates and evidence IDs. Never starts a request. continuation is independent of this page: ready/review work requires continuing, even when a page or network queue is empty. Render recovery re-reads omitted items before next_offset.",)),
-    "plan.audit": _entry(fields=PAGINATION, notes=("Offline completion audit: unresolved consumers/candidates, observed-but-unassessed work, category matrix and browser-ledger gaps. Partial assessment is explicit; no requests, exclusions, findings or obligation updates are made. continuation distinguishes registered obligation closure from evidence-bound scoped exhaustion; a draft report is not a finish line.",)),
+    "plan.next": _entry(fields={"limit": "integer 1..25; default 10", "offset": "nonnegative queue offset", "include_blocked": "boolean; default false"}, notes=("Prioritized handoff with readiness, missing prerequisites, concrete action templates and evidence IDs. Never starts a request. continuation is independent of this page: ready/review work requires continuing, even when a page or network queue is empty. Render recovery re-reads omitted items before next_offset. Applicable work_items and page/function/orphan review_followups carry browser_testing; the top-level browser_testing_summary counts the full queue and all browser followups independently of pagination, not security coverage.", *BROWSER_TESTING_NOTES), output={"work_items[].browser_testing": BROWSER_TESTING_OUTPUT, "review_followups[].browser_testing": BROWSER_TESTING_OUTPUT, "browser_testing_summary": BROWSER_TESTING_SUMMARY_OUTPUT}),
+    "plan.audit": _entry(fields=PAGINATION, notes=("Offline completion audit: unresolved consumers/candidates, observed-but-unassessed work, category matrix and browser-ledger gaps. Partial assessment is explicit; no requests, exclusions, findings or obligation updates are made. continuation distinguishes registered obligation closure from evidence-bound scoped exhaustion; a draft report is not a finish line. Applicable page/function/orphan checklist rows carry browser_testing.", *BROWSER_TESTING_NOTES), output={"checklist[].browser_testing": BROWSER_TESTING_OUTPUT}),
     "plan.checkpoint": _entry(fields={
         "label": "optional nonempty round label, at most 200 characters",
         "frontier_review": "optional object containing discovery, categories and pages; all declarations need reason and optional evidence_ids/page_visit_ids arrays of actual current observations",
@@ -122,7 +157,7 @@ CONTRACTS = {
         "reviewer": "required in analyst mode", "reason": "required in analyst mode", "evidence_ids": "required array in analyst mode",
         "limitations": "array of strings (not a string)", "proof_decision_id": "SQL metadata/error-channel decision in analyst mode",
         "sql_evidence": "{control_evidence_id,injection_evidence_id,observed_change,input_location,input_selector,response_selector}; same identity, only the registered SQL input changes; response_selector must expose a discriminating finite business count, not a nonce/message/status",
-        "runtime_visit_id": "real browser observation for analyst XSS", "consumer_url": "observed attack consumer page", "runtime_marker": "application-triggered AWA-XSS- marker",
+        "runtime_visit_id": "real application runtime for analyst XSS; authenticated typed closure needs locally recorded verified-session identity binding", "consumer_url": "observed attack consumer page", "runtime_marker": "application-triggered AWA-XSS- marker, never manual evaluate(alert)",
         "obligation_id": "optional in analyst XSS only: current explicit XSS input-test obligation; exactly normal-baseline/attack captures, only selected input differs, actual identity-bound consumer runtime; stays analyst, unsupported attribution remains unbound/partial",
     }, notes=("Unverified scanner output, registration counts and analyst text alone never become machine confirmation. Static or no-dialog browser observations cannot refute an XSS family. Optional analyst XSS binding revalidates controls, exact input, runtime provenance and identity on every coverage query.",)),
     "finding.list": _entry(fields={**PAGINATION, "current": "optional boolean filter", "lifecycle_status": "active | withdrawn | superseded"}),

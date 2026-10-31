@@ -55,19 +55,22 @@ Native errors use the host's own HarnessError. The installed SDK persists name/c
 
 No JavaScript transpilation is required. Node.js 22.19+ and Python 3.10+ are required. The JavaScript AST helper uses the pinned `acorn@8.19.0` dependency; it runs offline after package installation.
 
-```powershell
-npm ci --ignore-scripts
-npm test
-python -X utf8 -B -m unittest discover -s tests -p "test_*.py"
+```sh
+npm ci
+npm run check
+npm run test:python
 npm run pack:check
-npm pack --ignore-scripts
 ```
 
-Install the generated package only in the profile chosen by the user:
+On Windows PowerShell, use `npm.cmd` if the `npm` PowerShell shim is unavailable. Install the archive produced by the successful current check, only in the profile chosen by the user:
 
 ```powershell
-dsh plugin --profile desktop add "D:/path/to/awa-ddd-0.8.0.tgz"
+$package = Get-Content -LiteralPath '.validation/package-check.json' -Raw | ConvertFrom-Json
+if ($package.result -ne 'passed') { throw 'The current package check did not pass.' }
+dsh plugin --profile desktop add "$($package.archive_path)"
 ```
+
+Use the actual `archive_path` and verify `archive_sha256`; the filename comes from the current package version, not a private timestamp directory. A fresh clone does not contain old `.validation` artifacts or local release archives. Their absence is expected, not a missing runtime dependency. Old local backup/validation copies have been cleared; rerun the commands to obtain current results. Replace `desktop` with the profile explicitly chosen by the user when appropriate.
 
 Then activate/configure its bundle through the host's profile/plugin management. The packaged bundle patch makes the native plugin row available; adding a dependency and activating a composition are distinct host operations. For an explicit composed row, use:
 
@@ -82,8 +85,8 @@ Then activate/configure its bundle through the host's profile/plugin management.
 
 Development tests exercise actual SDK definition/schema compilation, grouped action routing, stdin/stdout protocol boundaries, real child-process cancellation and timeouts, input-pipe failures, and credential removal. An input-pipe failure terminates the owned process even if it remains alive after closing stdin.
 
-`npm run pack:check` creates an archive with an isolated local npm cache, checks its contents, safely extracts it, and loads the extracted native entry. It invokes the packaged Python engine to create a temporary SQLite assessment, import local OpenAPI and JavaScript documents (including the packaged AST/acorn helper), register an actor/session, compare plan and coverage output, and export a report with verified digests. It additionally verifies help/catalog equality, local runtime metadata, paged inventory/readiness, offline preflight with no run claims, and the extracted UTF-8 input/result CLI. No target requests are sent. SDK dependencies resolve from the installed development dependencies; this check does not install dependencies from the registry or launch the desktop host. Set `AWA_DDD_PYTHON` to select a different Python executable for this check. Temporary state is removed after the check; the verified archive is retained at `.validation/awa-ddd-0.8.0.tgz`, and `.validation/package-check.json` records its path, digest and validated behavior. A failed check overwrites the result status so an earlier success cannot be mistaken for the current result.
+`npm run pack:check` automatically creates ignored `.validation` scratch space and an archive with an isolated local npm cache, checks its contents, safely extracts it, and loads the extracted native entry. It invokes the packaged Python engine to create a temporary SQLite assessment, import local OpenAPI and JavaScript documents (including the packaged AST/acorn helper), register an actor/session, compare plan and coverage output, and export a report with verified digests. It additionally verifies help/catalog equality, local runtime metadata, paged inventory/readiness, offline preflight with no run claims, and the extracted UTF-8 input/result CLI. No target requests are sent. SDK dependencies resolve from the development dependencies installed by `npm ci`; this check does not install dependencies from the registry or launch the desktop host. Set `AWA_DDD_PYTHON` to select a different Python executable for this check. Temporary state is removed after the check; a successful run retains its newly generated archive and writes `.validation/package-check.json` with `archive_path`, `archive_sha256` and validated behavior. A failed check overwrites the result status so an earlier success cannot be mistaken for the current result.
 
-The current retained archive is `.validation/awa-ddd-0.8.0.tgz`; earlier filenames in the original smoke-test discussion are historical. Package smoke also requires the shipped help/workflow/WSL modules and UTF-8 file CLI, and exercises plan.build/preflight without network requests. WSL live validation is separate and only runs trusted local version fixtures, not historical targets.
+Generated scratch data, logs and archives are not GitHub source files or prerequisites for another checkout. Cleanup can remove them; the next check rebuilds them from source. For a manual `npm pack`, use a fresh ignored `dist` or temporary output directory after validation, rather than treating an old local tarball as the current release. Package smoke also requires the shipped help/workflow/WSL modules and UTF-8 file CLI, and exercises plan.build/preflight without network requests. WSL live validation is separate and only runs trusted local version fixtures, not historical targets.
 
 These checks do not claim that the user's live desktop profile has been changed or that external targets have been tested.

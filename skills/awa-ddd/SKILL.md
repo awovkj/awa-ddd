@@ -19,7 +19,7 @@ surface.import / surface.register 登记操作、真实输入位置和来源。�
 
 plan.next 公平交错不同任务类别，并查看 review_followups，不能让大量 baseline 淹没输入追踪。plan.audit 的 checklist 区分未归档候选、有效观察、人工发现、页面访问与运行状态；跟随 next_offset 查看完整清单。安全专项矩阵排除正常基线，登记/观察/求值/专项闭环不是漏洞召回率。同角色同租户与跨租户必须分别测试，代表样本和超预算上下文保留限制。
 
-actor、session、测试 resource 分别登记；同角色账号用独立 session generation。HTTP/浏览器认证必须引用服务端核验的会话，凭据留在项目隔离目录。长任务在 TTL 到期前用 `identity.session renew:true` 续期：保留同一 session_id、generation、headers 和身份核验，已有证据不会失效；换凭据才创建新会话并重新 `identity.verify`。captcha/SMS/cart 等绑定匿名 Cookie 的 public 流程用 `http.capture` 的 `anonymous_cookie` 取证，不要退回 curl。
+actor、session、测试 resource 分别登记；同角色账号用独立 session generation。HTTP/本地浏览器认证必须引用服务端核验的会话，凭据留在项目隔离目录；外部 Playwright MCP 观察不自动绑定该 session/actor，不能补造绑定或替代 authenticated XSS typed closure。长任务在 TTL 到期前用 `identity.session renew:true` 续期：保留同一 session_id、generation、headers 和身份核验，已有证据不会失效；换凭据才创建新会话并重新 `identity.verify`。captcha/SMS/cart 等绑定匿名 Cookie 的 public 流程用 `http.capture` 的 `anonymous_cookie` 取证，不要退回 curl。
 
 一个已核验 session 只用于其 identity endpoint 同 origin（含 scheme/port）；多域 scope 不等于可以跨域发送凭据，另一 origin 建立单独会话。
 
@@ -29,9 +29,19 @@ actor、session、测试 resource 分别登记；同角色账号用独立 sessio
 
 中文/复杂 XML/multipart 优先 body_file 原字节（普通文件、最多 1 MiB）或 body_base64，不用多层 PowerShell 字符串插值。PowerShell 5.1 不用 `>` 保存协议结果，helper 的 `-OutputFile` 直接写 UTF-8 新文件；文件式 helper 和可选 WSL 后端见 docs/WINDOWS_WSL.md。runtime.probe 先查本地实际能力；本机 Kali 无 Node/Yak，不冒充浏览器/MCP 可用；nmap/nuclei 目录存在不等于有执行适配。WSL 不重写 localhost、不共享并发 SQLite，不自动绕范围。
 
+## Playwright 必调策略
+
+对于必须借助浏览器验证，或者浏览器会明显有利于测试的漏洞，都必须实际调用 Playwright，不只是提出建议。XSS/DOM、客户端路由/状态、浏览器专属结论、CSRF/CORS、点击劫持/CSP、Cookie SameSite/HttpOnly/Secure、postMessage、OAuth/OIDC 需要真实浏览器；复杂UI、登录/动态token、多角色页面、上传预览消费、业务链有明显收益时也必须使用。纯后端 SQL 元数据/SSRF/XXE 等不盲目浏览器化，不把 not_needed 解释为整个漏洞族 N/A。
+
+读取 plan.next 的 work_items、页面/功能/orphan review_followups 和 plan.audit 对应 checklist 上的 browser_testing。requirement 为 required 或 assisted 都有 must_call_playwright:true，assisted 不是可选建议。call_needed 表示仍需新运行时观察；invoke_now 决定是否本阶段调用。capture_controls/prepare/identify_consumer 先准备正常/攻击 HTTP 控制及实际消费链，blocked 不绕过前提，review_existing 离线复核已有合格材料，不重复 visit 或重放写入凑调用数。plan.next 顶层 browser_testing_summary 是全队列/全部浏览器跟进的固定任务计数，不是安全覆盖；字段是输出指引，不能作为 action 参数改变策略。
+
+优先实际宿主 Playwright MCP：先发现真实可用的工具，再导航/快照、必要 click/fill、网络与运行时观察，保存真实输出后 browser.import_mcp。仅 native 回退路线先 browser.probe 再 browser.visit；本地不可用不能否定宿主 MCP。缺范围、消费页、身份、真正隔离 context 或提供方能力时保留 BLOCKED，不能用 raw HTTP/curl、静态HTML、无关页面或伪造导入替代。
+
+scope、身份、写授权和测试资源限制不放宽。native 不提供上传、任意 evaluate、独立多 context 或下载测试，30x/跨源写/WS/SW 仍阻断；真实 Cookie SameSite/HttpOnly/Secure 不能靠注入 Cookie header 证明。宿主 tabs 不是隔离 context，unsafe run_code 不是默认安全入口。上传/evaluate/tab 输出不得伪装 click 填入旧 action enum，不宣称新增 oracle。细则见 docs/PLAYWRIGHT_TESTING.md。
+
 ## 主动使用 MCP 和外部工具
 
-对于 Web 探索，优先当前宿主实际提供的 Playwright MCP：授权页面导航、快照、必要交互、网络及运行时观察。保存真实输出后用 browser.import_mcp 留证；格式见随包 docs/SQL_METADATA_AND_MCP.md。页面登记或空白页检查不等于探索完成。源码/报告维护或用户要求不测试时，遵守该限制。
+对于 Web 探索和上述必需/有益测试，实际调用当前宿主提供的 Playwright MCP：授权页面导航、快照、必要交互、网络及运行时观察。保存真实输出后用 browser.import_mcp 留证；格式见随包 docs/SQL_METADATA_AND_MCP.md，并保留 imported_mcp 不绑定身份的边界。页面登记或空白页检查不等于探索完成。源码/报告维护或用户要求不测试时，遵守该限制，不自动访问历史目标。
 
 awa_browser 的 browser.visit 是可用的本地隔离 Playwright 路径，逐请求执行范围与方法保护。写请求默认阻断；项目 `project.update allow_mutation:true` 后可整体允许，或用 `allow_write:false` 让单次访问保持只读，且只允许访问目标同源的写请求。受阻断的重定向/写流程明确保留 BLOCKED。SPA 登录后通过成功 action 到达的页面算该次访问的 navigation trail，可直接用于 `page.mark`，不再因为 finalUrl 是登录页而系统性误伤；MCP 导入保持 imported_mcp 来源，不冒充机器认证的本地观察。
 
@@ -86,6 +96,8 @@ page.register 只登记页面；page.mark 的 visited/triggered 必须引用真�
 成功本地 browser.visit 自动核验并采纳实际导航页面，但不推断功能已触发。历史/导入观察可用 page.adopt page_visit_id 离线归档；MCP 来源保持 imported，不替代 HTTP 或运行时漏洞证明。
 
 人工 XSS 确认必须提供 runtime_visit_id、consumer_url、runtime_marker。标记用 AWA-XSS- 加 16–64 位随机十六进制串，必须出现在原始应用触发的浏览器 dialog，并绑定同源攻击捕获。静态 innerHTML 和服务端原样存储仍是候选，禁止在浏览器中人工设置标记冒充应用执行。
+
+人工 evaluate(alert) 只能说明手工脚本运行，不能证明应用执行了攻击输入；XSS 仍需真实正常/攻击 HTTP 控制、实际消费页与身份绑定。MCP 导入不绑定 session/actor，不能替代 authenticated XSS typed closure，本地 verified session 运行时对应该证明。非 XSS 的浏览器观察辅助发现和消费链理解，安全结论仍需已有契约允许的后端请求/状态证据；浏览器调用成功不自动关闭义务。
 
 XSS 的无弹窗观察也需要实际消费链：绑定的输入到达真实消费页，完成成功的应用交互，证明观察器对当前假设有敏感性，并保留路由、身份和上下文边界。空白/登录/无关页面没有 dialog、未成功触发功能或简单 HTTP 响应相同都不能否定 XSS；静态/HTTP 阴性不能关闭运行时 XSS 义务，按 action.help 查询可接受证据，缺有效证明保持 open/blocked。人工确认可显式传适用的 obligation_id，但必须通过真实基线/攻击和身份绑定运行时门禁，不能靠标签关联关闭。
 

@@ -302,8 +302,8 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
                        analyst_binding_supported=True, proof_channels=["analyst_runtime"],
                        hypothesis_note_zh="XSS 可用绑定本义务的人工运行时证明闭环：正常与攻击输入对照、实际消费页面、真实交互及同身份浏览器信号。静态反射、存储或无弹窗访问不能否定整类 XSS。")
             if not row["missing_prerequisites"]:
-                row.update(queue_status="review", suggested_action="browser.visit",
-                           help_input={"name": "browser.visit"})
+                row.update(queue_status="review", suggested_action="http.preflight",
+                           help_input={"name": "http.preflight"})
         if family in {"command_injection", "template_injection", "deserialization", "file_upload"}:
             row["positive_machine_adapter"] = False
             row["hypothesis_note_zh"] += " 当前没有通用正向机器确认适配器，有限否定或人工复核不能冒充全面完成。"
@@ -382,13 +382,37 @@ def queue_inventory(project, evaluated, inventory=None):
         observations = {}
         for item in inventory["observations"]:
             observations.setdefault(item["operation_id"], []).append(item)
+    from .browser_policy import Context, for_work_item
+    browser_context = Context(project)
     sessions_by_operation, rows = {}, []
     for gap in evaluated["gaps"]:
         operation_id = gap["operation_id"]
         if operation_id not in sessions_by_operation:
             sessions_by_operation[operation_id] = _operation_sessions(project, operations[operation_id], live)
         compatible, foreign = sessions_by_operation[operation_id]
-        rows.append(_work_item(project, gap, operations, compatible, observations, foreign))
+        row = _work_item(project, gap, operations, compatible, observations, foreign)
+        evidence_ids = set(row.get("evidence_ids", []))
+        evidence = [item for item in observations.get(operation_id, []) if item["id"] in evidence_ids]
+        policy = row["browser_testing"] = for_work_item(browser_context, operations[operation_id], gap, row, evidence)
+        family = row.get("hypothesis_family") or gap.get("test_family")
+        if policy["stage"] == "review_existing" and family == "xss":
+            refs = policy["existing_observation"]
+            row.update(queue_status="review", suggested_action="finding.record", help_input={"name": "finding.record"},
+                       input_template={"mode": "analyst", "obligation_id": gap["id"],
+                           "evidence_ids": [refs["baseline_evidence_id"], refs["attack_evidence_id"]],
+                           "runtime_visit_id": refs["runtime_visit_id"]})
+            row["required_experiment_fields"] += ["consumer_url", "runtime_marker", "analyst reviewer/reason and supported impact"]
+        elif policy["must_call_playwright"] and policy["stage"] in {"identify_consumer", "browser_runtime", "browser_assist"}:
+            row["queue_status"] = "review"
+            if policy["native_supported"]:
+                row.update(suggested_action="browser.visit", help_input={"name": "browser.visit"},
+                           input_template=dict(policy.get("native_visit_input", {})))
+            else:
+                row.update(suggested_action="action.help", help_input={"name": "browser.import_mcp"},
+                           input_template={"name": "browser.import_mcp"})
+            row["required_experiment_fields"] += policy["required_input_fields"]
+            row["browser_handoff_note"] = "Use actual host Playwright tools first; this template is a bounded native fallback, not authorization. Fill the missing exact URL/interaction inputs before invocation."
+        rows.append(row)
     return rows
 
 
@@ -406,6 +430,11 @@ def next_work(project, args):
         selected += blocked
     from .completeness import followups
     closure = followups(project, evaluated, min(limit, 10))
+    from .browser_policy import summarize
+    browser_summary = summarize([row["browser_testing"] for row in rows])
+    followup_summary = closure.pop("browser_followup_summary")
+    for key, count in followup_summary.items():
+        browser_summary[key] += count
     return {"continuation": evaluated["continuation"],
             "work_items": selected[offset:offset + limit], "queue_total": len(selected),
             "ready_total": counts["ready"], "review_total": counts["review"], "blocked_total": counts["blocked"],
@@ -414,6 +443,7 @@ def next_work(project, args):
             "requests_sent": 0, "coverage_ratio": evaluated["coverage_ratio"],
             "security_coverage": evaluated["security_coverage"], "completion": evaluated["completion"],
             "queue_policy": "family_round_robin", "closure_action": "plan.audit",
+            "browser_testing_summary": browser_summary,
             "limitation": "Readiness is not approval, execution, or completed coverage. Fill the exact experiment fields and preflight every request; imported tool output remains untrusted."}
 
 

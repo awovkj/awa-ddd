@@ -202,13 +202,15 @@ def _inventory(project, evaluated):
              or run.get("diagnostic") == "timeout" or run.get("injection_signal") or run.get("metadata_candidates"))]
     partial_tools.extend(run for run in project.list("run") if run.get("adapter") == "tscanplus"
         and run.get("status") not in {"running", "interrupted"} and _tscanplus_incomplete(run))
+    config = project.config
     inventory = {"operations": operations, "obligations": obligations, "gaps": gaps, "decisions": decisions,
             "valid_decisions": valid_decisions, "current_findings": current_findings,
             "observations": current_observations, "unassessed": unassessed,
             "unlinked_analyst": unlinked_analyst, "unrecorded": unrecorded,
             "candidates": unresolved_candidates, "proof_resolved_candidates": proof_resolved_candidates,
             "page_coverage": page_coverage, "orphan_visits": orphan_visits, "pending_runs": pending_runs,
-            "partial_tools": partial_tools}
+            "partial_tools": partial_tools,
+            "browser_scope_config": {"scope": config.get("scope", []), "exclude": config.get("exclude", [])}}
     from .continuation import apply_reviews
     return apply_reviews(project, inventory)
 
@@ -312,6 +314,7 @@ def _review_id(kind, identity):
 
 
 def _checklist(inventory):
+    from .browser_policy import for_page
     rows = []
     labels = {"baseline": "补齐正常业务基线", "input_review": "追踪真实输入消费点", "input_test": "完成具体输入安全假设",
               "access": "验证身份或角色访问边界", "ownership": "验证资源所有权与租户边界",
@@ -354,6 +357,9 @@ def _checklist(inventory):
                 else:
                     row.update(status="blocked", action="plan.audit", suggested_action="plan.audit",
                                reason_code=item.get("review_reason_code"), reason_zh="已有浏览器观察失败、受阻或摘要/血缘失效，不能收编为成功页面覆盖。")
+                row["browser_testing"] = for_page(item["url"], blocked=not item.get("adopt_ready"),
+                                                   existing_visit_id=item["id"] if item.get("adopt_ready") else None,
+                                                   config=inventory["browser_scope_config"])
             if kind == "unassessed_observation" and item.get("review_source_invalid"):
                 row.update(status="blocked", reason_code=item.get("review_reason_code"),
                            reason_zh="曾归档的 HTTP 来源或血缘失效，必须修复或保留明确受阻，不能从闭环台账中消失。")
@@ -377,6 +383,19 @@ def _checklist(inventory):
                    "label_zh": label, "reason_zh": "需要真实成功观察，登记或阻塞状态不会满足页面/功能覆盖。", "action": action, "page_id": item["page_id"]}
             if item.get("function_id"):
                 row["function_id"] = item["function_id"]
+            existing = next((visit["id"] for visit in reversed(inventory["orphan_visits"]) if visit.get("adopt_ready")
+                             and any(entry.get("url") == item["url"] for entry in visit.get("navigation_trail", []))), None)
+            blocked = row["status"] == "blocked" or item.get("reason") == "out_of_scope"
+            policy = row["browser_testing"] = for_page(item["url"], function=kind == "untriggered_function",
+                                                       blocked=blocked, existing_visit_id=existing,
+                                                       config=inventory["browser_scope_config"])
+            if policy["stage"] == "review_existing":
+                row.update(action="page.adopt", suggested_action="page.adopt", input_template={"page_visit_id": existing})
+            elif not policy["execution_blocked"]:
+                row.update(action="browser.visit", suggested_action="browser.visit", input_template=dict(policy["native_visit_input"]))
+                row["required_experiment_fields"] = policy["required_input_fields"]
+            else:
+                row["status"] = "blocked"
             rows.append(row)
     for row in rows:
         review = inventory.get("blocked_reviews", {}).get(row["id"])
@@ -384,6 +403,8 @@ def _checklist(inventory):
             row.update(status="blocked", review_id=review["id"], reason_zh=review["reason"],
                        action="plan.review", suggested_action="plan.review",
                        input_template={"checklist_id": row["id"], "status": "reopen"})
+            if "browser_testing" in row:
+                row["browser_testing"].update(stage="blocked", invoke_now=False, execution_blocked=True)
     return sorted(rows, key=lambda row: (row["kind"] == "obligation", row["kind"], row["id"]))
 
 
@@ -465,6 +486,7 @@ def audit(project, args):
 
 def followups(project, evaluated, limit=5):
     from .reporting import safe_metadata
+    from .browser_policy import summarize
 
     rows = [row for row in _checklist(_inventory(project, evaluated)) if row["kind"] != "obligation"]
     lanes = {}
@@ -475,5 +497,7 @@ def followups(project, evaluated, limit=5):
         for lane in lanes.values():
             if lane and len(sample) < limit:
                 sample.append(lane.popleft())
+    policies = [row["browser_testing"] for row in rows if "browser_testing" in row]
     return {"review_followups": safe_metadata(sample), "review_followup_total": len(rows),
+            "browser_followup_summary": summarize(policies, followup_total=len(policies)),
             "review_followup_action": "plan.audit"}

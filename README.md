@@ -17,7 +17,7 @@ awa-ddd 0.8.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 | 项目与发现 | 多源离线 OpenAPI/JS AST/HAR/ARTEX/SARIF 导入、精确输入、来源和 candidate 生命周期 |
 | 身份与资源 | 服务端主体/角色核验、同 origin 会话、凭据头分类与 actor/fixture 快照、唯一资源绑定；同角色跨租户不被去重，采样范围和预算公开 |
 | 执行与恢复 | 共用 preflight 门禁；JSON 字段名/Pointer/数组、唯一 form/multipart/Cookie 输入对照；原字节 `body_file`、持久 checkpoint 和失败 run_id；真实 scenario 的读/写/读 `state_transition`；不自动重放 |
-| 浏览器 | 隔离 Playwright、逐请求保护与 SPA trail；成功本地观察自动采纳实际页面，`page.adopt` 可离线归档旧观察；功能仍需真实交互，MCP 来源不变 |
+| 浏览器 | 浏览器必需 / 明显有益的测试都要求调用 Playwright；离线 `browser_testing` 区分控制准备、运行时与已有材料复核；优先实际宿主 MCP、保留 native 回退与身份/来源边界 |
 | Yakit MCP | 真实 stdio MCP 握手、tools/list 与受控 HTTP 单包重放；保存目录、交换、执行结果、传输告警及摘要 |
 | TscanPlus MCP | loopback Streamable HTTP 握手和目录；受控 GET/HEAD/fixture POST 单包、已有项目结果与只读 route 建议入未验证候选、脱敏项目计数；兼容 3.5.4 结果数组，截断和远端未决保留 partial |
 | sqlmap | GET query 与受控 POST JSON/form 单参数，POST 必须写授权与精确可回退 fixture；方法/头/原字节/身份/资源 V2 血缘；元信息-only，partial/signal 留为未验证候选 |
@@ -53,6 +53,18 @@ awa-ddd 0.8.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 `project.status` 默认最多 10 条各类实体与 5 个 gap 示例；`plan.list/report.coverage/finding.list` 默认 25 条、最多 100 条。模型展示限制为 24 KiB；出现 `render_recovery` 时先用更小 limit 重读当前 offset，并保留原过滤条件，再跟随正式 `next_offset`，不能跳过省略的条目。`plan.build.obligations` 是整数，`obligation_items` 才是分页明细。
 
 闭环为 `plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint → 再读 continuation`。`continue_required:true` 不因空页、已有漏洞、请求数或报告生成而变成完成。`completed/blocked` 收尾需要两轮同快照的发现、12 族适用性、页面边界复核和零可推进项；复核是有来源的范围声明，不是两次独立实验。用户暂停、实际预算或授权限制只能作明确的部分退出，调用方不得编造原因；引擎不认证宿主事件，也不能阻止模型自由文本结束会话。
+
+## Playwright 测试策略
+
+需要浏览器验证，或浏览器会明显有利于测试的漏洞，**都必须实际调用 Playwright**。XSS/DOM、客户端路由/状态、CSRF/CORS、点击劫持/CSP、Cookie SameSite/HttpOnly/Secure、postMessage、OAuth/OIDC 等浏览器上下文结论属于必需；复杂 UI、登录/动态 token、多角色页面、上传预览/消费和业务链有明显收益时也必须使用。纯后端 SQL 元数据、SSRF、XXE 等不盲目浏览器化，也不因此将整个漏洞族标 N/A。
+
+`plan.next.work_items` 及页面/功能复核项携带离线 `browser_testing`：`requirement:required|assisted|not_needed`，其中 required 和 assisted 都有 `must_call_playwright:true`；assisted 不是可选建议。`call_needed` 表示仍需新运行时观察，`invoke_now` 指示是否本阶段调用；先准备 HTTP 控制和消费链，缺前提保留 blocked，已有合格材料以 review_existing 离线复核，不重放写入凑调用数。顶层 `browser_testing_summary` 保留全队列和全部浏览器跟进任务的计数，不依赖页面大小，也不是安全覆盖率。投影不自动执行工具、不改变授权或新增 oracle。
+
+每次交接重新核对当前 scope/exclude；曾登记或访问的 operation/page/function 不因此继续获准访问。全部关联消费页显式 BLOCKED 时不会自动重开，有合法且非 blocked 的备选才优先使用。GET 型 XSS 和任何带 query 的消费 URL 只公开 `consumer_locator`，不把 `safe_url` 当成可执行输入；须填入精确绑定 URL，之前 `native_visit_input` 不含 url、`invoke_now:false` 且 `native_input_requires_binding:true`。
+
+先发现并调用**实际宿主 Playwright MCP 工具**，执行授权页面导航/快照、必要 click/fill、网络和运行时观察，保存真实输出后 `browser.import_mcp`。仅在 native 回退路线先 `browser.probe` 再 `browser.visit`；本地 Chromium 不可用不代表宿主 MCP 不可用。MCP 导入不绑定 session/actor，不能替代 authenticated XSS typed closure；该证明仍需本地已核验会话绑定的运行时和正常/攻击 HTTP 控制。人工 evaluate(alert)、无 dialog、静态 HTML 或浏览器调用成功本身都不是漏洞证明。
+
+native 不提供上传、任意 evaluate、独立多 context 或下载测试，30x/跨源写/WS/SW 仍阻断；宿主 tabs 不等于隔离 context，unsafe run_code 不是默认安全入口。上传/evaluate/tab 输出不得伪装成 click 导入旧 action enum。范围、身份、写授权和测试资源限制不放宽；具体策略、提供方限制与证据工作流见 [PLAYWRIGHT_TESTING.md](docs/PLAYWRIGHT_TESTING.md)。
 
 ## 中文可复现报告
 
@@ -135,15 +147,28 @@ WSL 不自动把 Windows `127.0.0.1` 改成网关，不能据此绕开 scope；W
 
 ## 构建与升级
 
-从完整源码生成发行包：
+GitHub 仓库保存源码、测试、依赖锁文件和文档，不附带本机备份、验证日志或旧安装包。克隆/检出后，在项目根目录安装锁定依赖并重新验证、打包：
 
-```powershell
-npm.cmd pack --ignore-scripts --pack-destination .validation
+```sh
+npm ci
+npm run check
+npm run test:python
+npm run pack:check
 ```
 
-续接升级的历史发行包为 `.validation/awa-ddd-0.8.0.tgz`，历史源码备份及摘要保持不变。2026-10-31 的 TscanPlus 补齐包另存于 `.validation/tscanplus-completion-20261031-155601-616175/release/awa-ddd-0.8.0.tgz`；版本号仍为 0.8.0，安装时应使用这个新包的完整路径并重载，不要误用旧包。补齐前源码和 SHA-256 清单、隔离打包摘要与本机 fixture 验收材料均保存在 `.validation/tscanplus-completion-20261031-155601-616175/`。不自动改写桌面宿主配置或存量评估库，安装新包并重载后才读取新增动作。
+Windows PowerShell 可将 `npm` 换为 `npm.cmd`。`pack:check` 会自动创建已忽略的 `.validation` 临时目录，解包并检查当前源码生成的发行包；完成后生成 `.validation/package-check.json`。确认该记录的 `result` 为 `passed`，再从 `archive_path` 取得实际安装包路径，并核对 `archive_sha256`。不要猜时间戳目录或仅凭版本号选择旧包。
 
-验证命令：`npm.cmd run check`、`npm.cmd run test:python`、`npm.cmd run pack:check`。旧版 WSL 中文/emoji、版本调用及进程取消验证继续保留，本轮不冒称重新验证未执行能力。历史对话、数据库和报告只读分析；回归使用 mock、新建本地 fixture 或隔离历史副本，不访问历史目标，也不把版本检查描述成漏洞验证。
+安装时使用本次生成的包，在用户选择的 dsh profile 中安装并重载；不自动改写桌面配置或存量评估库。Playwright/TscanPlus 功能和当前 60 个动作不变。旧本地备份、验收 fixture、日志和 tarball 已清理；它们不属于 fresh clone 的运行/验证依赖，历史验收说明也不等于当前检查通过。
+
+需要手工 `npm pack` 时先完成上述验证，再把输出放入已忽略的 `dist` 新目录：
+
+```powershell
+$releaseDir = Join-Path 'dist' ('manual-release-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+New-Item -ItemType Directory -Path $releaseDir -ErrorAction Stop | Out-Null
+npm.cmd pack --ignore-scripts --pack-destination $releaseDir
+```
+
+当前结果以重跑检查及新生成的记录为准。回归使用 mock、新建本地 fixture 或明确的本机运行时条件，不访问历史目标，也不把版本检查、历史验收或成功打包描述成漏洞验证。实际浏览器/扫描器能力仍按当前安装和授权边界核对，详见 [Playwright 策略](docs/PLAYWRIGHT_TESTING.md)、[TscanPlus 适配](docs/TSCANPLUS.md) 与 [Windows/WSL](docs/WINDOWS_WSL.md)。
 
 ## 当前范围
 

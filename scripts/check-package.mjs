@@ -29,15 +29,17 @@ try {
     'src/parse-js.mjs', 'src/mode.mjs', 'src/client.js',
     'scripts/invoke-request.mjs', 'scripts/Invoke-AwaDdd.ps1', 'skills/awa-ddd/SKILL.md',
     'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/REPRODUCTION.md',
-    'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md',
+    'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md', 'docs/PLAYWRIGHT_TESTING.md',
     ...['__init__', '__main__', 'store', 'engine', 'scope', 'transport', 'assessment', 'scenario',
-      'discovery', 'importers', 'reporting', 'candidates', 'lineage', 'browser', 'external', 'contracts', 'continuation',
+      'discovery', 'importers', 'reporting', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
       'mcp_http', 'tscanplus',
       'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction'].map(module => `awa_ddd/${module}.py`)];
   for (const file of required) assert.ok(files.has(file), `Release is missing ${file}`);
   for (const file of files) {
-    assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|node_modules|__pycache__|projects|tests)(?:\/|$)/);
-    assert.doesNotMatch(file, /(?:\.py[co]|\.sqlite3?(?:-wal|-shm)?|\.db|\.tgz|\.env)$/i);
+    assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|node_modules|__pycache__|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|htmlcov|coverage|projects|tests|backups?)(?:\/|$)/);
+    assert.doesNotMatch(file, /(?:\.py[co]|\.sqlite[^/]*|\.db(?:-wal|-shm|-journal)?|\.tgz|\.log|\.tmp|\.temp|\.bak|\.backup|\.orig|\.rej|~)$/i);
+    const environment = /(?:^|\/)(?:\.env|[^/]+\.env)(?:\.[^/]*)?$/i.test(file);
+    assert.ok(!environment || /\.(?:example|sample|template)$/i.test(file), `Release contains private environment configuration: ${file}`);
   }
 
   // HARD RULE: the archive must never vendor @deepseek-ai/*.
@@ -151,6 +153,8 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(planned.obligation_items.length, 1);
     const ready = await dispatch('awa_plan', 'plan.next');
     assert.equal(ready.requests_sent, 0);
+    assert.equal(typeof ready.browser_testing_summary.task_total, 'number');
+    assert.ok(ready.work_items.every(item => item.browser_testing && typeof item.browser_testing.call_needed === 'boolean'));
     const closure = await dispatch('awa_plan', 'plan.audit', { limit: 1 });
     assert.equal(closure.requests_sent, 0);
     assert.equal(closure.completion.status, 'partial');

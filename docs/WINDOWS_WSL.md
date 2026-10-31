@@ -53,7 +53,7 @@ WSL guardian 先监听无缓冲控制通道，建立本地截止时间，再创�
 - Node 返回 ABORTED/ENGINE_TIMEOUT 不把晚到成功当成功；回归另外检查 Linux engine/tool/grandchild 的已知 PID、start_time、pgid，而非仅检查 wsl.exe 关闭。
 - 杀进程不能回滚已经发送的业务写。中断 run 可能仍为 running/uncertain；先 `project.status`、`run.inspect`，必要时 `run.recover` 标为 interrupted，绝不自动重放。
 
-上一轮实机验证保持 stdin open 测试本地 deadline，并修复 daemon BufferedReader shutdown 的 `_enter_buffered_busy` 崩溃，记录在 `.validation/upgrade-20261029/wsl-live.json`。本次再次验证 Unicode、真实 sqlmap 版本、宿主取消/截止和 guardian 本地截止，分别检查真正 guardian、worker、engine、tool、grandchild 的 PID/start_time/pgid；续接记录位于 `.validation/resume-20261029-214119/`，不覆盖旧材料。
+历史实机验收曾保持 stdin open 测试本地 deadline，并修复 daemon BufferedReader shutdown 的 `_enter_buffered_busy` 崩溃；随后另验证 Unicode、真实 sqlmap 版本、宿主取消/截止和 guardian 本地截止，检查真正 guardian、worker、engine、tool、grandchild 的 PID/start_time/pgid。旧本地日志/备份已清理，不随仓库交付，也不是当前检出的验收结果。当前回归按 [README](../README.md) 重跑；需要实际 WSL/可信本地工具的检查仍依赖当前环境，不能从历史说明或缺失日志推断通过。
 
 ## 网络与存储边界
 

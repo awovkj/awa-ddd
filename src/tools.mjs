@@ -5,12 +5,14 @@ import { ACTION_GROUPS, READ_ACTIONS } from './actions.mjs';
 import { GUIDANCE } from './tool-guidance.mjs';
 
 export const MAX_RENDER_BYTES = 24 * 1024;
+const BROWSER_SUMMARY_FIELDS = ['required_total', 'assisted_total', 'call_needed_total', 'invoke_now_total',
+  'blocked_total', 'native_unsupported_total', 'followup_total', 'task_total'];
 const HELP_HINT = 'Put every action-specific field inside input; misplaced top-level fields are rejected. For exact required fields, enums and examples call awa_project action.help with input:{name:"<action>"}; it needs no project_id.';
 const DETAIL_HINTS = Object.freeze({
   'project.status': 'Page project.status entities with offset/limit and methods with method_offset/method_limit; use surface.inspect for operation detail.',
   'plan.build': 'Use plan.next for the next ready tasks, or page plan.list with offset/limit.',
   'plan.list': 'Follow next_offset using plan.list; plan.next returns a short prioritized queue.',
-  'plan.next': 'Request the next short plan.next page; inspect the referenced operation or preflight before execution.',
+  'plan.next': 'Request the next short plan.next page; inspect browser_testing.stage/call_needed/invoke_now before execution. Required and assisted both mandate needed Playwright work, but capture_controls/prepare/blocked are not permission to skip prerequisites; qualified existing material is reviewed offline without replay.',
   'plan.audit': 'Follow next_offset for the complete closure checklist; unresolved work is not a security finding or an exclusion.',
   'plan.checkpoint': 'Inspect continuation and persist actual progress after each round; no_progress_rounds requires a changed hypothesis or evidence review, not repeated requests.',
   'plan.review': 'Administrative review does not close a security obligation, candidate or running execution. Recheck plan.audit and continuation.',
@@ -35,11 +37,23 @@ const PAGE_FIELDS = Object.freeze({
 });
 const PAGE_FILTERS = ['operation_id', 'run_id', 'name', 'method', 'auth', 'status', 'kind', 'current', 'lifecycle_status', 'include_blocked'];
 
+function compactBrowserSummary(value) {
+  const result = Object.create(null);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+  for (const key of BROWSER_SUMMARY_FIELDS) {
+    if (Number.isSafeInteger(value[key]) && value[key] >= 0) result[key] = value[key];
+  }
+  return result;
+}
+
 function renderControls(data) {
   const result = Object.create(null);
   if (!data || typeof data !== 'object' || Array.isArray(data)) return result;
   const continuation = compactContinuation(data.continuation);
   if (continuation) result.continuation = continuation;
+  if (Object.hasOwn(data, 'browser_testing_summary')) {
+    result.browser_testing_summary = compactBrowserSummary(data.browser_testing_summary);
+  }
   for (const key of ['offset', 'limit', 'next_offset', 'method_offset', 'method_next_offset',
     'actor_next_offset', 'session_next_offset', 'run_next_offset']) {
     if (data[key] === null || (Number.isSafeInteger(data[key]) && data[key] >= 0)) result[key] = data[key];
@@ -105,6 +119,10 @@ export function asHostError(error) {
 /** Presentation is bounded independently of the canonical, credential-free result. */
 export function renderToolResult(args, value) {
   const safe = { ok: value.ok, data: redactActionResult(args?.action, value.data) };
+  if (safe.data && typeof safe.data === 'object' && !Array.isArray(safe.data)
+    && Object.hasOwn(safe.data, 'browser_testing_summary')) {
+    safe.data = { ...safe.data, browser_testing_summary: compactBrowserSummary(safe.data.browser_testing_summary) };
+  }
   const full = JSON.stringify(safe);
   if (Buffer.byteLength(full, 'utf8') <= MAX_RENDER_BYTES) return [{ type: 'text', text: full }];
   const controls = renderControls(safe.data);
@@ -159,13 +177,13 @@ export const GROUPS = Object.freeze([
     description: 'Keep actors, sessions, tenants and resources separate. Session credentials are private; labels alone do not verify identity. Verified sessions cannot forward headers to another origin, even if that origin is also in scope. Same-role actors retain distinct session records.',
     fields: 'identity.actor: subject (server identity), roles, optional actor_id,label,tenant_id. identity.session: actor_id, optional session_id, headers_file (preferred absolute JSON file), ttl_seconds:1..86400. renew:true extends the same session without credential/generation changes; TTL expiry does not invalidate historical proof. identity.verify: session_id,operation_id,subject_selector and optional roles_selector/tenant_selector JSON Pointers. identity.resource: owner_actor_id,operation_id,external_id,request_binding:{location:path|query|body,selector}, optional resource_id,state; body selectors support JSON Pointer, JSON key or multipart field.' },
   { name: 'awa_browser',
-    description: 'Drive a real browser for questions about rendering, and keep a page/function coverage ledger. Use it whenever a conclusion depends on the DOM, a client-side route guard, a dialog firing, or a console error — not for request-level evidence, which stays in http.capture. Call browser.probe first; if it reports unavailable, mark the page BLOCKED with the reason instead of inferring behaviour from HTML.',
+    description: 'Must use real Playwright for required and materially assisted browser testing: DOM/XSS,client routes/state,browser security constraints and beneficial UI/login/upload/business workflows. First discover the host Playwright MCP provider and preserve actual observations; only the native fallback probes locally before browser.visit. Local unavailability does not negate host MCP. Keep scope/write guards and provenance; browser calls alone never confirm vulnerabilities or replace backend evidence.',
     fields: GUIDANCE.awa_browser },
   { name: 'awa_candidate',
     description: 'Work the unresolved-discovery ledger. Candidates are clues from imports and parsing, never evidence: linking records lineage to an operation without closing any coverage obligation.',
     fields: 'candidate.list: project_id, optional status (unverified/linked/dismissed/any, default unverified), kind, offset, limit (1..500, default 50); follow next_offset. candidate.inspect: candidate_id, returns the full record and its linked operation. candidate.link: candidate_id, operation_id, optional input_location and input_selector together (the input must already be registered on that operation); the candidate URL must equal the operation URL. candidate.dismiss: candidate_id, reason (required); dismissal is not a test and does not change any denominator. candidate.reopen: candidate_id, reason (required); use it after the source file changed.' },
   { name: 'awa_plan',
-    description: 'Build shared obligations and a persisted continuation/stop contract. Empty queues and successful reports do not authorize stopping. Unknown inputs, missing identities and invalid evidence remain visible; only a guarded finalization records a completed or explicit partial exit.',
+    description: 'Build shared obligations, browser_testing requirements and a persisted continuation/stop contract. Required and assisted both mandate needed Playwright work; stage/invoke_now preserve control preparation and offline review. The projection is not execution or proof. Empty queues and successful reports do not authorize stopping. Unknown inputs, missing identities and invalid evidence remain visible; only guarded finalization records a completed or explicit partial exit.',
     fields: GUIDANCE.awa_plan },
   { name: 'awa_execute',
     description: 'Execute scoped HTTP captures and explicit business scenarios, recording immutable evidence and resource state. Requests must belong to the configured project scope. After a timeout recover the recorded run before retrying a state-changing operation.',

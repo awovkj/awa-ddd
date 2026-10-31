@@ -133,6 +133,30 @@ test('active policy requires persisted progress and guarded finalization without
   assert.match(text, /route 自动执行/);
 });
 
+test('active policy mandates beneficial Playwright use with stage, provider and proof boundaries', () => {
+  const { log, ctx } = harness();
+  ctx.sessionProjections.applyEvent(commandRun(''), 's1');
+  const text = log.sections[0].text({ agent: { session: 's1' } });
+  assert.match(text, /required 或 assisted/);
+  assert.match(text, /must_call_playwright:true/);
+  assert.match(text, /assisted 表示有明显收益时也必须使用/);
+  assert.match(text, /call_needed/);
+  assert.match(text, /invoke_now/);
+  assert.match(text, /review_existing 离线复核已有合格材料/);
+  assert.match(text, /只有 native 回退路线先 browser\.probe/);
+  assert.match(text, /本地不可用不能否定宿主 MCP/);
+  for (const mechanism of ['CSRF/CORS', 'SameSite/HttpOnly/Secure', 'postMessage', 'OAuth/OIDC', '上传预览消费']) {
+    assert.ok(text.includes(mechanism), mechanism);
+  }
+  assert.match(text, /宿主 tabs 不是隔离 context/);
+  assert.match(text, /unsafe run_code 不是默认安全入口/);
+  assert.match(text, /MCP 导入不绑定 session\/actor/);
+  assert.match(text, /不能替代 authenticated XSS typed closure/);
+  assert.match(text, /上传\/evaluate\/tab 输出不得伪装 click/);
+  assert.match(text, /人工 evaluate\(alert\) 不算证明/);
+  assert.match(text, /用户要求不测试或仅源码\/报告维护时不启动目标测试/);
+});
+
 test('the command handler validates input and does not mutate state itself', () => {
   const { log, ctx } = harness();
   const handler = log.commands[0].handler;
