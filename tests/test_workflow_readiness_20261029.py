@@ -15,7 +15,7 @@ from awa_ddd.store import Project, now
 
 
 def observation(url, method, headers, body, timeout, max_bytes, *, response=None):
-    response = {"ok": True} if response is None else response
+    response = {"ok": True, "document": {"id": "owned-fixture-document", "value": "protected fixture data"}} if response is None else response
     raw = json.dumps(response, ensure_ascii=False).encode("utf-8")
     sent = body if isinstance(body, bytes) else body.encode("utf-8") if isinstance(body, str) else b""
     return {"request": {"url": url, "method": method, "headers": headers,
@@ -122,7 +122,7 @@ class WorkflowReadinessTests(unittest.TestCase):
         variant = self.captured(operation, session_id=bob["id"], **args)
         obligation = self.obligation(operation, "ownership", "bob")
         evaluate(self.project, {"obligation_id": obligation["id"], "evidence_ids": [baseline["id"], variant["id"]],
-            "oracle": {"type": "authorization", "selector": "/ok"}})
+            "oracle": {"type": "authorization", "selector": "/document"}})
         engine.add_resource(self.project, {"resource_id": resource["id"], "operation_id": operation["id"],
             "owner_actor_id": "alice", "external_id": "8", "request_binding": {"location": "query", "selector": "id"}})
         inspected = self.inspected_obligation(operation, obligation)

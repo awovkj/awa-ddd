@@ -50,8 +50,8 @@ test('assessment tools still register when the host cannot provide mode services
     console.error = original;
   }
   assert.equal(registered.length, GROUPS.length, 'all tool groups survive a mode failure');
-  assert.equal(errors.length, 1, 'the degradation is reported, not silent');
-  assert.match(errors[0], /penetration mode unavailable/);
+  assert.ok(errors.some(message => /penetration mode unavailable/.test(message)), 'mode degradation is visible');
+  assert.ok(errors.some(message => /public_hook_unavailable/.test(message)), 'missing host continuation hook is visible');
 });
 
 test('plugin disposal cancels owned execution even when caller signal remains active', async () => {
@@ -191,19 +191,20 @@ test('checkpoint, administrative review and guarded finalization route as persis
   for (const [action, input] of [
     ['plan.checkpoint', { label: 'Round one' }],
     ['plan.review', { checklist_id: 'CL-1', status: 'blocked', reviewer: 'local-reviewer', reason: 'Needs actual fixture' }],
-    ['plan.finalize', { checkpoint_id: 'CP-1', reason: 'user_stop', explanation: 'User requested pause', reviewer: 'local-reviewer' }],
+    ['plan.finalize', { checkpoint_id: 'CP-1', reason: 'completed', explanation: 'Registered scope exhausted', reviewer: 'local-reviewer' }],
   ]) {
     await plan.execute({ action, project_id: 'p', input }, {});
     assert.equal(plan.isConcurrencySafe({ action }), false, `${action} persists state`);
     assert.deepEqual(calls.at(-1), { action, args: { ...input, project_id: 'p' } });
   }
   assert.match(plan.parameters.properties.input.description, /continue_required/);
-  assert.match(plan.parameters.properties.input.description, /two same-snapshot/);
+  assert.match(plan.parameters.properties.input.description, /two COMPLETE current same-snapshot/);
   const report = definitions.find(tool => tool.name === 'awa_report');
   await report.execute({ action: 'report.build', project_id: 'p', input: { stage: 'final', finalization_id: 'FZ-1' } }, {});
   assert.deepEqual(calls.at(-1).args, { project_id: 'p', stage: 'final', finalization_id: 'FZ-1' });
   assert.match(report.parameters.properties.input.description, /Draft success never authorizes stopping/);
-  assert.match(report.description, /free-text host turn/);
+  assert.match(report.description, /supported awaited host turn-stopping/);
+  assert.match(report.description, /cannot retract streamed text/);
 });
 
 test('TscanPlus only exposes metadata, controlled requests and read-only project inspection', async () => {

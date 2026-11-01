@@ -413,6 +413,7 @@ class MCPHTTPTests(unittest.TestCase):
 
     def test_invalid_arguments_and_budgets_send_no_http_requests(self):
         for args in ({"timeout": False}, {"timeout": 0}, {"timeout": float("inf")}, {"timeout": 301},
+                     {"timeout": 10 ** 400}, {"timeout": -(10 ** 400)},
                      {"max_bytes": False}, {"max_bytes": 0}, {"max_bytes": 12 * 1024 * 1024 + 1}):
             with self.subTest(args=args):
                 self.assert_code("mcp_arguments", lambda: self.client(**args))

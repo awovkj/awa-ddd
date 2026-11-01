@@ -103,6 +103,7 @@ class SessionLifecycleTests(ProjectFixture):
     def _capture_with_session(self, operation, session):
         # A minimal in-process artifact is enough here; the capture path itself is
         # exercised by test_engine.py against a loopback server.
+        session = self.project.get("session", session["id"])
         body = b'{"ok":true,"value":"synthetic"}'
         artifact = {"request": {"url": operation["url"], "method": operation["method"], "headers": {"x-actor": "alice"},
                                 "body_base64": base64.b64encode(b"").decode()},

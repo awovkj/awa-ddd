@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ _PRIVATE_KEYS = {
     "request_headers", "response_headers", "session_headers", "proxy_authorization", "set_cookie",
     "client_secret", "id_token", "session_token", "private_key", "credential", "jwt",
     "auth_token", "api_token", "x_auth_token", "x_session_token", "basic",
+    "credential_signature", "credential_nonce", "redaction_context_sha256", "candidate_closure_context",
 }
 _PRIVATE_KEYS = {re.sub(r"[^a-z0-9]", "", name) for name in _PRIVATE_KEYS}
 _QUOTED_VALUE = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
@@ -40,6 +42,17 @@ _CHINESE_CREDENTIAL = re.compile(
     r"((?:支付密码|登录密码|数据库密码|数据库口令|明文密码|验证码|短信码|重置令牌|签名密钥|回调密钥)"
     r"\s*(?:(?:为|是|=|:|：)\s*){0,6}[\"'（(]?)[A-Za-z0-9._~+/-]{4,}"
 )
+
+
+def public_integrity_metadata(value):
+    """Pure credential/context hashes are private, not a low-entropy password oracle."""
+    private = {"credentialsignature", "credentialnonce", "redactioncontextsha256", "candidateclosurecontext"}
+    if isinstance(value, dict):
+        return {key: public_integrity_metadata(item) for key, item in value.items()
+                if re.sub(r"[^a-z0-9]", "", str(key).lower()) not in private}
+    if isinstance(value, list):
+        return [public_integrity_metadata(item) for item in value]
+    return value
 
 
 def safe_url(value):
@@ -176,6 +189,108 @@ def _finding_groups(findings):
                                       "lifecycle_reason": item.get("lifecycle_reason"),
                                       "replacement_finding_id": item.get("replacement_finding_id"),
                                       "evidence_current": item.get("evidence_current")} for item in historical]}
+
+
+def _continuation_metadata(redactor, original):
+    public = redactor.metadata(original)
+    booleans = ("continue_required", "can_finalize", "can_claim_complete", "automatic_stop_allowed",
+                "legacy_finalization_ignored", "frontier_review_required", "registered_scope_only")
+    counts = ("contract_version", "stop_policy_version", "ready_total", "review_total", "blocked_total",
+              "unresolved_total", "actionable_total", "no_progress_rounds", "frontier_rounds",
+              "applicability_review_total", "scope_reduction_review_total")
+    enums = {"state": {"continue", "blocked", "review_frontier", "review_coverage", "ready_to_finalize", "stalled", "not_started", "finalized"},
+             "reason_code": {"work_remaining", "blocked_preconditions", "coverage_incomplete", "frontier_review_required",
+                             "registered_scope_exhausted", "no_closure_progress", "inventory_missing", "completed"},
+             "next_action": {"plan.next", "plan.audit", "plan.checkpoint", "surface.list", "plan.finalize", "report.build"},
+             "coverage_status": {"complete", "partial"}, "stop_policy": {"exhaustion_only"}}
+    for key in booleans:
+        if type(original.get(key)) is bool:
+            public[key] = original[key]
+    for key in counts:
+        if type(original.get(key)) is int and original[key] >= 0:
+            public[key] = original[key]
+    for key, allowed in enums.items():
+        if isinstance(original.get(key), str) and original[key] in allowed:
+            public[key] = original[key]
+    for key in ("snapshot_id", "progress_id", "checkpoint_id", "finalization_id"):
+        value = original.get(key)
+        if value is None or isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", value):
+            public[key] = value
+    return public
+
+
+def _evaluation_metadata(project, redactor, original):
+    public = redactor.metadata(original)
+    if isinstance(original.get("completion"), dict) and original["completion"].get("status") in {"complete", "partial"}:
+        public["completion"]["status"] = original["completion"]["status"]
+    if isinstance(original.get("continuation"), dict):
+        public["continuation"] = _continuation_metadata(redactor, original["continuation"])
+    from .continuation import ALL_FAMILIES
+    enums = {
+        "test_family": set(ALL_FAMILIES), "scope_family": set(ALL_FAMILIES), "consumer_family": set(ALL_FAMILIES),
+        "status": {"open", "blocked", "not_applicable", "evaluated", "confirmed", "refuted", "inconclusive"},
+        "outcome": {"confirmed", "refuted", "inconclusive"}, "mode": {"machine", "analyst"},
+        "severity": {"critical", "high", "medium", "low", "info"},
+        "lifecycle_status": {"active", "withdrawn", "superseded"},
+        "kind": {"baseline", "access", "ownership", "ownership_setup", "identity_setup", "auth_review", "input_review", "input_test"},
+        "obligation_kind": {"baseline", "access", "ownership", "ownership_setup", "identity_setup", "auth_review", "input_review", "input_test"},
+    }
+    from .publication import PublicationContext
+    context = PublicationContext(project)
+    with project._lock:
+        identities = project.connection.execute("SELECT kind,id FROM entities").fetchall()
+    known_ids = {identity for kind, identity in identities if context.bound_handle(kind, identity)}
+    material_hashes, material_paths = set(), set()
+    for kind in ("evidence", "page_visit", "run"):
+        for record in project.list(kind):
+            for key, value in record.items():
+                if isinstance(value, str) and (key == "sha256" or key.endswith("_sha256")) \
+                        and key not in {"credential_signature", "redaction_context_sha256"}:
+                    material_hashes.add(value)
+                if key in {"artifact_path", "screenshot", "html", "after_actions_html"} and isinstance(value, str):
+                    material_paths.add(value)
+
+    def controls(source, sanitized):
+        if isinstance(source, dict) and isinstance(sanitized, dict):
+            for key, value in source.items():
+                if key not in sanitized:
+                    continue
+                if isinstance(value, str) and (key in enums and value in enums[key]
+                        or (key == "id" or key.endswith("_id")) and value in known_ids
+                        or (key == "sha256" or key.endswith("_sha256")) and value in material_hashes
+                        or key in {"artifact_path", "screenshot", "html", "after_actions_html"} and value in material_paths):
+                    sanitized[key] = value
+                else:
+                    controls(value, sanitized[key])
+        elif isinstance(source, list) and isinstance(sanitized, list):
+            for value, item in zip(source, sanitized):
+                controls(value, item)
+
+    controls(original, public)
+    return public
+
+
+def _finalization_metadata(redactor, original):
+    if original is None:
+        return None
+    public = redactor.metadata(original)
+    for key in ("id", "checkpoint_id", "snapshot_id", "reason", "reason_basis", "stop_policy", "stop_policy_version",
+                "completion_status", "can_claim_complete", "automatic_stop_allowed", "frontier_reviewed",
+                "external_constraint_verified", "blocker_facts_verified"):
+        if key in original:
+            public[key] = original[key]
+    if isinstance(original.get("remaining"), dict):
+        public["remaining"] = {key: original["remaining"][key] for key in
+            ("ready_total", "review_total", "blocked_total", "unresolved_total") if key in original["remaining"]}
+    created = original.get("created_at")
+    if isinstance(created, str):
+        try:
+            datetime.fromisoformat(created)
+        except ValueError:
+            pass
+        else:
+            public["created_at"] = created
+    return public
 
 
 _ZH = {
@@ -319,21 +434,13 @@ def _render(summary):
     finalization = summary.get("finalization") or {}
     delivery = summary.get("delivery_status", "draft")
     stage_labels = {"draft": "草稿 / 阶段快照（非完成凭证）",
-                    "final-partial": "最终部分交付（仍有覆盖限制）",
                     "final-completed": "最终交付（仅限已登记授权任务）"}
     stage_warnings = {
         "draft": "报告生成成功不代表评估结束。继续检查 plan.checkpoint、plan.next 和 plan.audit；不得据此宣称已经测无可测。",
-        "final-partial": "仅校验停止记录与当前快照的绑定。调用方声明的外部退出或阻塞事实不因此获独立核验；未完成和范围限制仍保留，不代表完整覆盖。",
         "final-completed": "引擎确认已登记任务满足当前闭环规则；范围适用性仍来自复核声明，不证明未知接口、未测试业务状态或未知漏洞不存在。",
     }
-    stop_labels = {"completed": "已登记任务通过引擎闭环门禁（仅限登记范围）",
-                   "blocked": "登记计划暂无可推进项（阻塞事实来自台账声明，未独立核验）",
-                   "budget_exhausted": "调用方声明预算耗尽（未独立计量或核验预算）",
-                   "user_stop": "调用方声明用户要求结束（未独立核验宿主事件）",
-                   "authorization_boundary": "调用方声明达到授权边界（未独立核验，禁止自动扩大范围）"}
-    basis_labels = {"engine_gate": "引擎闭环门禁（登记范围内）",
-                    "projected_declared_blockers": "按台账声明的阻塞前提投影；阻塞事实未独立核验",
-                    "caller_declared_external_constraint": "调用方声明的外部退出约束；宿主事件、预算或授权事实未独立核验"}
+    stop_labels = {"completed": "已登记任务通过严格测无可测门禁（仅限登记范围）"}
+    basis_labels = {"engine_gate": "引擎严格闭环门禁（登记范围内，零执行/复核/阻塞/未决任务）"}
     partial = evaluated.get("open", 0) or evaluated.get("blocked", 0)
     label = completion.get("label_zh") or ("部分评估，仍有未完成工作" if partial else "仅限已登记范围的评估快照")
     rows = ["# awa-ddd 中文渗透测试报告", "", "- 项目：" + _md(summary["project_id"]),
@@ -341,10 +448,12 @@ def _render(summary):
             "## " + stage_labels.get(delivery, stage_labels["draft"]), "",
             "**" + stage_warnings.get(delivery, stage_warnings["draft"]) + "**", "",
             "frontier_review 两轮记录属于引用已有证据的范围复核声明，不是两次独立安全实验。", "",
+            "自动停测仅允许严格核验的登记范围耗尽；预算、耗时、发现数量、受阻声明及阶段报告均不能授权自动停止。真实用户停止或宿主中断只保存续接快照，不冒充评估完成。", "",
             "- 报告阶段：" + _md(stage),
-            "- 当前续接判定：" + ("仍需继续" if continuation.get("continue_required") else "已按停止记录退出；不等于完整覆盖"),
+            "- 当前续接判定：" + ("仍需继续" if continuation.get("continue_required") else "登记范围已通过严格闭环；不等于目标绝对安全"),
             "- 剩余 ready / review / blocked：" + str(continuation.get("ready_total", 0)) + " / "
             + str(continuation.get("review_total", 0)) + " / " + str(continuation.get("blocked_total", 0)),
+            "- 自动停止策略：exhaustion_only；旧部分退出记录不获得当前停测权限",
             "- 停止记录：" + _md(finalization.get("id") or "无（草稿不能作为结束授权）"),
             "- 停止理由：" + _md(stop_labels.get(finalization.get("reason"), "无（阶段快照不能授权停止）")),
             "- 停止依据：" + _md(basis_labels.get(finalization.get("reason_basis"), "未提供可区分的停止依据，不能据此声称外部事实获核验")),
@@ -357,6 +466,8 @@ def _render(summary):
             "- 已求值义务：" + str(evaluated.get("evaluated", 0)) + " / " + str(evaluated.get("obligations", 0))
             + "；待完成：" + str(evaluated.get("open", 0)) + "；受阻：" + str(evaluated.get("blocked", 0)),
             "- 已登记操作 / 输入：" + str(evaluated.get("operations", 0)) + " / " + str(evaluated.get("inputs", 0))]
+    if summary.get("reproduction_metadata_only") is True:
+        rows.append("- 私有旧浏览器上下文不可恢复：本批仅导出安全台账元数据，不提供请求/正文文件或执行命令；恢复实际本地上下文后再准备复现，不自动重放未知执行。")
     security = evaluated.get("security_coverage") or {}
     if security:
         rows.append("- 安全专项已求值：" + str(security.get("evaluated", 0)) + " / " + str(security.get("total", 0))
@@ -465,6 +576,62 @@ def _check_plain_path(path):
     return path
 
 
+def _require_final_delivery(evaluated, continuation, finalization):
+    """A report must not relabel an inconsistent or partial stop as final."""
+    from .continuation import MIN_FRONTIER_ROUNDS
+    from .store import EngineError
+
+    remaining = finalization.get("remaining") or {}
+    zero_counts = ("ready_total", "review_total", "blocked_total", "unresolved_total")
+    valid = finalization.get("reason") == "completed" \
+        and finalization.get("reason_basis") == "engine_gate" \
+        and finalization.get("can_claim_complete") is True \
+        and finalization.get("completion_status") == "complete" \
+        and finalization.get("frontier_reviewed") is True \
+        and evaluated.get("completion", {}).get("status") == "complete" \
+        and all(type(evaluated.get(key)) is int and evaluated[key] == 0 for key in ("open", "blocked")) \
+        and type(evaluated.get("operations")) is int and evaluated["operations"] > 0 \
+        and continuation.get("continue_required") is False \
+        and continuation.get("can_finalize") is True \
+        and continuation.get("can_claim_complete") is True \
+        and continuation.get("automatic_stop_allowed") is True \
+        and continuation.get("frontier_review_required") is False \
+        and type(continuation.get("frontier_rounds")) is int \
+        and continuation["frontier_rounds"] >= MIN_FRONTIER_ROUNDS \
+        and continuation.get("snapshot_id") == finalization.get("snapshot_id") \
+        and continuation.get("checkpoint_id") == finalization.get("checkpoint_id") \
+        and continuation.get("finalization_id") == finalization.get("id") \
+        and all(type(continuation.get(key)) is int and continuation[key] == 0
+                for key in (*zero_counts, "actionable_total")) \
+        and all(type(continuation.get(key, 0)) is int and continuation.get(key, 0) == 0
+                for key in ("applicability_review_total", "scope_reduction_review_total")) \
+        and all(type(remaining.get(key)) is int and remaining[key] == 0 for key in zero_counts)
+    if not valid:
+        denied = {**continuation, "continue_required": True, "can_finalize": False, "can_claim_complete": False,
+                  "automatic_stop_allowed": False, "finalization_id": None,
+                  "state": "continue", "reason_code": "final_report_inconsistent", "next_action": "plan.audit"}
+        raise EngineError("continue_required", "A final report requires current strict registered-scope exhaustion; partial exits are draft snapshots only",
+                          {"continuation": denied, "next_action": "plan.audit"})
+
+
+def _publish_report(staging, destination, parent):
+    for delay in (0.025, 0.075, 0.15, None):
+        checked_parent = _check_plain_path(parent).resolve()
+        if _check_plain_path(staging).resolve().parent != checked_parent \
+                or _check_plain_path(destination).resolve().parent != checked_parent:
+            raise ValueError("Report rename escaped destination parent")
+        if destination.exists():
+            raise FileExistsError("A report batch must never replace an existing destination")
+        try:
+            os.rename(staging, destination)
+            return
+        except PermissionError as exc:
+            # Windows scanners can briefly hold a freshly closed staging file.
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or delay is None:
+                raise
+            time.sleep(delay)
+
+
 def build_report(project, output_dir=None, *, stage="draft", finalization_id=None):
     from .store import EngineError
     if not isinstance(stage, str) or stage not in {"draft", "final"}:
@@ -480,19 +647,17 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         original = evaluate_coverage(project)
         finalization = require_finalization(project, finalization_id, evaluated=original) if stage == "final" else None
         continuation = control(project, evaluated=original)
+        if stage == "final":
+            _require_final_delivery(original, continuation, finalization)
         source_context = {"continuation": continuation, "finalization": finalization}
         if any(run.get("kind") == "external_tool" and run.get("adapter") == "tscanplus" for run in project.list("run")):
             from .tscanplus import report_context
             source_context["tscanplus"] = report_context(project)
         reproduction = prepare_reproduction(project, original.get("findings") or [],
             context=source_context)
-        redactor = reproduction["redactor"]
-        evaluated = redactor.metadata(original)
-        delivery = "draft" if stage == "draft" else (
-            "final-completed" if finalization.get("can_claim_complete") is True
-            and evaluated.get("completion", {}).get("status") == "complete" else "final-partial")
+        evaluated = original
+        delivery = "draft" if stage == "draft" else "final-completed"
         from .browser import coverage as browser_coverage
-        from .candidates import UNVERIFIED
         operation_metadata = []
         for operation in project.list("operation"):
             row = _pick(operation, ("id", "url", "method", "protocol", "operation_name", "content_type",
@@ -508,31 +673,36 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             "stage": stage,
             "delivery_status": delivery,
             "completion": evaluated.get("completion") or {},
-            "continuation": redactor.metadata(continuation),
-            "finalization": redactor.metadata(finalization),
-            "project_id": redactor.prose(project.config.get("project_id") or project.base.name, 128),
+            "continuation": continuation,
+            "finalization": finalization,
+            "project_id": project.config.get("project_id") or project.base.name,
             "generated_at": generated.isoformat(),
-            "scope": redactor.metadata(_scope(project.config)),
+            "scope": _scope(project.config),
             "coverage": evaluated,
-            "finding_groups": redactor.metadata(_finding_groups(evaluated.get("findings") or [])),
-            "operation_metadata": redactor.metadata(operation_metadata),
-            "unverified_candidates": sum(row.get("status", UNVERIFIED) == UNVERIFIED for row in project.list("candidate")),
-            "browser_coverage": redactor.metadata(browser_coverage(project)),
+            "finding_groups": _finding_groups(evaluated.get("findings") or []),
+            "operation_metadata": operation_metadata,
+            "unverified_candidates": original["completion"]["unresolved_candidates"],
+            "browser_coverage": browser_coverage(project),
             "external_tools": [_tool_report_metadata(run)
                 for run in project.list("run") if run.get("kind") == "external_tool"],
             "reproduction": reproduction["finding_details"],
+            "reproduction_metadata_only": reproduction.get("metadata_only", False),
+            "reproduction_warnings": reproduction["warnings"],
             "artifacts": [{"path": path, "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
                           for path, data in sorted(reproduction["files"].items())],
         }
-        summary["external_tools"] = redactor.metadata(summary["external_tools"])
         if stage == "final":
             # SQLite does not freeze artifact bytes. Recheck them after source
             # preparation; this is not a lock against later external changes.
             current = evaluate_coverage(project)
             current_stop = require_finalization(project, finalization_id, evaluated=current)
+            _require_final_delivery(current, current["continuation"], current_stop)
             if current_stop != finalization or current["continuation"]["snapshot_id"] != original["continuation"]["snapshot_id"]:
                 raise EngineError("finalization_stale", "Report sources changed during preparation; create a current stop record",
                     {"continuation": control(project, evaluated=current), "next_action": "plan.checkpoint"})
+        from .publication import publish_report_summary
+        summary = publish_report_summary(project, summary, extra_secrets=reproduction["redactor"].values,
+                                         files=reproduction["files"])
     report_bytes = _render(summary).encode("utf-8")
     digest = hashlib.sha256(report_bytes).hexdigest()
     summary["report_sha256"] = digest
@@ -564,9 +734,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             with path.open("xb") as stream:
                 written.append(path)
                 stream.write(data)
-        if staging.resolve().parent != parent.resolve() or destination.resolve().parent != parent.resolve():
-            raise ValueError("Report rename escaped destination parent")
-        os.rename(staging, destination)
+        _publish_report(staging, destination, parent)
     finally:
         # Only known files in our fresh staging directory are removed on failure.
         if staging.exists():
@@ -581,4 +749,5 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             "report_sha256": digest, "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
             "manifest": str(destination / "manifest.json"), "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
             "reproduction_dir": str(destination / "reproduction") if reproduction["files"] else None,
+            "reproduction_metadata_only": summary.get("reproduction_metadata_only", False),
             "snapshot": True, "generated_at": summary["generated_at"]}

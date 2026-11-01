@@ -1,16 +1,18 @@
 # 中文报告与人工复现
 
-适用于 0.7.0。报告是经过当前证据校验的交付快照，不是自动攻击脚本，也不是漏洞全集。
+适用于 0.9.0。报告是经过当前证据校验的交付快照，不是自动攻击脚本，也不是漏洞全集。早期版本允许的自报预算/受阻等最终部分退出不再获得收尾权限。
 
 ## 生成与阅读
 
-先查看 `project.status`、`plan.next` 与 `plan.audit`，处理可推进的任务和归档缺口，再调用：
+先查看 `project.status`、`plan.next` 与 `plan.audit`，持续处理 ready/review 和归档缺口。阶段快照调用：
 
 ```json
-{"action":"report.build","project_id":"assessment","input":{"output_dir":"D:/Assessments/reports"}}
+{"action":"report.build","project_id":"assessment","input":{"stage":"draft","output_dir":"D:/Assessments/reports"}}
 ```
 
 每次生成独立目录，不覆盖上一批次。默认报告语言为中文，`summary.json` 的 `format_version` 为 5、`language` 为 `zh-CN`。返回值包含 `report`、`summary`、`manifest`、对应 SHA-256 和 `reproduction_dir`；没有可安全导出的复现材料时目录字段可以为空。
+
+`draft` 成功不能授权自动停测。只有非空登记范围、完整求值覆盖、零 ready/review/blocked/unresolved、最新同快照 checkpoint 及两轮完整有效 frontier 都成立后，`plan.finalize reason:completed` 才授予有范围边界的停止权。最终报告使用 `stage:final` 和实际 `finalization_id`；门禁在材料准备之前与之后复核，不接受旧部分 FN，也不将未完成工作导出为 final-partial。真实用户暂停/停止或宿主中断保留 checkpoint/draft 和恢复前提，不制造预算耗尽事实或最终完成记录。
 
 - `report.md`：先执行摘要、风险分布、漏洞详情和复现步骤，再覆盖率、未决义务与来源附录。
 - `summary.json`：保留完整当前求值结果，区分 machine / analyst、当前 / 历史、登记 / 观察 / 求值 / 安全专项闭环。
@@ -32,6 +34,8 @@
 `curl.exe` 与 POSIX curl 模板都明确请求方法，不跟随重定向，不继承系统代理。正文使用 `--data-binary @<body-file>`，避免 PowerShell 多层插值。`.http` 文件可以导入 Burp/Yakit/sqlmap；手动改变正文后应重新计算 Content-Length，或让工具按实际正文重算。
 
 认证头、Cookie、令牌、密码、短信验证码、支付签名和敏感配置使用一致的占位符；敏感字段可能造成 JSON 格式规范化，报告会说明。不能安全解析或脱敏的二进制/畸形正文不会输出貌似可用的重放模板。不要将脱敏请求视为未经改变的原始证据。
+
+短 PIN、数值/浮点/前导零别名、嵌入式正文、JSON 键和可逆深层百分编码同样脱敏；服务器自行给出的 UUID/hex 字符串不因外形获得免责。真实 evidence/finding 引用、文件字节摘要及台账计数按来源保留，curl/sqlmap 参数仅从绑定的安全文件和证据顺序重建，不能从任意原始命令恢复。已保护的 locator 或无法保持的 multipart/JSON framing 不生成执行模板。若旧浏览器 fill 上下文未知，`reproduction_metadata_only:true` 表示本批仅有安全台账元数据，没有请求/正文文件或执行命令；它不授权停测，恢复实际本地上下文后再准备材料，不重放未知执行。
 
 ## SQL 注入的最终结果复核
 

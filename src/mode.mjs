@@ -37,7 +37,7 @@ const SECTION_TEXT = `## Penetration mode（渗透模式）
 - runtime.probe 只检查本机/WSL 运行时能力，不扫描目标；WSL Kali 不会绕过 scope 或自动把 localhost 转成 Windows 目标。
 - 先 surface.import / surface.register 建立操作与输入，再执行实验。
 - 按实际功能追踪输入消费点，明确 test_families；一项 SQL、XSS 或业务假设的结果不能关闭另一类假设。优先处理高风险 URL/XML/规则表达式/金额/积分/签名/令牌，不因已有十几个漏洞提前停止。
-- 并行委派交接同一 backend/workspace/project_id、operation/obligation/input 与 session/resource 引用、范围和剩余预算，不复制明文凭据；子代理返回 run/evidence/candidate/decision ID。只有 shell 的观察保留未验证，由主代理补实际血缘，不把口头结论当 confirmed；不跨 native/WSL 并发共享 SQLite。
+- 并行委派交接同一 backend/workspace/project_id、operation/obligation/input 与 session/resource 引用、范围和用户明确给定的资源限制（若有），不自行设定停测预算、不复制明文凭据；子代理返回 run/evidence/candidate/decision ID。只有 shell 的观察保留未验证，由主代理补实际血缘，不把口头结论当 confirmed；不跨 native/WSL 并发共享 SQLite。
 - 真实请求需要目标授权；项目默认只允许读取，写操作需显式开启并绑定测试资源。长任务用 identity.session renew:true 续期，不要把 TTL 过期当成证据失效。
 - SQL 注入用 sql_metadata 直接回显、sqlmap 元数据 transcript 或 error_channel 报错回显确认；破坏性/write-side 注入用 sql_evidence 行为差异，工具告警保留为候选。
 - 浏览器测试不是可选建议：browser_testing.requirement 为 required 或 assisted 时都必须调用 Playwright（must_call_playwright:true），assisted 表示有明显收益时也必须使用。call_needed 表示仍需新运行时观察，invoke_now 判断是否本阶段调用；capture_controls/prepare/identify_consumer 先补控制与消费链，blocked 不绕过前提，review_existing 离线复核已有合格材料，不能重放写入凑调用数。XSS/DOM、客户端路由/状态、浏览器专属结论、CSRF/CORS、点击劫持/CSP、Cookie SameSite/HttpOnly/Secure、postMessage、OAuth/OIDC 需要真实浏览器；复杂UI、登录/动态token、多角色页面、上传预览消费、业务链有明显收益时也必须调用。纯后端 SQL 元数据/SSRF/XXE 不盲目浏览器化，不标整类 N/A。
@@ -49,11 +49,14 @@ const SECTION_TEXT = `## Penetration mode（渗透模式）
 - 解析不了的线索进入 candidate 台账并显式处理，不要让它们静默消失，也不要把线索当成漏洞。
 - 缺账号、缺资源、未知消费点保留为 open/blocked，不要写成 not_applicable。
 - 报告保留未决与受阻项；测试计数和操作计数都不能替代漏洞召回率。
-- 每轮按 plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint → 再检查 continuation 的闭环推进。continue_required:true 时，在现有授权和实际用户/宿主预算内继续具体可推进工作；空 work_items 页、发现若干漏洞、请求计数和 report.build 成功都不是停止条件。
-- plan.checkpoint 保存真实轮次进展；frontier_review 需按 action.help 提供 discovery、全部 12 族 categories 与 pages 的来源/实际证据引用，API-only/N/A 也要业务证据，且不能改写义务为 N/A。completed/blocked 需两轮相同材料快照的复核及没有其他可推进任务；两轮无变化本身不证明安全。no_progress_rounds 增加时换具体假设、补消费点/身份/资源、检查已有证据或说明阻塞，不无限重复相同请求补计数。
+- 每轮按 plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint → 再检查 continuation 的闭环推进。continue_required:true 时，必须继续现有授权内具体可推进工作，包括全部 ready 与 review；除严格核验测无可测外，禁止以任何理由自动终止。空 work_items 页、发现若干漏洞、请求计数、耗时、上下文压力、低收益和 report.build 成功都不是停止条件，不得自行设定执行/轮次/时间/token/操作预算。
+- plan.checkpoint 保存真实轮次进展；frontier_review 需按 action.help 提供 discovery、全部 12 族 categories 与 pages 的来源/实际证据引用，API-only/N/A 也要业务证据，且不能改写义务为 N/A。completed 需两轮相同材料快照的完整有效复核及零 ready/review/blocked/unresolved；blocked 声明不算完整复核，两轮无变化本身不证明安全。no_progress_rounds 增加时换具体假设、补消费点/身份/资源、检查已有证据或说明阻塞，不无限重复相同请求补计数。
 - plan.review 只复核来源绑定的行政归档清单，不能关闭安全义务、候选或正在运行的执行。未追踪输入、未归档候选/人工发现、失败工具与页面账本缺口仍须完成或明确保留。
-- 正式收尾先 plan.finalize，引用当前 checkpoint_id，提供 reason:completed|blocked|budget_exhausted|user_stop|authorization_boundary、explanation 和 reviewer。completed 必须满足 can_finalize、completion.status:complete、零阻塞和当前完整 frontier 复核；can_claim_complete 只授权成功收尾后的完成声明，不是调用前提。合法部分退出必须保留剩余工作、真实停止原因及恢复前提，不能自行虚构预算、扩大授权或把可推进项标成受阻。
-- report.build 默认 stage:draft，仅导出进度，不能授权停测；stage:final 必须传入当前 plan.finalize 的 finalization_id。项目材料更新后重新 checkpoint/finalize。工具能校验正式收尾，但不能阻止宿主自由文本结束、用户暂停或预算取消，不假称有自动续跑钩子。
+- plan.disposition/plan.review 的 caller-only blocked 文字不能压掉实际可做的 ready、setup 或离线复核；先按 blocker_reconciliation_required 的当前模板离线 reopen，不自动发包。真实范围、身份、fixture、浏览器、未知写及材料前提仍受阻。完整失败只读浏览器材料可行政复核，不能采纳为成功页面覆盖。
+- candidate.dismiss 只有 reason 时仍是未验证声明，保留 candidate.reopen 复核；可机验的 declared-scope 外具体 URL，或全部当前 typed 安全义务已闭环的精确普通 operation duplicate，才可关闭发现复核。新增 exclude、动态/私有 locator、扫描器告警和无关正常响应不能凑成此证明；来源/范围/证据变化重新投影，历史保留。
+- plan.disposition 的人工 not_applicable 仅保留有来源的适用性声明，applicability_review_total 仍是待验证工作；正常捕获加一句理由不能关闭整条安全义务。删减未测输入/漏洞族/分支或弱化角色/属主声明会保留 scope_reduction_review_total，明确 SQL/HTML 消费点省略必需族也不算耗尽；当前 consumer 标签不能改写历史族。上述复核不能用 plan.review 或 blocked 文字归档，恢复真实边界并用 typed 判据闭环。
+- 正式收尾先 plan.finalize，引用当前 checkpoint_id，只允许 reason:completed、explanation 和 reviewer。completed 必须满足 can_finalize、completion.status:complete、非空登记范围、零 ready/review/blocked/unresolved 和两轮当前完整 frontier 复核；can_claim_complete 只授权成功收尾后的完成声明，不是调用前提。budget_exhausted/user_stop/authorization_boundary/blocked 都不能作为模型自报的最终退出理由；旧 partial 停止记录仅留历史，不能获得新最终报告或停测权限。不能扩大授权或把可推进项标成受阻。
+- report.build 默认 stage:draft，仅导出进度，不能授权停测；stage:final 必须传入当前严格 plan.finalize 的 finalization_id，仍有任务即拒绝，不生成最终部分交付。真实用户明确暂停/停止或宿主真实中断时遵守该事件，保留 checkpoint 和 draft 及恢复前提，不将中断冒充测无可测。项目材料更新后重新 checkpoint/finalize。支持的 rc.3 宿主通过 agent/turn-stopping 串行钩子先离线审计已绑定工作，再用插件自身来源的 agent.steer 保持当前轮次；不能撤回已输出文字、伪造用户、覆盖实际取消/平台终止或保证无界运行。新用户意图重置绑定，报告维护不转为测试，缺支持有可见降级；渗透模式关闭也不放宽引擎硬门禁。
 - XSS 阴性不能只看“没有 dialog”：必须到达绑定输入的实际消费页并完成成功业务交互，证明观察器敏感性且限定路由/身份/上下文。空白页、登录页或无关页面无弹窗不构成否定。
 - report.build 默认输出中文报告和经过证据校验的人工复现包。每个漏洞说明身份/资源前提、请求参数、步骤、对照结果、影响边界与修复；SQL 注入附对应参数的只读 sqlmap 命令，凭据占位符需重新登录替换，不给全库导出或未经验证的扩大结论。
 - 改判据或补证据后重新求值覆盖，gap_id 在计划、覆盖与报告中必须一致。

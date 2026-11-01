@@ -255,10 +255,10 @@ class EngineTests(unittest.TestCase):
 
     def test_json_cli_protocol_and_error_exit(self):
         command=[sys.executable,"-X","utf8","-B","-m","awa_ddd","--workspace",self.tmp.name]
-        success=subprocess.run(command,input=json.dumps({"action":"project.status","args":{"project_id":"test"}}),text=True,capture_output=True,cwd=ROOT)
+        success=subprocess.run(command,input=json.dumps({"action":"project.status","args":{"project_id":"test"}}),text=True,encoding="utf-8",capture_output=True,cwd=ROOT)
         self.assertEqual(0,success.returncode,success.stderr+success.stdout)
         self.assertTrue(json.loads(success.stdout)["ok"])
-        failure=subprocess.run(command,input=json.dumps({"action":"unknown","args":{"project_id":"test"}}),text=True,capture_output=True,cwd=ROOT)
+        failure=subprocess.run(command,input=json.dumps({"action":"unknown","args":{"project_id":"test"}}),text=True,encoding="utf-8",capture_output=True,cwd=ROOT)
         self.assertEqual(2,failure.returncode)
         self.assertFalse(json.loads(failure.stdout)["ok"])
 

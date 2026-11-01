@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   invokeEngine, resolveConfig, validateRequest, validateJson, redactResult, safeErrorText, safeErrorDetails,
-  PACKAGE_ROOT, MAX_REQUEST_BYTES, MAX_JSON_DEPTH, ACTIONS,
+  PACKAGE_ROOT, MAX_REQUEST_BYTES, MAX_JSON_DEPTH, ACTIONS, ENGINE_DISPATCH_UNCERTAIN,
 } from '../src/bridge.mjs';
 
 const config = { workspace: join(tmpdir(), 'awa-ddd-bridge-test-state'), timeoutMs: 5000 };
@@ -30,6 +30,19 @@ test('configuration separates state from code and accepts an executable path, ne
     { wslPythonExecutable: '-c' }, { wslPythonExecutable: '/usr/bin/python3\n' }]) {
     assert.throws(() => resolveConfig(bad), { code: 'INVALID_CONFIG' });
   }
+});
+
+test('candidate closure source context stays private even in unexpected bridge output', () => {
+  const source = 'synthetic-private-candidate-source';
+  const value = { candidate_closure_context: { opaque: source },
+    nested: [{ 'Candidate-Closure-Context': { opaque: source } }],
+    candidate_closure: { version: 1, basis: 'outside_scope' } };
+  const result = redactResult(value);
+  assert.equal(result.candidate_closure_context, '[redacted]');
+  assert.equal(result.nested[0]['Candidate-Closure-Context'], '[redacted]');
+  assert.equal(Object.getPrototypeOf(result.candidate_closure), null);
+  assert.deepEqual({ ...result.candidate_closure }, value.candidate_closure);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(source));
 });
 
 test('the bridge rejects non-JSON values instead of changing oracle or request semantics', () => {
@@ -294,6 +307,23 @@ test('extra stdout, malformed envelopes and missing Python produce explicit erro
   }
   await assert.rejects(invokeEngine({ ...config, pythonExecutable: join(tmpdir(), 'awa-ddd-no-such-python-executable') }, 'project.list', {}),
     { code: 'PYTHON_START_FAILED' });
+});
+
+test('only bridge-owned uncertain outcomes carry dispatch uncertainty, never backend assertions', async () => {
+  await assert.rejects(invokeEngine(config, 'project.list', {}, {
+    spawnProcess: synthetic("process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('not-json'))"),
+  }), error => {
+    assert.equal(error.code, 'INVALID_RESPONSE');
+    assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true);
+    return true;
+  });
+  await assert.rejects(invokeEngine(config, 'project.list', {}, {
+    spawnProcess: synthetic("process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:false,error:{code:'arguments',message:'Preflight failed',details:{engine_dispatch_uncertain:true}}}));process.exitCode=2})"),
+  }), error => {
+    assert.equal(error.code, 'arguments');
+    assert.notEqual(error[ENGINE_DISPATCH_UNCERTAIN], true);
+    return true;
+  });
 });
 
 test('cancellation before dispatch starts no child', async () => {

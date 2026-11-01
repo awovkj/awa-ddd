@@ -150,7 +150,7 @@ class _LoopbackConnection(http.client.HTTPConnection):
 class StreamableHTTPClient:
     def __init__(self, endpoint=DEFAULT_ENDPOINT, timeout=30, max_bytes=4 * 1024 * 1024):
         self.endpoint = validate_endpoint(endpoint)
-        if type(timeout) not in {int, float} or not math.isfinite(timeout) or not 0 < timeout <= 300 \
+        if type(timeout) not in {int, float} or not 0 < timeout <= 300 or not math.isfinite(timeout) \
                 or type(max_bytes) is not int or not 1 <= max_bytes <= 12 * 1024 * 1024:
             raise MCPHTTPError("mcp_arguments", "MCP timeout must be greater than zero and at most 300 seconds; max_bytes must be 1..12582912")
         self.timeout, self.max_bytes = timeout, max_bytes
@@ -209,6 +209,8 @@ class StreamableHTTPClient:
     def _read_body(self, response, exchange, size):
         raw = response.read1(size)
         exchange["response_body_bytes_read"] += len(raw)
+        # A deadline watchdog shutdown can look like EOF; retain bytes first.
+        self._remaining()
         if not raw:
             # A matching SSE event is not EOF, and short Content-Length bodies
             # must not acquire a complete-transcript label merely on socket EOF.

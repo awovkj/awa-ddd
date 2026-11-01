@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from bisect import bisect_left
 import hashlib
 import re
 
@@ -67,6 +68,8 @@ def _entry(operation, item):
 def obligation_family(item, operation):
     if item.get("test_family"):
         return item["test_family"]
+    if isinstance(item.get("scope_family"), str) and item["scope_family"] in FAMILY_LABELS:
+        return item["scope_family"]
     if item.get("kind") in {"access", "ownership", "auth_review", "identity_setup", "ownership_setup"}:
         return "access_control"
     consumer = re.sub(r"[^a-z0-9]", "", str(_entry(operation, item).get("consumer") or "").lower())
@@ -106,13 +109,160 @@ def _tscanplus_incomplete(run):
         or run.get("unretrieved_results") is True or bounded_read and run.get("results_complete") is False
 
 
+def _scope_key(item, operation):
+    kind, identity = item.get("kind"), item.get("operation_id")
+    if kind == "input_test":
+        family = next((item[key] for key in ("test_family", "scope_family")
+                       if isinstance(item.get(key), str) and item[key] in FAMILY_LABELS), None)
+        if family is None:
+            family = "legacy_signature:" + str(item.get("input_signature") or item["id"])
+        return (identity, kind, item.get("input_location"), item.get("input_selector"),
+                item.get("schema_branch"), family)
+    if kind in {"baseline", "access"}:
+        return (identity, kind, item.get("actor_id"))
+    if kind == "ownership":
+        return (identity, kind, item.get("actor_id"), item.get("baseline_actor_id"), item.get("resource_id"))
+    return None
+
+
+def _unknown_policy_replacements(project, obligations):
+    """Recognize the first actual plan transaction replacing unknown-policy work."""
+    from .engine import stamp
+
+    with project._lock:
+        metadata = project.connection.execute(
+            "SELECT id,created_at,updated_at FROM entities WHERE kind='obligation'").fetchall()
+        generated = project.connection.execute(
+            "SELECT created_at FROM events WHERE type='plan.generated' ORDER BY seq").fetchall()
+    try:
+        boundaries = sorted({stamp(row[0]) for row in generated})
+        times = {row[0]: (stamp(row[1]), stamp(row[2])) for row in metadata}
+        for item in obligations:
+            if item.get("superseded_at") is not None and item["id"] in times:
+                times[item["id"]] = (times[item["id"]][0], stamp(item["superseded_at"]))
+    except (EngineError, ValueError, TypeError, KeyError):
+        return set()
+
+    def generation(identity, column):
+        if identity not in times:
+            return None
+        index = bisect_left(boundaries, times[identity][column])
+        return index if index < len(boundaries) else None
+
+    replacements = {}
+    for item in obligations:
+        if item.get("kind") == "auth_review" and item.get("superseded"):
+            cycle = generation(item["id"], 1)
+            if cycle is not None:
+                replacements[item["operation_id"]] = cycle
+    prior_known = set()
+    for item in obligations:
+        cycle = replacements.get(item["operation_id"])
+        created = generation(item["id"], 0)
+        if cycle is not None and created is not None and created < cycle \
+                and (item.get("kind") == "identity_setup" or item.get("kind") == "baseline" and item.get("actor_id")):
+            prior_known.add(item["operation_id"])
+    return {item["id"] for item in obligations if item.get("kind") == "access" and item.get("superseded")
+            and item["operation_id"] not in prior_known and item["operation_id"] in replacements
+            and generation(item["id"], 1) == replacements[item["operation_id"]]}
+
+
+def _historically_closed(project, item, decisions, key):
+    from . import engine
+    from .assessment import validate_confirmation
+
+    decision = decisions.get(item.get("decision_id"), {})
+    if item.get("status") != "evaluated" or decision.get("obligation_id") != item["id"] \
+            or decision.get("outcome") not in {"confirmed", "refuted"} or not decision.get("evidence_ids"):
+        return False
+    if item.get("kind") == "input_test":
+        oracle = decision.get("oracle") or {}
+        if isinstance(key[-1], str) and key[-1].startswith("legacy_signature:"):
+            return False
+        if key[-1] == "sql_injection" and oracle.get("type") not in {"sql_metadata", "error_channel"}:
+            return False
+        if key[-1] == "xss" and (oracle.get("type") != "analyst_runtime" or oracle.get("test_family") != "xss"):
+            return False
+    try:
+        for identity in decision["evidence_ids"]:
+            engine.verify_current_evidence(project, identity)
+        # The old record stays superseded; only its real proof is checked here.
+        validate_confirmation(project, decision)
+    except (EngineError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+    return True
+
+
+def _consumer_requirements(operations, obligations):
+    result = []
+    for operation in operations.values():
+        for entry in operation.get("inputs", []):
+            probe = {"operation_id": operation["id"], "input_location": entry.get("location"),
+                     "input_selector": entry.get("selector", entry.get("name")), "schema_branch": entry.get("schema_branch")}
+            family = obligation_family(probe, operation)
+            families = entry.get("test_families", [])
+            missing = family == "xss" and "xss" not in families \
+                or family == "sql_injection" and "test_families" in entry and "sql_injection" not in families
+            if not missing:
+                continue
+            references = [item["id"] for item in obligations if not item.get("superseded")
+                          and item.get("operation_id") == operation["id"] and item.get("kind") in {"input_test", "input_review"}
+                          and all(item.get(key) == value for key, value in probe.items())]
+            result.append({**probe, "test_family": family, "consumer": entry.get("consumer"),
+                           "scope_key": (operation["id"], "input_test", probe["input_location"], probe["input_selector"],
+                                         probe["schema_branch"], family), "source_obligation_ids": references})
+    return result
+
+
+def _scope_reductions(project, obligations, operations, decisions, consumer_requirements):
+    active = set()
+    for item in obligations:
+        if not item.get("superseded"):
+            key = _scope_key(item, operations.get(item["operation_id"], {}))
+            if key is not None:
+                active.add(key)
+            if item.get("kind") == "access":
+                active.add((item["operation_id"], "baseline", item.get("actor_id")))
+    active.update(item["scope_key"] for item in consumer_requirements)
+    candidates = []
+    for item in obligations:
+        if not item.get("superseded"):
+            continue
+        key = _scope_key(item, operations.get(item["operation_id"], {}))
+        keys = [key] if key is not None else []
+        if item.get("kind") == "input_test" and isinstance(item.get("consumer_family"), str) \
+                and item["consumer_family"] in {"sql_injection", "xss"}:
+            keys.append((*key[:-1], item["consumer_family"]))
+        for key in set(keys):
+            if key not in active:
+                candidates.append((key, item))
+    unknown_replaced = _unknown_policy_replacements(project, obligations) \
+        if any(item.get("kind") == "access" for key, item in candidates) else set()
+    groups = {}
+    for key, item in candidates:
+        if item["id"] not in unknown_replaced and not _historically_closed(project, item, decisions, key):
+            groups.setdefault(key, []).append(item)
+    result = []
+    for key, items in sorted(groups.items(), key=lambda row: canonical(row[0])):
+        items.sort(key=lambda row: (row.get("created_at", ""), row["id"]))
+        result.append({**items[0], "scope_key": key, "source_obligation_ids": [item["id"] for item in items]})
+    return result
+
+
 def _inventory(project, evaluated):
     from . import browser, engine
 
     operations = {operation["id"]: operation for operation in project.list("operation")}
     gaps = {gap["id"]: gap for gap in evaluated["gaps"]}
-    obligations = [item for item in project.list("obligation") if not item.get("superseded")]
+    all_obligations = project.list("obligation")
+    obligations = [item for item in all_obligations if not item.get("superseded")]
+    # A current source authenticates the observation, not the caller's assertion
+    # that the whole obligation is inapplicable. Invalid sources already reopen
+    # the ordinary obligation gap and must not create a second review row.
+    applicability_reviews = [item for item in obligations if _status(item, gaps) == "not_applicable"]
     decisions = {decision["id"]: decision for decision in project.list("decision")}
+    consumer_requirements = _consumer_requirements(operations, all_obligations)
+    scope_reductions = _scope_reductions(project, all_obligations, operations, decisions, consumer_requirements)
     valid_decision_ids = {item.get("decision_id") for item in obligations if _status(item, gaps) == "evaluated"}
     current_findings = [finding for finding in evaluated["findings"] if finding.get("current") is True]
     finding_decision_ids = set()
@@ -155,9 +305,15 @@ def _inventory(project, evaluated):
                   and decision["id"] not in finding_decision_ids]
     unresolved_candidates = []
     proof_resolved_candidates = []
+    from .candidates import dismissal_valid
+    candidate_coverage = {**evaluated, "completion": {
+        "applicability_review_total": len(applicability_reviews),
+        "scope_reduction_review_total": len(scope_reductions) + len(consumer_requirements)}}
     for candidate in project.list("candidate"):
         if candidate.get("status", "unverified") == "dismissed":
-            continue
+            if dismissal_valid(project, candidate, candidate_coverage):
+                continue
+            candidate = {**candidate, "disposition_review_required": True}
         # A precisely bound accepted metadata proof can account for its original
         # tool clue. Merely linking a clue to an operation never resolves it.
         resolved = candidate.get("kind") == "tool_metadata" and any(
@@ -209,10 +365,15 @@ def _inventory(project, evaluated):
             "unlinked_analyst": unlinked_analyst, "unrecorded": unrecorded,
             "candidates": unresolved_candidates, "proof_resolved_candidates": proof_resolved_candidates,
             "page_coverage": page_coverage, "orphan_visits": orphan_visits, "pending_runs": pending_runs,
-            "partial_tools": partial_tools,
+            "partial_tools": partial_tools, "applicability_reviews": applicability_reviews,
+            "scope_reductions": scope_reductions,
+            "consumer_requirements": consumer_requirements,
             "browser_scope_config": {"scope": config.get("scope", []), "exclude": config.get("exclude", [])}}
     from .continuation import apply_reviews
-    return apply_reviews(project, inventory)
+    from .workflow import queue_inventory
+    inventory = apply_reviews(project, inventory)
+    inventory["queue"] = queue_inventory(project, evaluated, inventory)
+    return inventory
 
 
 def _security(inventory):
@@ -268,6 +429,8 @@ def _completion(inventory, security, evaluated):
         "functions_untriggered": len(inventory["page_coverage"]["untriggered"]),
         "unreconciled_runs": len(inventory["pending_runs"]),
         "failed_partial_tools": len(inventory["partial_tools"]),
+        "applicability_review_total": len(inventory.get("applicability_reviews", [])),
+        "scope_reduction_review_total": len(inventory.get("scope_reductions", [])) + len(inventory.get("consumer_requirements", [])),
         "limited_ownership_sampling": sum(operation.get("ownership_sampling", {}).get("limited") is True
                                           for operation in inventory["operations"].values()),
     }
@@ -277,7 +440,9 @@ def _completion(inventory, security, evaluated):
              "unrecorded_confirmations": "已确认判据尚未登记当前发现", "orphan_browser_visits": "浏览器观察未绑定页面、功能或运行时证明",
              "pages_unvisited": "登记页面尚未完成真实访问", "functions_untriggered": "登记功能尚未完成真实触发",
              "unreconciled_runs": "执行记录仍需检查或恢复，不能自动重放", "failed_partial_tools": "工具失败、远端执行未决或结果未完整归档仍需复核",
-             "limited_ownership_sampling": "权限测试超过有界样本预算"}
+             "limited_ownership_sampling": "权限测试超过有界样本预算",
+             "applicability_review_total": "人工不适用声明尚未形成可验证的测试闭环",
+             "scope_reduction_review_total": "未测义务因计划缩减而被隐藏，仍需恢复真实测试边界"}
     reasons = [f"{label}：{pending[key]} 项。" for key, label in names.items() if pending[key]]
     if security["operations_without_security_tests"]:
         reasons.append(f"{security['operations_without_security_tests']} 个操作仅登记或仅有基线，没有明确的安全测试义务。")
@@ -316,6 +481,7 @@ def _review_id(kind, identity):
 def _checklist(inventory):
     from .browser_policy import for_page
     rows = []
+    queue = {item["obligation_id"]: item for item in inventory.get("queue", [])}
     labels = {"baseline": "补齐正常业务基线", "input_review": "追踪真实输入消费点", "input_test": "完成具体输入安全假设",
               "access": "验证身份或角色访问边界", "ownership": "验证资源所有权与租户边界",
               "auth_review": "明确实际访问策略", "identity_setup": "补齐服务端核验身份", "ownership_setup": "补齐权限测试资源和独立主体"}
@@ -335,6 +501,72 @@ def _checklist(inventory):
             operation = inventory["operations"].get(item["operation_id"], {})
             row.update(action="surface.declare_consumer", suggested_test_families=suggested_families(_entry(operation, item), operation),
                        unverified_hint=True, reason_zh="字段名或媒体类型只提供待追踪方向，不是已证明的危险消费点。")
+        work = queue.get(item["id"], {})
+        if work:
+            row.update(queue_status=work["queue_status"], missing_prerequisites=work["missing_prerequisites"])
+        if work.get("scope_binding_review_required") is True and work.get("queue_status") != "blocked":
+            # The audit handoff only inspects local metadata; it never supplies a request URL.
+            for key in ("scope_binding_review_required", "url_requires_binding", "native_input_requires_binding",
+                        "requestable", "scope_handoff_note", "scope_binding_followup_action",
+                        "scope_binding_required_input_fields", "execution_blocked"):
+                if key in work:
+                    row[key] = work[key]
+            row.update(action="surface.inspect", suggested_action="surface.inspect",
+                       input_template={"operation_id": item["operation_id"]}, help_input={"name": "surface.inspect"},
+                       scope_binding_followup_template={"operation_id": item["operation_id"]})
+        if work.get("blocker_reconciliation_required"):
+            row.update(status="open", declared_status="blocked", action="plan.disposition",
+                       suggested_action="plan.disposition", blocker_reconciliation_required=True,
+                       underlying_queue_status=work["underlying_queue_status"], execution_blocked=True,
+                       input_template=dict(work["input_template"]), help_input={"name": "plan.disposition"},
+                       operator_reason=work.get("operator_reason"), reason_code="declared_blocker_unverified")
+        rows.append(row)
+    for item in inventory.get("scope_reductions", []):
+        row = {"id": _review_id("scope_reduction", canonical(item["scope_key"])), "kind": "scope_reduction",
+               "status": "open", "label_zh": "被缩减的未测边界仍需闭环",
+               "reason_zh": "变更输入族、分支或访问/所有权声明只能重建计划，不能把已登记但未测试的边界当作耗尽。保留旧义务来源，恢复对应边界后执行真实 typed 测试；行政复核或受阻文字不能关闭此项。",
+               "reason_code": "scope_reduction_unverified", "operation_id": item["operation_id"],
+               "obligation_id": item["id"], "obligation_kind": item.get("kind"),
+               "source_obligation_ids": item["source_obligation_ids"], "action": "surface.inspect",
+               "suggested_action": "surface.declare_consumer" if item.get("kind") == "input_test" else "surface.register",
+               "administrative_review_allowed": False,
+               "required_experiment_fields": ["Restore the exact previously planned family/input/branch or principal/fixture boundary from actual authorized sources.",
+                                              "Close the restored current obligation using accepted evidence-bound assessment; never replay uncertain writes."]}
+        row["help_input"] = {"name": row["suggested_action"]}
+        for key in ("input_location", "input_selector", "test_family", "schema_branch", "actor_id", "baseline_actor_id", "resource_id"):
+            if key in item:
+                row[key] = item[key]
+        if item.get("kind") == "input_test" and item["scope_key"][-1] in FAMILY_LABELS:
+            row["test_family"] = item["scope_key"][-1]
+        rows.append(row)
+    for item in inventory.get("consumer_requirements", []):
+        row = {"id": _review_id("consumer_family_required", canonical(item["scope_key"])), "kind": "consumer_family_required",
+               "status": "open", "label_zh": "已声明消费点缺少必需测试族",
+               "reason_zh": "明确 SQL 或 HTML 执行消费点不能靠只声明 generic 省略相应 SQL 元数据或 XSS 运行时验证。补齐具体族，再执行其真实 typed 闭环；这不是从字段名推测漏洞。",
+               "reason_code": "consumer_family_missing", "operation_id": item["operation_id"],
+               "input_location": item["input_location"], "input_selector": item["input_selector"],
+               "schema_branch": item.get("schema_branch"), "test_family": item["test_family"],
+               "source_obligation_ids": item["source_obligation_ids"], "action": "surface.declare_consumer",
+               "suggested_action": "surface.declare_consumer", "administrative_review_allowed": False,
+               "help_input": {"name": "surface.declare_consumer"},
+               "required_experiment_fields": ["Preserve the declared concrete consumer and include its required test_family.",
+                                              "Close each family independently with actual accepted evidence; this review is not a finding."]}
+        rows.append(row)
+    for item in inventory.get("applicability_reviews", []):
+        row = {"id": _review_id("unverified_applicability", item["id"]), "kind": "unverified_applicability",
+               "status": "open", "label_zh": "人工不适用声明仍需验证",
+               "reason_zh": "同操作正常观察和业务文字不能证明整个义务不适用。原声明与来源保留；重新打开义务后按实际前提和 typed 判据闭环，不能用行政复核或受阻声明归档。",
+               "reason_code": "applicability_unverified", "operation_id": item["operation_id"],
+               "obligation_id": item["id"], "obligation_kind": item.get("kind"),
+               "declared_status": "not_applicable", "basis": item.get("basis"),
+               "evidence_ids": item.get("evidence_ids", []), "action": "plan.disposition",
+               "suggested_action": "plan.disposition", "administrative_review_allowed": False,
+               "input_template": {"obligation_id": item["id"], "status": "open",
+                                  "reason": "Reopen the caller-declared exclusion for an accepted evidence-bound assessment."},
+               "help_input": {"name": "plan.disposition"}}
+        for key in ("input_location", "input_selector", "test_family", "schema_branch", "tenant_boundary"):
+            if key in item:
+                row[key] = item[key]
         rows.append(row)
     extras = (
         ("candidate", inventory["candidates"], "候选线索待复核", "候选登记或关联不能替代真实验证。", "candidate.inspect", "candidate_id"),
@@ -349,11 +581,33 @@ def _checklist(inventory):
         for item in items:
             row = {"id": _review_id(kind, item["id"]), "kind": kind, "status": "open", "label_zh": label,
                    "reason_zh": reason, "action": action, field: item["id"]}
+            prerequisites = inventory.get("review_prerequisites", {}).get(row["id"], [])
+            if prerequisites:
+                row.update(status="blocked", execution_blocked=True, missing_prerequisites=list(prerequisites),
+                           reason_code="review_prerequisite_missing")
             if item.get("operation_id"):
                 row["operation_id"] = item["operation_id"]
+            if kind == "candidate" and item.get("disposition_review_required"):
+                row.update(declared_status="dismissed", disposition_review_required=True,
+                           reason_code="candidate_dismissal_unverified", administrative_review_allowed=False,
+                           action="candidate.reopen", suggested_action="candidate.reopen",
+                           input_template={"candidate_id": item["id"], "reason": "Reopen the caller-declared dismissal for source-bound scope or duplicate review."},
+                           help_input={"name": "candidate.reopen"},
+                           reason_zh="Caller-only candidate dismissal is not verified scope exclusion or duplicate proof. Reopen the local clue for evidence-bound review; do not infer a finding or replay requests.")
             if kind == "orphan_browser_visit":
                 if item.get("adopt_ready"):
-                    row.update(suggested_action="page.adopt", input_template={"page_visit_id": item["id"]})
+                    row.update(status="open", suggested_action="page.adopt", input_template={"page_visit_id": item["id"]},
+                               administrative_review_allowed=False)
+                    if prerequisites:
+                        row.update(administrative_missing_prerequisites=list(prerequisites), missing_prerequisites=[],
+                                   reason_code="verified_browser_adoption")
+                elif not prerequisites:
+                    row.update(action="plan.review", suggested_action="plan.review",
+                               input_template={"checklist_id": row["id"], "status": "reviewed"},
+                               help_input={"name": "plan.review"},
+                               required_experiment_fields=["Inspect the complete read-only failed observation and supply the actual reviewer and reason.",
+                                                           "Administrative archive does not adopt a page, close an obligation, or authorize replay."],
+                               reason_code="failed_read_only_browser_review")
                 else:
                     row.update(status="blocked", action="plan.audit", suggested_action="plan.audit",
                                reason_code=item.get("review_reason_code"), reason_zh="已有浏览器观察失败、受阻或摘要/血缘失效，不能收编为成功页面覆盖。")
@@ -400,11 +654,21 @@ def _checklist(inventory):
     for row in rows:
         review = inventory.get("blocked_reviews", {}).get(row["id"])
         if review:
-            row.update(status="blocked", review_id=review["id"], reason_zh=review["reason"],
-                       action="plan.review", suggested_action="plan.review",
-                       input_template={"checklist_id": row["id"], "status": "reopen"})
+            row.update(declared_status="blocked", review_id=review["id"], operator_reason=review["reason"])
+            if row["status"] != "blocked":
+                row.update(underlying_queue_status="review", blocker_reconciliation_required=True,
+                           execution_blocked=True, action="plan.review", suggested_action="plan.review",
+                           input_template={"checklist_id": row["id"], "status": "reopen"},
+                           help_input={"name": "plan.review"},
+                           required_experiment_fields=["Inspect the current source and prerequisites offline before recording a new source-bound review."],
+                           reason_code="declared_review_blocker_unverified",
+                           reason_zh="The caller-declared blocker does not suppress feasible offline review. Reopen the local receipt; do not replay requests or infer a security result.")
+            else:
+                row.update(reason_zh=review["reason"], action="plan.audit", suggested_action="plan.audit")
+                row.pop("input_template", None)
             if "browser_testing" in row:
-                row["browser_testing"].update(stage="blocked", invoke_now=False, execution_blocked=True)
+                row["browser_testing"].update(stage="blocked", call_needed=False, invoke_now=False, execution_blocked=True)
+                row["browser_testing"].pop("native_visit_input", None)
     return sorted(rows, key=lambda row: (row["kind"] == "obligation", row["kind"], row["id"]))
 
 

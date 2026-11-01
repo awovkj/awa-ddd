@@ -18,6 +18,20 @@ const recordPath = join(validation, 'package-check.json');
 const startedAt = new Date().toISOString();
 await writeFile(recordPath, JSON.stringify({ result: 'running', started_at: startedAt }, null, 2) + '\n');
 
+async function shippedSourceManifest(files, installedRoot) {
+  const rows = [];
+  for (const path of [...files].sort()) {
+    const original = resolve(root, path);
+    const delta = relative(root, original);
+    assert.ok(delta && !isAbsolute(delta) && delta !== '..' && !delta.startsWith(`..${sep}`), 'Source must stay below the checkout.');
+    const sourceDigest = createHash('sha256').update(await readFile(original)).digest('hex');
+    assert.equal(sourceDigest, createHash('sha256').update(await readFile(join(installedRoot, path))).digest('hex'),
+      `The extracted ${path} differs from the current release source.`);
+    rows.push({ path, sha256: sourceDigest });
+  }
+  return rows;
+}
+
 try {
   assert.ok(process.env.npm_execpath, 'Run this check with npm run pack:check.');
   const { stdout } = await run(process.execPath, [process.env.npm_execpath, 'pack', '--ignore-scripts', '--offline',
@@ -26,14 +40,14 @@ try {
   const files = new Set(packed.files.map(file => file.path));
   const required = ['package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'pyproject.toml',
     'src/index.mjs', 'src/bridge.mjs', 'src/tools.mjs', 'src/actions.mjs', 'src/tool-guidance.mjs',
-    'src/parse-js.mjs', 'src/mode.mjs', 'src/client.js',
+    'src/parse-js.mjs', 'src/mode.mjs', 'src/stop-policy.mjs', 'src/host-continuation.mjs', 'src/client.js',
     'scripts/invoke-request.mjs', 'scripts/Invoke-AwaDdd.ps1', 'skills/awa-ddd/SKILL.md',
-    'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/REPRODUCTION.md',
+    'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/UPGRADE-20261031.md', 'docs/REPRODUCTION.md',
     'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md', 'docs/PLAYWRIGHT_TESTING.md',
     ...['__init__', '__main__', 'store', 'engine', 'scope', 'transport', 'assessment', 'scenario',
       'discovery', 'importers', 'reporting', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
       'mcp_http', 'tscanplus',
-      'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction'].map(module => `awa_ddd/${module}.py`)];
+      'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction', 'publication'].map(module => `awa_ddd/${module}.py`)];
   for (const file of required) assert.ok(files.has(file), `Release is missing ${file}`);
   for (const file of files) {
     assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|node_modules|__pycache__|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|htmlcov|coverage|projects|tests|backups?)(?:\/|$)/);
@@ -52,7 +66,7 @@ try {
     assert.ok(!name.startsWith('@deepseek-ai/'),
       `dependencies must not include ${name}: shipping an SDK copy shadows the host's instance`);
   }
-  for (const name of ['@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery', '@deepseek-ai/cordis']) {
+  for (const name of ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-llm', '@deepseek-ai/schemastery', '@deepseek-ai/cordis']) {
     assert.ok(manifest.peerDependencies?.[name],
       `${name} must stay a peerDependency so the host supplies the single instance`);
   }
@@ -86,11 +100,17 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
   // SDK dependencies resolve from the installed development host above stage;
   // application code and all Python modules come from the extracted archive.
   const installedRoot = join(destination, 'package');
+  const publishedSource = await shippedSourceManifest(files, installedRoot);
   const plugin = await import(pathToFileURL(join(installedRoot, 'src', 'index.mjs')).href);
   const registered = [];
+  const hooks = new Map();
   let dispose;
   const workspace = join(stage, 'state');
-  plugin.apply({ effect(factory) { dispose = factory(); }, tools: { register(tool) { registered.push(tool); } } },
+  plugin.apply({ effect(factory) { dispose = factory(); }, tools: { register(tool) { registered.push(tool); } },
+    on(event, callback) {
+      hooks.set(event, callback);
+      return () => { if (hooks.get(event) === callback) hooks.delete(event); };
+    } },
     { workspace, pythonExecutable, timeoutMs: 10000 });
   // Derive the expected group set from the packaged module instead of hard-coding a
   // count: a stale literal here silently fails the release check after any tool change.
@@ -101,6 +121,9 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
 
   // The penetration-mode half must ship and declare its client entry.
   const installedManifest = JSON.parse(await readFile(join(installedRoot, 'package.json'), 'utf8'));
+  assert.equal(installedManifest.name, manifest.name);
+  assert.equal(installedManifest.version, manifest.version);
+  assert.equal(packed.version, manifest.version);
   assert.equal(installedManifest.exports['./client'], './src/client.js');
   assert.equal(installedManifest.dsh.client.platform, 'web');
 
@@ -119,10 +142,18 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
   assert.equal(mode.name, 'awa-ddd-penetration-mode');
   assert.equal(typeof mode.apply, 'function');
   assert.equal(mode.penetrationProjection.key, 'penetration');
+  const stopPolicy = await import(pathToFileURL(join(installedRoot, 'src', 'stop-policy.mjs')).href);
+  assert.deepEqual(stopPolicy.inject, ['systemPrompt']);
+  assert.match(stopPolicy.STOP_POLICY_TEXT, /Automatic finalization is exhaustion-only/);
+  const hostContinuation = await import(pathToFileURL(join(installedRoot, 'src', 'host-continuation.mjs')).href);
+  assert.equal(hostContinuation.TURN_STOPPING_EVENT, 'agent/turn-stopping');
+  assert.equal(typeof hostContinuation.createController, 'function');
+  assert.equal(typeof hooks.get('agent/pre-step'), 'function');
+  assert.equal(typeof hooks.get(hostContinuation.TURN_STOPPING_EVENT), 'function');
   const signal = new AbortController().signal;
-  const dispatch = async (name, action, input = {}, project_id = 'package-smoke') => {
+  const dispatch = async (name, action, input = {}, project_id = 'package-smoke', execution = { signal }) => {
     const tool = registered.find(tool => tool.name === name);
-    return (await tool.execute({ action, ...(project_id ? { project_id } : {}), input }, { signal })).data;
+    return (await tool.execute({ action, ...(project_id ? { project_id } : {}), input }, execution)).data;
   };
   try {
     const catalog = await dispatch('awa_project', 'action.help', {}, null);
@@ -130,6 +161,9 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.deepEqual(Object.values(catalog.groups).flat().sort(), [...ACTIONS].sort());
     const help = await dispatch('awa_project', 'action.help', { name: 'http.preflight' }, null);
     assert.equal(help.fields.body_file.includes('local file'), true);
+    const stopHelp = await dispatch('awa_project', 'action.help', { name: 'plan.finalize' }, null);
+    assert.match(stopHelp.fields.reason, /^completed/);
+    assert.doesNotMatch(stopHelp.fields.reason, /\|/);
     const runtime = await dispatch('awa_external', 'runtime.probe', { backend: 'native' }, null);
     assert.equal(runtime.target_traffic_sent, false);
     await dispatch('awa_project', 'project.create', { target: 'https://example.invalid/', scope: ['https://example.invalid/'] });
@@ -155,6 +189,35 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(ready.requests_sent, 0);
     assert.equal(typeof ready.browser_testing_summary.task_total, 'number');
     assert.ok(ready.work_items.every(item => item.browser_testing && typeof item.browser_testing.call_needed === 'boolean'));
+    const localOperation = await dispatch('awa_surface', 'surface.register', {
+      url: 'https://example.invalid/offline-fixture', method: 'GET', auth: 'public',
+      inputs: [{ name: 'q', location: 'query', consumer: 'business_input', test_families: ['generic'] }],
+    });
+    const agent = { id: 'packaged-agent-fixture', status: 'running', session: {},
+      inbox: { nextStep: [], nextTurn: [] }, steer(message) { this.inbox.nextStep.push(message); } };
+    const boundary = { agent, signal, turn: 1 };
+    await hooks.get('agent/pre-step')(boundary, async () => ({ kind: 'enter', messages: [{
+      id: 'packaged-user-fixture', role: 'user', source: { kind: 'user' },
+      content: [{ type: 'text', text: 'Continue offline planning and source review for this fixture; no target requests.' }],
+    }] }));
+    const boundReady = await dispatch('awa_plan', 'plan.next', {}, 'package-smoke', { agent, signal });
+    const actualReady = boundReady.work_items.find(item => item.operation_id === localOperation.id && item.queue_status === 'ready');
+    assert.ok(actualReady, 'The packaged fixture must have actual ready work before a caller block.');
+    await dispatch('awa_plan', 'plan.disposition', { obligation_id: actualReady.obligation_id, status: 'blocked',
+      reason: 'Caller-only package fixture declaration; no prerequisite changed.' });
+    const reconciled = await dispatch('awa_plan', 'plan.next');
+    const blocker = reconciled.work_items.find(item => item.obligation_id === actualReady.obligation_id);
+    assert.equal(blocker.queue_status, 'review');
+    assert.equal(blocker.blocker_reconciliation_required, true);
+    assert.equal(blocker.execution_blocked, true);
+    assert.equal(blocker.suggested_action, 'plan.disposition');
+    assert.equal(reconciled.requests_sent, 0);
+    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
+    assert.equal(agent.inbox.nextStep.length, 1);
+    assert.equal(agent.inbox.nextStep[0].source.kind, 'awa-ddd-host-continuation');
+    assert.match(agent.inbox.nextStep[0].content[0].text, /OFFLINE/);
+    await dispatch('awa_plan', 'plan.disposition', blocker.input_template);
+    assert.equal((await dispatch('awa_project', 'project.status')).run_total, 0);
     const closure = await dispatch('awa_plan', 'plan.audit', { limit: 1 });
     assert.equal(closure.requests_sent, 0);
     assert.equal(closure.completion.status, 'partial');
@@ -203,6 +266,16 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     const dismissed = await dispatch('awa_candidate', 'candidate.dismiss',
       { candidate_id: target.id, reason: 'package smoke: verified the ledger round-trip' });
     assert.equal(dismissed.status, 'dismissed');
+    const candidateAudit = await dispatch('awa_plan', 'plan.audit', { limit: 100 });
+    const candidateReview = candidateAudit.checklist.find(item => item.candidate_id === target.id);
+    assert.ok(candidateReview, 'A reason-only dismissal must not erase the packaged discovery queue.');
+    assert.equal(candidateReview.reason_code, 'candidate_dismissal_unverified');
+    assert.equal(candidateReview.suggested_action, 'candidate.reopen');
+    assert.equal(candidateReview.administrative_review_allowed, false);
+    assert.ok(candidateAudit.completion.unresolved_candidates > 0);
+    await assert.rejects(dispatch('awa_plan', 'plan.review', { checklist_id: candidateReview.id,
+      status: 'blocked', reviewer: 'package fixture reviewer', reason: 'Caller text is not candidate evidence.' }),
+    error => error.code === 'closure_review');
     const draft = await dispatch('awa_report', 'report.build', { stage: 'draft' });
     assert.equal(draft.stage, 'draft');
     assert.equal(draft.continuation.continue_required, true);
@@ -212,17 +285,21 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
       checkpoint_id: round.checkpoint.id, reason: 'completed', reviewer: 'package fixture reviewer',
       explanation: 'This attempt must fail because ready/review fixture tasks remain.',
     }), error => error.code === 'continue_required');
-    const stop = await dispatch('awa_plan', 'plan.finalize', {
-      checkpoint_id: round.checkpoint.id, reason: 'user_stop', reviewer: 'package fixture user',
-      explanation: 'The fixture user explicitly ended this offline package test; remaining work is not exhausted.',
-    });
-    assert.equal(stop.finalization.can_claim_complete, false);
-    assert.equal(stop.finalization.external_constraint_verified, false);
-    const report = await dispatch('awa_report', 'report.build', {
-      stage: 'final', finalization_id: stop.finalization.id,
-    });
-    assert.equal(report.delivery_status, 'final-partial');
+    for (const reason of ['budget_exhausted', 'user_stop', 'authorization_boundary', 'blocked']) {
+      await assert.rejects(dispatch('awa_plan', 'plan.finalize', {
+        checkpoint_id: round.checkpoint.id, reason, reviewer: 'package fixture reviewer',
+        explanation: 'Caller text cannot authorize automatic stopping with unfinished fixture work.',
+      }), error => error.code === 'stop_policy' && error.details?.continuation?.continue_required === true);
+    }
+    await assert.rejects(dispatch('awa_report', 'report.build', { stage: 'final' }),
+      error => error.code === 'finalization_required');
+    const report = await dispatch('awa_report', 'report.build', { stage: 'draft' });
+    assert.equal(report.delivery_status, 'draft');
     assert.equal(report.continuation.can_claim_complete, false);
+    assert.equal(report.continuation.stop_policy, 'exhaustion_only');
+    assert.equal(report.continuation.automatic_stop_allowed, false);
+    assert.equal(report.continuation.continue_required, true);
+    assert.equal(report.finalization, null);
     assert.doesNotMatch(JSON.stringify(report), new RegExp(credential));
     const reportBytes = await readFile(report.report);
     const summaryBytes = await readFile(report.summary);
@@ -241,27 +318,37 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     }
     assert.doesNotMatch(reportBytes.toString('utf8') + summaryBytes.toString('utf8'), new RegExp(credential));
     assert.equal((await readFile(join(workspace, 'projects', 'package-smoke', 'assessment.sqlite3'))).subarray(0, 15).toString(), 'SQLite format 3');
+    assert.deepEqual(await shippedSourceManifest(files, installedRoot), publishedSource,
+      'Release sources changed during package validation; rerun the check.');
     const retainedArchive = join(validation, packed.filename);
     await copyFile(archive, retainedArchive);
+    const archiveDigest = createHash('sha256').update(await readFile(retainedArchive)).digest('hex');
+    assert.equal(archiveDigest, createHash('sha256').update(await readFile(archive)).digest('hex'));
     await writeFile(recordPath, JSON.stringify({
       package: packed.name, version: packed.version, files: files.size,
       archive_path: retainedArchive,
-      archive_sha256: createHash('sha256').update(await readFile(archive)).digest('hex'),
+      archive_sha256: archiveDigest,
+      source_sha256: createHash('sha256').update(JSON.stringify(publishedSource)).digest('hex'),
+      source_files: publishedSource,
       sdk_entry: 'extracted package/src/index.mjs', native_tool_groups: registered.length,
-      checks: ['archive contents', 'native SDK tool definitions', 'Python bridge', 'SQLite persistence',
+      checks: ['archive contents', 'current source byte equality before and after smoke', 'current packaged version and retained archive SHA-256', 'native SDK tool definitions', 'Python bridge', 'SQLite persistence',
         'OpenAPI import', 'JavaScript AST/acorn import', 'private session summary', 'shared plan/coverage evaluator',
-        'stable gap projection', 'candidate ledger round-trip', 'penetration mode module and client entry',
+        'stable gap projection', 'candidate ledger round-trip and unverified dismissal review', 'penetration mode module and client entry',
+        'always-on exhaustion-only prompt and packaged public-hook registration',
+        'active bound offline steering through the extracted entry with a fixture Agent',
+        'caller-only blocked ready work retains an offline reconciliation template; zero target runs',
         'packaged action/help catalog equality', 'native runtime inventory', 'bounded inventory/readiness',
         'offline plan.build/http.preflight with no run claims', 'packaged UTF-8 BOM input and no-BOM result CLI',
         'read-only completion/category audit', 'draft is not a stop record', 'persisted round checkpoint',
-        'ready/review work rejects completed finalization', 'explicit snapshot-bound partial stop/final report',
+        'ready/review work rejects completed finalization', 'caller-declared budget/user/authorization/blocked exits rejected',
+        'final report without strict finalization rejected; interrupted work remains draft',
         'Chinese format-5 report export and complete manifest digests'],
       network_requests: 0, result: 'passed', started_at: startedAt, finished_at: new Date().toISOString(),
     }, null, 2) + '\n');
   } finally {
     dispose();
   }
-  process.stdout.write('Package smoke passed: extracted native entry, help/runtime, Python/SQLite, UTF-8 file CLI, offline workflow and report.\n');
+  process.stdout.write('Package smoke passed: extracted entry/public hook, caller-block and candidate reconciliation, Python/SQLite, UTF-8 file CLI and draft report.\n');
 } catch (error) {
   await writeFile(recordPath, JSON.stringify({ result: 'failed', started_at: startedAt,
     finished_at: new Date().toISOString(), code: String(error.code || error.name || 'PACKAGE_CHECK_FAILED') }, null, 2) + '\n');

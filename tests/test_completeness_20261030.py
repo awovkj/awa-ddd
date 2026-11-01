@@ -226,15 +226,21 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(row["manual_followup_action"], "finding.record")
         self.assertNotIn("xss_execution", row["proof_channels"])
 
-    def test_blocked_review_disposition_is_not_silently_ready(self):
+    def test_caller_blocked_review_needs_offline_reopen_not_implicit_readiness(self):
         operation = self.operation(inputs=[{"name": "q", "location": "query"}])
         engine.build_plan(self.project)
         item = self.active(operation, "input_review")[0]
         engine.disposition(self.project, {"obligation_id": item["id"], "status": "blocked", "reason": "fixture sink not accessible"})
         result = workflow.next_work(self.project, {"include_blocked": True})
         row = next(row for row in result["work_items"] if row["obligation_id"] == item["id"])
-        self.assertEqual(row["queue_status"], "blocked")
+        self.assertEqual(row["queue_status"], "review")
+        self.assertEqual(row["declared_status"], "blocked")
+        self.assertEqual(row["underlying_queue_status"], "review")
+        self.assertTrue(row["blocker_reconciliation_required"])
         self.assertEqual(row["suggested_action"], "plan.disposition")
+        self.assertEqual(row["input_template"]["status"], "open")
+        self.assertTrue(row["execution_blocked"])
+        self.assertEqual(self.project.get("obligation", item["id"])["status"], "blocked")
 
     def test_baseline_is_observed_and_assessed_but_not_security_complete(self):
         operation = self.operation()
@@ -312,12 +318,17 @@ class CompletenessTests(unittest.TestCase):
         self.assertEqual(self.project.list("page"), [])
 
     def test_failed_browser_visit_cannot_be_adopted_as_success(self):
-        self.imported_visit(blocked=True)
+        visit = self.imported_visit(blocked=True)
         result = completeness.audit(self.project, {})
         row = next(row for row in result["checklist"] if row["kind"] == "orphan_browser_visit")
-        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["suggested_action"], "plan.review")
+        self.assertEqual(row["input_template"]["status"], "reviewed")
         self.assertNotEqual(row["action"], "page.adopt")
-        self.assertNotIn("input_template", row)
+        with self.assertRaises(EngineError):
+            browser.adopt_visit(self.project, {"page_visit_id": visit["id"]})
+        self.assertEqual(browser.coverage(self.project)["pages_visited"], 0)
+        self.assertEqual(self.project.list("page"), [])
 
     def test_partial_tool_failure_is_not_a_security_negative(self):
         operation = self.operation()

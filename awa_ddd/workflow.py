@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+from urllib.parse import urlsplit, urlunsplit
 
 from . import engine
 from .reporting import safe_metadata, safe_text, safe_url
@@ -204,6 +205,31 @@ def _observations(project):
     return by_operation
 
 
+def _query_scope_binding_possible(config, url):
+    """A proof-only path check, never a URL template or new scope authorization."""
+    from .scope import _matches, normalize_url
+
+    try:
+        target = normalize_url(url)
+        if urlsplit(target).query:
+            return False
+
+        def path_matches(rule):
+            parsed = urlsplit(normalize_url(rule))
+            widened = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            return parsed, _matches(widened, target)
+
+        excluded = [path_matches(rule) for rule in config.get("exclude", [])]
+        for rule in config.get("scope", []):
+            parsed, matched = path_matches(rule)
+            if matched and parsed.query and not any(matches and (not exclusion.query or exclusion.query == parsed.query)
+                                                     for exclusion, matches in excluded):
+                return True
+    except (EngineError, ValueError, TypeError, KeyError):
+        pass
+    return False
+
+
 def _work_item(project, gap, operations, live, observations, foreign_actors=()):
     operation = operations[gap["operation_id"]]
     kind = gap["obligation_kind"]
@@ -211,10 +237,6 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
     row["obligation_id"] = gap["id"]
     row["method"], row["url"] = operation["method"], safe_url(operation["url"])
     row["missing_prerequisites"] = []
-    if gap["status"] == "blocked":
-        row.update(queue_status="blocked", suggested_action="plan.disposition",
-                   input_template={"obligation_id": gap["id"], "status": "open", "reason": "Supply the resolved prerequisite before reopening"})
-        return row
     setup = {"auth_review": "surface.register", "input_review": "surface.declare_consumer",
              "identity_setup": "identity.actor", "ownership_setup": "identity.resource"}
     if kind in setup:
@@ -229,6 +251,12 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
                        note_zh="先追踪实际消费点；字段名提示不是已证实的 sink，不会自动创建或确认漏洞。")
         return row
     from .assessment import _authorized
+    try:
+        engine.require_scope(project.config, operation["url"])
+    except (EngineError, ValueError, TypeError):
+        row["missing_prerequisites"].append("exact_scoped_url_query_binding" if
+            _query_scope_binding_possible(project.config, operation["url"]) else "authorized_operation_scope")
+        row["execution_blocked"] = True
     allowed = [session for actor_id, session in live.items() if _authorized(project, operation, actor_id)] if operation["auth"] != "unknown" else []
     actor_id = gap.get("actor_id")
     session = live.get(actor_id) if actor_id else (allowed[0] if allowed and kind == "input_test" and operation["auth"] != "public" else None)
@@ -280,7 +308,7 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
     row.update(suggested_action="http.preflight", input_template=template,
                required_experiment_fields=["concrete input values", "oracle-specific business assertions"])
     successful = [item for item in evidence if 200 <= item.get("status_code", 0) < 300]
-    if kind == "baseline" and successful:
+    if kind == "baseline" and successful and operation["auth"] != "unknown":
         row.update(queue_status="ready", missing_prerequisites=[], suggested_action="assessment.evaluate",
                    input_template={"obligation_id": gap["id"], "evidence_ids": [successful[-1]["id"]]},
                    required_experiment_fields=["oracle.type:baseline", "oracle.selector", "oracle.expected"])
@@ -330,7 +358,11 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
                 row["proof_channels"].append("analyst_write_side_business_proof")
     if row["missing_prerequisites"]:
         existing = observations.get(operation["id"], [])
-        if kind in {"access", "ownership"}:
+        if operation["auth"] == "unknown":
+            # Unknown policy allows evidence inspection, never an inferred allowed actor.
+            existing = [item for item in existing if kind == "input_test"
+                        or item.get("actor_id") == actor_id]
+        elif kind in {"access", "ownership"}:
             existing = [item for item in existing if item.get("actor_id") == actor_id
                         or _authorized(project, operation, item.get("actor_id"))]
         elif kind == "input_test":
@@ -345,6 +377,53 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
                        observation_total=len(existing),
                        assessment_followup_action="finding.record" if row.get("hypothesis_family") == "xss" else "assessment.evaluate",
                        note_zh="新请求的前提不可用，但已有完整观察仍可离线复核；会话过期不等于历史证据失效。复核不通过时登记具体阻塞，不自动重放。")
+            if operation["auth"] == "unknown":
+                row.update(assessment_followup_action="surface.register", help_input={"name": "surface.register"},
+                           note_zh="已有观察可离线检查，但未知访问策略不能推断允许或拒绝。先声明实际访问策略，再选择匹配的身份、控制与判据；不得据此发包或关闭义务。")
+    if row["queue_status"] == "blocked" and row["missing_prerequisites"] == ["exact_scoped_url_query_binding"]:
+        row.update(queue_status="review", suggested_action="surface.inspect", input_template={"operation_id": operation["id"]},
+                   help_input={"name": "surface.inspect"}, execution_blocked=True, scope_binding_review_required=True,
+                   url_requires_binding=True, native_input_requires_binding=True, requestable=False,
+                   scope_binding_followup_action="http.preflight", scope_binding_required_input_fields=["url"],
+                   scope_binding_followup_template={"operation_id": operation["id"]},
+                   scope_handoff_note="The query-free operation locator is not a permitted request. Select the exact current intended URL from authorized sources, not by copying a scope rule or replaying an imported URL.")
+        row["required_experiment_fields"] += [
+            "Supply an exact current authorized URL with its real query binding before http.preflight; no URL value is supplied by this review.",
+            "Every baseline, variant and sensitivity-control request must independently satisfy fixed scope query constraints; selecting a binding does not authorize changing them."]
+        if "recommended_tools" in row:
+            row["recommended_tools"] = []
+    elif row["queue_status"] == "blocked" and "authorized_operation_scope" in row["missing_prerequisites"]:
+        row.update(suggested_action="surface.inspect", input_template={"operation_id": operation["id"]},
+                   help_input={"name": "surface.inspect"},
+                   required_experiment_fields=["Inspect the existing scope boundary offline; only actual authorization may change it."],
+                   scope_handoff_note="The current scope forbids execution. Do not widen scope or replay a request to remove this gap.")
+    return row
+
+
+def _reconcile_declared_blocker(row, gap):
+    """Preserve caller history, but never let prose suppress feasible offline work."""
+    if gap["status"] != "blocked":
+        return row
+    row["declared_status"] = "blocked"
+    if row["queue_status"] == "blocked":
+        return row
+    row.update(underlying_queue_status=row["queue_status"],
+               underlying_suggested_action=row["suggested_action"], queue_status="review",
+               blocker_reconciliation_required=True, execution_blocked=True,
+               suggested_action="plan.disposition", help_input={"name": "plan.disposition"},
+               input_template={"obligation_id": gap["id"], "status": "open",
+                               "reason": "Reopen the caller-declared blocker for offline prerequisite reconciliation; preflight remains required before any new request."},
+               required_experiment_fields=["Reconcile the declared blocker against the current prerequisites and existing evidence offline.",
+                                           "Reopening is not execution approval; preserve actual authorization, identity, fixture and browser limits."],
+               blocker_handoff_note="Caller-only blocked prose is not a missing prerequisite. This generated template only reopens local work; do not automatically replay a target request.")
+    if "recommended_tools" in row:
+        row["recommended_tools"] = []
+    for field in ("manual_followup_action", "assessment_followup_action", "browser_handoff_note"):
+        row.pop(field, None)
+    policy = row["browser_testing"]
+    policy.update(stage="blocked", call_needed=False, invoke_now=False, execution_blocked=True,
+                  required_input_fields=["offline_obligation_blocker_reconciliation"])
+    policy.pop("native_visit_input", None)
     return row
 
 
@@ -395,6 +474,25 @@ def queue_inventory(project, evaluated, inventory=None):
         evidence = [item for item in observations.get(operation_id, []) if item["id"] in evidence_ids]
         policy = row["browser_testing"] = for_work_item(browser_context, operations[operation_id], gap, row, evidence)
         family = row.get("hypothesis_family") or gap.get("test_family")
+        binding_review = row.get("scope_binding_review_required") is True
+        if binding_review and policy["requirement"] == "required":
+            linked = browser_context.linked_pages(operations[operation_id])
+            if linked and all(page.get("visit_status") == "BLOCKED" for page in linked):
+                row.update(queue_status="blocked", execution_blocked=True)
+                row["missing_prerequisites"].append("explicit_consumer_page_unblock_or_authorized_alternative")
+                policy.update(stage="blocked", invoke_now=False, execution_blocked=True,
+                              required_input_fields=list(row["missing_prerequisites"]))
+            else:
+                policy.update(stage="prepare", invoke_now=False, execution_blocked=True, native_input_requires_binding=True,
+                              required_input_fields=["exact_scoped_url_query_binding", "scoped_consumer_url"])
+                policy.pop("native_visit_input", None)
+        offline = row["suggested_action"] in {"evidence.inspect", "assessment.evaluate", "surface.register",
+                                               "surface.declare_consumer", "identity.actor", "identity.resource"} \
+            or binding_review and row["suggested_action"] == "surface.inspect"
+        if policy["stage"] == "blocked" and policy["requirement"] == "required" and not offline:
+            row.update(queue_status="blocked", execution_blocked=True)
+            row["missing_prerequisites"] = list(dict.fromkeys(
+                row["missing_prerequisites"] + policy.get("required_input_fields", [])))
         if policy["stage"] == "review_existing" and family == "xss":
             refs = policy["existing_observation"]
             row.update(queue_status="review", suggested_action="finding.record", help_input={"name": "finding.record"},
@@ -412,7 +510,7 @@ def queue_inventory(project, evaluated, inventory=None):
                            input_template={"name": "browser.import_mcp"})
             row["required_experiment_fields"] += policy["required_input_fields"]
             row["browser_handoff_note"] = "Use actual host Playwright tools first; this template is a bounded native fallback, not authorization. Fill the missing exact URL/interaction inputs before invocation."
-        rows.append(row)
+        rows.append(_reconcile_declared_blocker(row, gap))
     return rows
 
 

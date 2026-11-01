@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import shlex
-from urllib.parse import parse_qsl, quote, quote_plus, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, quote_plus, unquote, unquote_plus, urlsplit, urlunsplit
 
 from .store import EngineError
 
@@ -17,11 +17,13 @@ _SECRET_KEYS = {
     "idtoken", "authorization", "proxyauthorization", "cookie", "setcookie", "apikey",
     "privatekey", "credential", "credentials", "jwt", "signature", "sign", "paysign",
     "smscode", "verificationcode", "verifycode", "otp", "pin", "code", "phone", "mobile", "email",
+    "credentialnonce",
 }
 _AUTH_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key",
                  "x-auth-token", "x-session-token"}
 _MANAGED_HEADERS = {"host", "content-length", "transfer-encoding", "connection", "accept-encoding"}
 _PLACEHOLDER = re.compile(r"<AWA_[A-Z0-9_]+>")
+_ENCODED_OMISSIONS = {"[content omitted: encoded protected value]", "[content omitted: nested encoding limit]"}
 _CHINESE_VALUE = re.compile(
     r"(?:支付密码|登录密码|数据库密码|数据库口令|明文密码|验证码|短信码|重置令牌|签名密钥|回调密钥)"
     r"\s*(?:(?:为|是|=|:|：)\s*){0,6}[\"'（(]?([A-Za-z0-9._~+/-]{4,})"
@@ -51,6 +53,8 @@ class Redactor:
         self.values = {}
         self.aliases = {}
         self._pattern = None
+        self._content_pattern = None
+        self._content_aliases = None
 
     def slot(self, value, kind="SECRET"):
         if value is None or isinstance(value, (dict, list, bool)):
@@ -76,6 +80,37 @@ class Redactor:
 
     def replace(self, value):
         text = "" if value is None else str(value)
+        if "%" in text:
+            decoded = text
+            for _ in range(5):
+                following = unquote(decoded)
+                if following == decoded:
+                    break
+                decoded = following
+                if self._replace_content_literals(decoded) != decoded:
+                    return "[content omitted: encoded protected value]"
+            else:
+                # Unresolved nested encoding is not safely publishable content.
+                if unquote(decoded) != decoded:
+                    return "[content omitted: nested encoding limit]"
+        return self._replace_literals(text)
+
+    def _replace_content_literals(self, text):
+        aliases = {**self.values, **self.aliases}
+        if aliases != self._content_aliases:
+            self._content_aliases = aliases
+            self._content_pattern = re.compile(_PLACEHOLDER.pattern + "|" + "|".join(
+                re.escape(item) for item in sorted(aliases, key=len, reverse=True))) if aliases else None
+        if self._content_pattern is not None:
+            text = self._content_pattern.sub(lambda match: aliases.get(match.group(0), match.group(0)), text)
+        return text
+
+    def content(self, value):
+        """Untrusted prose has no opaque-ID substring exception."""
+        self.learn_text(value)
+        return self._replace_content_literals(self.replace(value))
+
+    def _replace_literals(self, text):
         if self.aliases:
             if self._pattern is None:
                 def literal(item):
@@ -115,22 +150,32 @@ class Redactor:
     def structured(self, value, sensitive=False, key="SECRET"):
         if isinstance(value, dict):
             declared = value.get("name")
-            return {name: self.structured(item, sensitive or _secret_key(name) or
-                                          (name == "value" and _secret_key(declared)),
-                                          _normal_key(name).upper() or key)
-                    for name, item in value.items()}
+            result = {}
+            for name, item in value.items():
+                public_name = self.content(name)
+                if public_name in result or public_name in _ENCODED_OMISSIONS:
+                    raise EngineError("reproduction_binary", "Protected JSON keys cannot produce an unambiguous request template")
+                result[public_name] = self.structured(item, sensitive or _secret_key(name) or
+                    (name == "value" and _secret_key(declared)), _normal_key(name).upper() or key)
+            return result
         if isinstance(value, list):
             return [self.structured(item, sensitive, key) for item in value]
         if sensitive and value is not None:
             return self.slot(value, key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and len(str(value)) >= 4 and str(value) in self.values:
-            return self.values[str(value)]
-        return self.replace(value) if isinstance(value, str) else value
+        if type(value) in (int, float):
+            if str(value) in self.values:
+                return self.values[str(value)]
+            numeric = {int(secret): placeholder for secret, placeholder in self.values.items()
+                       if re.fullmatch(r"[0-9]{1,64}", secret)}
+            if value in numeric:
+                return numeric[value]
+        if isinstance(value, str):
+            return self.content(value)
+        return value
 
     def prose(self, value, limit=4000):
         from .reporting import safe_text
-        self.learn_text(value)
-        return safe_text(self.replace(value), limit, preserve_placeholders=set(self.values.values()))
+        return safe_text(self.content(value), limit, preserve_placeholders=set(self.values.values()))
 
     def metadata(self, value):
         from .reporting import safe_metadata
@@ -154,15 +199,19 @@ class Redactor:
             name, separator, value = field.partition("=")
             if separator and _secret_key(unquote_plus(name)):
                 value = self.slot(unquote_plus(value), _normal_key(unquote_plus(name)).upper())
-            result.append(self.replace(name) + separator + self.replace(value))
+            result.append(self.content(name) + separator + self.content(value))
         return "&".join(result)
 
     def url(self, value):
         parsed = urlsplit(value)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
             raise ValueError("Invalid captured URL")
-        return urlunsplit((parsed.scheme, self.replace(parsed.netloc), self.replace(parsed.path or "/"),
-                           self.form(parsed.query), ""))
+        host, path, query = self.replace(parsed.netloc), self.replace(parsed.path or "/"), self.form(parsed.query)
+        if any(self._replace_content_literals(component) != component for component in (host, path, query)):
+            raise ValueError("A protected locator requires an explicit new binding")
+        if any(marker in component for marker in _ENCODED_OMISSIONS for component in (host, path, query)):
+            raise ValueError("A protected or unresolved encoded locator requires an explicit new binding")
+        return urlunsplit((parsed.scheme, host, path, query, ""))
 
 
 def _body_bytes(document, side):
@@ -173,11 +222,22 @@ def _learn_header(redactor, name, value):
     redactor.slot(value, "HEADER_" + _normal_key(name).upper())
     lower = str(name).lower()
     if lower in {"cookie", "set-cookie"}:
-        fields = str(value).split(";")
-        for field in fields[:1] if lower == "set-cookie" else fields:
-            _, separator, token = field.strip().partition("=")
-            if separator and token:
-                redactor.slot(token, "COOKIE_VALUE")
+        for line in str(value).splitlines():
+            fields = line.split(";")
+            for field in fields[:1] if lower == "set-cookie" else fields:
+                _, separator, token = field.strip().partition("=")
+                if separator and token:
+                    redactor.slot(token, "COOKIE_VALUE")
+                    if len(token) >= 2 and token[0] == token[-1] == '"':
+                        redactor.slot(token[1:-1], "COOKIE_VALUE")
+                        from http.cookies import CookieError, SimpleCookie
+                        quoted = SimpleCookie()
+                        try:
+                            quoted.load("awa_private=" + token)
+                            if "awa_private" in quoted:
+                                redactor.slot(quoted["awa_private"].value, "COOKIE_VALUE")
+                        except CookieError:
+                            pass
     elif lower in {"authorization", "proxy-authorization"}:
         scheme, separator, token = str(value).partition(" ")
         if separator and token:
@@ -254,11 +314,19 @@ def _multipart_body(redactor, data, content_type):
             if not (media.startswith("text/") or media in {"application/json", "application/xml"} or media.endswith(("+json", "+xml"))):
                 raise EngineError("reproduction_binary", "An opaque multipart file cannot be safely redacted")
         text = data[start:end].decode("utf-8")
-        clean = redactor.slot(text, "FORM_SECRET") if _secret_key(name) else redactor.replace(text)
+        framing = data[previous:start].decode("utf-8")
+        if redactor.content(framing) != framing:
+            raise EngineError("reproduction_binary", "Protected multipart framing requires an explicit new binding")
+        clean = redactor.slot(text, "FORM_SECRET") if _secret_key(name) else redactor.content(text)
         segments += [data[previous:start], clean.encode("utf-8")]
         previous = end
-    segments.append(data[previous:])
-    return b"".join(segments)
+    tail = data[previous:]
+    if redactor.content(tail.decode("utf-8")) != tail.decode("utf-8"):
+        raise EngineError("reproduction_binary", "Protected multipart framing requires an explicit new binding")
+    segments.append(tail)
+    clean = b"".join(segments)
+    _multipart(clean, content_type)
+    return clean
 
 
 def _safe_body(redactor, data, content_type):
@@ -284,7 +352,7 @@ def _safe_body(redactor, data, content_type):
         except (EngineError, ValueError, UnicodeError):
             return None, "multipart 边界/字段不唯一，或包含不透明文件；正文及执行模板未导出。", False
     else:
-        clean = redactor.form(text) if "application/x-www-form-urlencoded" in content_type else redactor.replace(text)
+        clean = redactor.form(text) if "application/x-www-form-urlencoded" in content_type else redactor.content(text)
     return clean.encode("utf-8"), clean, clean != text
 
 
@@ -344,7 +412,7 @@ def _response_observables(redactor, artifact, decision):
             for index, child in enumerate(item):
                 walk(child, path + "/" + str(index), sensitive, key)
         elif sensitive and item is not None and len(str(item)) >= 4:
-            result.append({"selector": redactor.replace(path), "observed_excerpt": redactor.slot(item, key),
+            result.append({"selector": redactor.content(path), "observed_excerpt": redactor.slot(item, key),
                            "sensitive_value_present": True, "source": "original_response"})
 
     walk(value)
@@ -364,7 +432,7 @@ def _step(project, redactor, evidence, artifact, decision, index, folder, files)
             raise ValueError("Invalid captured header framing")
         if name.lower() not in _MANAGED_HEADERS:
             headers[name] = redactor.slot(value, "HEADER_" + _normal_key(name).upper()) \
-                if name.lower() in names or _secret_key(name) else redactor.replace(value)
+                if name.lower() in names or _secret_key(name) else redactor.content(value)
     url = redactor.url(request["url"])
     body, body_text, changed = _safe_body(redactor, _body_bytes(artifact, "request"), _content_type(raw_headers))
     response_data, response_text, _ = _safe_body(redactor, _body_bytes(artifact, "response"), _content_type(response.get("headers") or []))
@@ -502,7 +570,7 @@ def _sqlmap(project, redactor, finding, decision, steps, folder):
             parameter = _manual_sql_parameter(project, step, location, selector)
         except (EngineError, ValueError, KeyError, TypeError):
             return {"available": False, "reason": "没有实际 tool_parameter 绑定，且请求不满足唯一 query / 标量 JSON / 表单输入配置；需要专用标记或适配前提，不输出貌似可用的 -p 命令。"}
-    arguments = ["-r", step["request_file"], "-p", redactor.replace(parameter), "--batch", "--level=1", "--risk=1",
+    arguments = ["-r", step["request_file"], "-p", redactor.content(parameter), "--batch", "--level=1", "--risk=1",
                  "--threads=1", "--technique=BEU", "--timeout=5", "--retries=0", "--ignore-redirects", "--ignore-proxy", "--disable-coloring",
                  "--output-dir=sqlmap-results/" + _component(finding["id"], "F"), "--fresh-queries"]
     if step["url"].startswith("https://"):
@@ -520,8 +588,8 @@ def _sqlmap(project, redactor, finding, decision, steps, folder):
     commands = {"posix": 'python3 -X utf8 "$AWA_SQLMAP_PATH" ' + shlex.join(arguments),
                 "powershell": "& 'python' '-X' 'utf8' $env:AWA_SQLMAP_PATH " +
                 " ".join("'" + item.replace("'", "''") + "'" for item in arguments)}
-    return {"available": True, "parameter": redactor.replace(parameter), "input_location": location,
-            "input_selector": redactor.replace(selector), "baseline_evidence_id": step["evidence_id"],
+    return {"available": True, "parameter": redactor.content(parameter), "input_location": location,
+            "input_selector": redactor.content(selector), "baseline_evidence_id": step["evidence_id"],
             "request_file": step["request_file"], "tool_run_id": proof.get("tool_run_id"),
             "request_method": step["method"], "recorded_profile": redactor.metadata(recorded.get("profile")),
             "commands": commands, "scope": scope, "manual_only": True, "executed_by_report": False,
@@ -534,7 +602,16 @@ def _sqlmap(project, redactor, finding, decision, steps, folder):
 def prepare_reproduction(project, findings, *, context=None):
     """Return sanitized descriptions and bytes; never write files or send requests."""
     redactor, files, warnings = Redactor(), {}, []
+    from .browser import learn_redaction_context
+    unavailable = learn_redaction_context(project, redactor)
     redactor.learn(context)
+    if any(unavailable.values()):
+        warning = "Private legacy browser context is unavailable; this report contains ledger metadata only, with no request/body files or execution commands. Restore the actual local context before preparing new reproduction material; never replay unknown writes."
+        details = {finding["id"]: {"available": False, "metadata_only": True, "steps": [],
+                   "evidence_ids": list(finding.get("evidence_ids") or []), "manual_only": True,
+                   "executed_by_report": False, "unavailable_reason": warning, "limitations": [warning]}
+                   for finding in findings if finding.get("current") is True}
+        return {"finding_details": details, "files": {}, "redactor": redactor, "warnings": [warning], "metadata_only": True}
     sessions = project.list("session")
     redactor.learn(project.config)
     for kind in ("actor", "resource"):
@@ -648,5 +725,5 @@ def prepare_reproduction(project, findings, *, context=None):
                 raise ValueError("A generated JSON template became ambiguous")
             files[path] = clean
         else:
-            files[path] = redactor.replace(data.decode("utf-8")).encode("utf-8")
+            files[path] = redactor.content(data.decode("utf-8")).encode("utf-8")
     return {"finding_details": redactor.scrub_generated(details), "files": files, "redactor": redactor, "warnings": warnings}

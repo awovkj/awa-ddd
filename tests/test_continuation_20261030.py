@@ -101,7 +101,7 @@ class ContinuationTests(unittest.TestCase):
         for reason in ("completed", "blocked"):
             with self.subTest(reason=reason), self.assertRaises(EngineError) as caught:
                 self.finish(checkpoint, reason)
-            self.assertEqual("continue_required", caught.exception.code)
+            self.assertEqual("continue_required" if reason == "completed" else "stop_policy", caught.exception.code)
             self.assertGreater(caught.exception.details["continuation"]["actionable_total"], 0)
         self.assertEqual(before, self.project.list("finalization"))
 
@@ -150,35 +150,50 @@ class ContinuationTests(unittest.TestCase):
         self.assertGreater(result["continuation"]["review_total"], 0)
         self.assertFalse(result["continuation"]["can_finalize"])
 
-    def test_declared_blocked_queue_allows_only_partial_stop(self):
+    def test_declared_blocked_queue_never_authorizes_automatic_stop(self):
         for row in self.project.list("obligation"):
             engine.disposition(self.project, {"obligation_id": row["id"], "status": "blocked",
                                              "reason": "The declared fixture observer is unavailable."})
         result = workflow.next_work(self.project, {})
-        self.assertEqual([], result["work_items"])
-        self.assertGreater(result["blocked_total"], 0)
+        self.assertEqual(2, len(result["work_items"]))
+        self.assertEqual(0, result["blocked_total"])
+        self.assertEqual(2, result["review_total"])
+        self.assertTrue(all(row["queue_status"] == "review" and row["declared_status"] == "blocked"
+                            and row["suggested_action"] == "plan.disposition"
+                            and row["input_template"]["status"] == "open" for row in result["work_items"]))
         self.assertTrue(result["continuation"]["continue_required"])
         self.checkpoint(self.frontier(blocked=True))
         second = self.checkpoint(self.frontier(blocked=True))
+        self.assertEqual(0, second["continuation"]["frontier_rounds"])
+        self.assertFalse(second["continuation"]["can_finalize"])
+        self.assertFalse(second["continuation"]["automatic_stop_allowed"])
         with self.assertRaises(EngineError) as caught:
             self.finish(second)
-        self.assertEqual("assessment_partial", caught.exception.code)
-        result = self.finish(second, "blocked")
-        self.assertFalse(result["continuation"]["can_claim_complete"])
-        self.assertEqual("projected_declared_blockers", result["finalization"]["reason_basis"])
+        self.assertEqual("continue_required", caught.exception.code)
+        with self.assertRaises(EngineError) as caught:
+            self.finish(second, "blocked")
+        self.assertEqual("stop_policy", caught.exception.code)
+        self.assertTrue(caught.exception.details["continuation"]["continue_required"])
+        self.assertEqual([], self.project.list("finalization"))
 
-    def test_explicit_external_exit_is_partial_and_not_authenticated_budget_proof(self):
+    def test_external_claims_cannot_authorize_automatic_stop(self):
         for reason in ("user_stop", "budget_exhausted", "authorization_boundary"):
             checkpoint = self.checkpoint(label="An actual externally requested fixture pause.")
-            result = self.finish(checkpoint, reason)
-            self.assertGreater(result["finalization"]["remaining"]["ready_total"], 0)
-            self.assertFalse(result["finalization"]["can_claim_complete"])
-            self.assertFalse(result["finalization"]["external_constraint_verified"])
-            self.assertEqual("caller_declared_external_constraint", result["finalization"]["reason_basis"])
+            before = [tuple(row) for row in self.project.connection.execute("SELECT * FROM entities ORDER BY kind,id")]
+            with self.subTest(reason=reason), self.assertRaises(EngineError) as caught:
+                self.finish(checkpoint, reason)
+            self.assertEqual("stop_policy", caught.exception.code)
+            self.assertTrue(caught.exception.details["continuation"]["continue_required"])
+            self.assertFalse(caught.exception.details["continuation"]["automatic_stop_allowed"])
+            self.assertEqual({"action": "report.build", "input": {"stage": "draft"}}, caught.exception.details["progress_export"])
+            self.assertEqual(before, [tuple(row) for row in self.project.connection.execute("SELECT * FROM entities ORDER BY kind,id")])
+            self.assertEqual([], self.project.list("finalization"))
 
     def test_new_checkpoint_resumes_even_without_new_material(self):
-        checkpoint = self.checkpoint()
-        finished = self.finish(checkpoint, "user_stop")
+        self.close_generic()
+        self.checkpoint(self.frontier())
+        checkpoint = self.checkpoint(self.frontier())
+        finished = self.finish(checkpoint)
         resumed = self.checkpoint()
         self.assertEqual(checkpoint["checkpoint"]["snapshot_id"], resumed["checkpoint"]["snapshot_id"])
         self.assertTrue(resumed["continuation"]["continue_required"])
@@ -190,7 +205,7 @@ class ContinuationTests(unittest.TestCase):
         checkpoint = self.checkpoint()
         self.capture(url=self.operation["url"] + "?q=new")
         with self.assertRaises(EngineError) as caught:
-            self.finish(checkpoint, "user_stop")
+            self.finish(checkpoint)
         self.assertEqual("checkpoint_stale", caught.exception.code)
 
     def test_repeated_captures_are_not_closure_progress_or_stop_permission(self):
@@ -450,10 +465,11 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual([], self.project.list("checkpoint"))
 
     def test_public_round_and_stop_receipts_redact_text_but_keep_private_original(self):
-        result = self.checkpoint(label="auth_token=private-round-value")
+        self.close_generic()
+        result = self.checkpoint(self.frontier(), label="auth_token=private-round-value")
         self.assertNotIn("private-round-value", json.dumps(result))
         self.assertIn("private-round-value", self.project.get("checkpoint", result["checkpoint"]["id"])["label"])
-        result = self.finish(result, "user_stop", explanation="password=private-stop-value", reviewer="token=private-reviewer-value")
+        result = self.finish(self.checkpoint(self.frontier()), explanation="password=private-stop-value", reviewer="token=private-reviewer-value")
         self.assertNotIn("private-stop-value", json.dumps(result))
         self.assertNotIn("private-reviewer-value", json.dumps(result))
         self.assertIn("private-stop-value", self.project.get("finalization", result["finalization"]["id"])["explanation"])
@@ -539,13 +555,25 @@ class ContinuationTests(unittest.TestCase):
 
     def test_new_actions_dispatch_using_public_protocol(self):
         result = dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "label": "protocol fixture"})
+        with self.assertRaises(EngineError) as caught:
+            dispatch(self.root, "plan.finalize", {"project_id": "continuation",
+                "checkpoint_id": result["checkpoint"]["id"], "reason": "user_stop", "reviewer": "fixture user",
+                "explanation": "An actual user interruption retains draft progress, not automatic finalization."})
+        self.assertEqual("stop_policy", caught.exception.code)
+        draft = dispatch(self.root, "report.build", {"project_id": "continuation"})
+        self.assertEqual("draft", draft["delivery_status"])
+        self.assertTrue(draft["continuation"]["continue_required"])
+        self.close_generic()
+        dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "frontier_review": self.frontier()})
+        result = dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "frontier_review": self.frontier()})
         stopped = dispatch(self.root, "plan.finalize", {"project_id": "continuation",
-            "checkpoint_id": result["checkpoint"]["id"], "reason": "user_stop", "reviewer": "fixture user",
-            "explanation": "The actual fixture user explicitly paused this test."})
+            "checkpoint_id": result["checkpoint"]["id"], "reason": "completed", "reviewer": "fixture user",
+            "explanation": "The finite fixture obligations and current complete frontier reviews are closed."})
         report = dispatch(self.root, "report.build", {"project_id": "continuation", "stage": "final",
                            "finalization_id": stopped["finalization"]["id"]})
-        self.assertEqual("final-partial", report["delivery_status"])
-        self.assertFalse(report["continuation"]["can_claim_complete"])
+        self.assertEqual("final-completed", report["delivery_status"])
+        self.assertTrue(report["continuation"]["can_claim_complete"])
+        self.assertTrue(report["continuation"]["automatic_stop_allowed"])
 
 
 if __name__ == "__main__":

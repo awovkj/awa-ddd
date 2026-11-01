@@ -13,7 +13,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from .store import EngineError, now, canonical
 from .engine import capture, verify_evidence, verify_current_evidence, preflight_capture, stable
-from .transport import response_json, pointer
+from .transport import response_json, pointer, json_equal
 
 
 def substitute(value, variables):
@@ -308,7 +308,7 @@ def run_scenario(project,args):
                 variables[step["id"]+"."+key]=pointer(response_json(artifact),selector)
             phase = "assertion"
             for assertion in step.get("assertions",[]):
-                if pointer(response_json(artifact),assertion["selector"])!=substitute(assertion["equals"],variables):
+                if not json_equal(pointer(response_json(artifact),assertion["selector"]), substitute(assertion["equals"], variables)):
                     raise EngineError("scenario_assertion", "Business assertion failed at step "+step["id"])
             run["checkpoints"][-1]["status"]="verified"
             project.put("run",run)

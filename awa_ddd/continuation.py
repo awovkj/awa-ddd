@@ -1,4 +1,4 @@
-"""Persisted continuation and honest, bounded stop gates; never execute requests."""
+"""Persisted continuation and evidence-bound exhaustion gates; never execute requests."""
 from __future__ import annotations
 
 from collections import Counter
@@ -11,7 +11,10 @@ ALL_FAMILIES = ("access_control", "sql_injection", "xss", "ssrf", "xxe", "path_t
                 "command_injection", "template_injection", "deserialization", "file_upload",
                 "business_logic", "generic")
 MIN_FRONTIER_ROUNDS = 2
-STOP_REASONS = {"completed", "blocked", "budget_exhausted", "user_stop", "authorization_boundary"}
+STOP_REASONS = {"completed"}
+REJECTED_STOP_REASONS = {"blocked", "budget_exhausted", "user_stop", "authorization_boundary"}
+STOP_POLICY = "exhaustion_only"
+STOP_POLICY_VERSION = 1
 REVIEW_LISTS = {"unassessed_observation": "unassessed", "failed_partial_tool": "partial_tools",
                "unreconciled_run": "pending_runs", "orphan_browser_visit": "orphan_visits",
                "unlinked_analyst_finding": "unlinked_analyst"}
@@ -41,10 +44,12 @@ def _ids(value, name):
 
 
 def _public(project, value):
+    from .browser import learn_redaction_context
     from .engine import credential_header_names
     from .reproduction import Redactor, _learn_header
 
     redactor = Redactor()
+    unavailable = learn_redaction_context(project, redactor)
     redactor.learn(value)
     for session in project.list("session"):
         for name in credential_header_names(session):
@@ -52,7 +57,61 @@ def _public(project, value):
             if secret is not None:
                 redactor.slot(secret, "SESSION_CREDENTIAL")
                 _learn_header(redactor, name, secret)
-    return redactor.metadata(value)
+    public = redactor.metadata(value)
+    if isinstance(value, dict) and isinstance(public, dict):
+        # Continuation contains generated handles, enums and counts, never caller
+        # prose. A fill value coinciding with a code must not corrupt its contract.
+        if isinstance(value.get("continuation"), dict):
+            public["continuation"] = dict(value["continuation"])
+        if isinstance(value.get("completion"), dict):
+            public["completion"] = dict(value["completion"])
+        with project._lock:
+            known_ids = {row[0] for row in project.connection.execute("SELECT id FROM entities").fetchall()}
+
+        def restore_handles(original, sanitized):
+            if isinstance(original, dict) and isinstance(sanitized, dict):
+                for key, item in original.items():
+                    if key not in sanitized:
+                        continue
+                    if (key == "id" or key.endswith("_id")) and isinstance(item, str) and item in known_ids:
+                        sanitized[key] = item
+                    elif key.endswith("_ids") and isinstance(item, list) and all(
+                            isinstance(identity, str) and identity in known_ids for identity in item):
+                        sanitized[key] = list(item)
+                    elif key == "status" and isinstance(item, str) and item in {
+                            "reviewed", "blocked", "reopen", "planned", "not_applicable", "api_only"}:
+                        sanitized[key] = item
+                    elif key == "test_family" and isinstance(item, str) and item in ALL_FAMILIES:
+                        sanitized[key] = item
+                    elif key == "completion_status" and isinstance(item, str) and item in {"complete", "partial", "not_started"}:
+                        sanitized[key] = item
+                    else:
+                        restore_handles(item, sanitized[key])
+            elif isinstance(original, list) and isinstance(sanitized, list):
+                for item, safe_item in zip(original, sanitized):
+                    restore_handles(item, safe_item)
+
+        restore_handles(value, public)
+        if any(unavailable.values()):
+            def omit_prose(node):
+                if isinstance(node, dict):
+                    for key, item in node.items():
+                        if key in {"label", "reviewer", "explanation", "reason", "relation"} and isinstance(item, str):
+                            node[key] = "[prose omitted: browser redaction context unavailable]"
+                        else:
+                            omit_prose(item)
+                elif isinstance(node, list):
+                    for item in node:
+                        omit_prose(item)
+
+            omit_prose(public)
+            public["redaction_context_status"] = "unavailable"
+            public["redaction_context_unavailable"] = unavailable
+        if isinstance(value.get("finalization"), dict) and isinstance(public.get("finalization"), dict):
+            for key, expected in (("reason", "completed"), ("reason_basis", "engine_gate"), ("stop_policy", STOP_POLICY)):
+                if value["finalization"].get(key) == expected:
+                    public["finalization"][key] = expected
+    return public
 
 
 def _material(project, record):
@@ -137,6 +196,87 @@ def _review_valid(project, review, item):
         and review.get("support_signature") == _digest("SP", references)
 
 
+def _review_prerequisites(project, kind, item, observations):
+    from . import engine
+    from .completeness import _tscanplus_incomplete
+
+    missing = []
+    for material in _material(project, item):
+        if material.get("state"):
+            missing.append("review_material_" + material["state"])
+        elif material.get("declared") and material.get("actual") != material["declared"]:
+            missing.append("review_material_changed")
+    if kind == "unassessed_observation" and item.get("review_source_invalid"):
+        missing.append("current_complete_http_observation")
+    if kind == "unreconciled_run" and item.get("status") == "running":
+        missing.append("terminal_or_genuinely_stale_run_checkpoint")
+    if kind in {"failed_partial_tool", "unreconciled_run"} and item.get("adapter") == "tscanplus" \
+            and _tscanplus_incomplete(item):
+        missing.append("verified_remote_stop_and_complete_results")
+    if kind == "orphan_browser_visit" or kind == "unreconciled_run" and item.get("kind") == "browser":
+        try:
+            raw = project.read_artifact(item) if item.get("artifact_path") else item
+            if item.get("blocked_requests") or raw.get("blocked_requests") or raw.get("scope_error"):
+                missing.append("resolved_explicit_browser_request_boundary")
+            if raw.get("network_truncated"):
+                missing.append("complete_browser_network_context")
+        except (EngineError, OSError, ValueError, TypeError, AttributeError):
+            missing.append("complete_browser_review_material")
+    contexts = _write_contexts(project, kind, item)
+    if not contexts:
+        return list(dict.fromkeys(missing))
+    if any(row.get("unknown") or not row.get("resource_id") or not row.get("resource_signature") for row in contexts):
+        missing.append("captured_fixture_write_context")
+        return list(dict.fromkeys(missing))
+    # A current bound readback only enables offline inspection. The reviewer
+    # must still supply and validate each actual business-state assertion.
+    for identity in {row["resource_id"] for row in contexts}:
+        source = project.get("resource", identity, required=False)
+        bound = [row for row in contexts if row["resource_id"] == identity]
+        if not source or any(row["resource_signature"] != engine.resource_signature(source) for row in bound):
+            missing.append("unchanged_captured_fixture_context")
+            continue
+        available = False
+        for evidence in observations:
+            read_resource = project.get("resource", evidence.get("resource_id"), required=False)
+            operation = project.get("operation", evidence.get("operation_id"), required=False)
+            if not read_resource or not operation or operation["method"] not in {"GET", "HEAD", "OPTIONS"} \
+                    or any(source.get(key) != read_resource.get(key) for key in ("owner_actor_id", "tenant_id", "external_id")) \
+                    or any(evidence.get("actor_id") != row.get("actor_id") for row in bound):
+                continue
+            try:
+                artifact = project.read_artifact(evidence)
+                available = artifact["request"]["method"] in {"GET", "HEAD", "OPTIONS"} \
+                    and 200 <= artifact["response"]["status"] < 300 \
+                    and engine.stamp(artifact["started_at"]) >= engine.stamp(item.get("finished_at") or item["started_at"])
+            except (EngineError, OSError, ValueError, TypeError, KeyError):
+                continue
+            if available:
+                break
+        if not available:
+            missing.append("later_same_identity_fixture_bound_readback_to_inspect")
+    return list(dict.fromkeys(missing))
+
+
+def _review_archive_allowed(project, kind, item, review, prerequisites):
+    from . import engine
+
+    if prerequisites or kind == "unlinked_analyst_finding" \
+            or kind == "orphan_browser_visit" and item.get("adopt_ready") \
+            or kind == "unreconciled_run" and item.get("status") not in {"interrupted", "failed"}:
+        return False
+    try:
+        contexts = _write_contexts(project, kind, item)
+        if contexts:
+            support = [engine.verify_current_evidence(project, identity) for identity in review.get("evidence_ids", [])]
+            # A historical receipt must satisfy today's business-state gates,
+            # not merely have intact bytes and a possible readback elsewhere.
+            _readback_bindings(project, item, contexts, support, review.get("readback_bindings"))
+        return True
+    except (EngineError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def apply_reviews(project, inventory):
     """Administrative receipts never count as decisions or security coverage."""
     from .completeness import _review_id, _tscanplus_incomplete
@@ -161,20 +301,23 @@ def apply_reviews(project, inventory):
             inventory["unassessed"].append({"id": record["source_id"], "kind": "http",
                 "review_source_invalid": True, "review_reason_code": "evidence_missing"})
             known.add(record["source_id"])
-    inventory["reviewed_admin"], inventory["blocked_reviews"] = [], {}
+    inventory["reviewed_admin"], inventory["blocked_reviews"], inventory["review_prerequisites"] = [], {}, {}
     for kind, key in REVIEW_LISTS.items():
         retained = []
         for item in inventory[key]:
             identity = _review_id(kind, item["id"])
             review = latest.get(identity)
+            prerequisites = _review_prerequisites(project, kind, item, inventory["observations"])
             if review and _review_valid(project, review, item):
                 remote_incomplete = kind in {"failed_partial_tool", "unreconciled_run"} \
                     and item.get("adapter") == "tscanplus" and _tscanplus_incomplete(item)
-                if review["status"] == "reviewed" and kind != "unlinked_analyst_finding" and not remote_incomplete:
+                if review["status"] == "reviewed" and kind != "unlinked_analyst_finding" \
+                        and not remote_incomplete and _review_archive_allowed(project, kind, item, review, prerequisites):
                     inventory["reviewed_admin"].append(review)
                     continue
                 if review["status"] == "blocked":
                     inventory["blocked_reviews"][identity] = review
+            inventory["review_prerequisites"][identity] = prerequisites
             retained.append(item)
         inventory[key] = retained
     return inventory
@@ -272,7 +415,9 @@ def _state(project, evaluated, inventory, completion):
     from .completeness import _checklist
     from .workflow import queue_inventory
 
-    queue = queue_inventory(project, evaluated, inventory)
+    queue = inventory.get("queue")
+    if queue is None:
+        queue = queue_inventory(project, evaluated, inventory)
     extras = [row for row in _checklist(inventory) if row["kind"] != "obligation"]
     counts = Counter(row["queue_status"] for row in queue)
     ready, review = counts["ready"], counts["review"] + sum(row["status"] == "open" for row in extras)
@@ -285,11 +430,18 @@ def _state(project, evaluated, inventory, completion):
                 "reviews": [row["id"] for row in inventory.get("reviewed_admin", [])]}
     material = {kind: [(row["id"], _material(project, row)) for row in rows[kind]]
                 for kind in ("evidence", "page_visit", "run")}
+    snapshot_completion = dict(completion)
+    # Empty derived review counters extend the public schema, not the material
+    # snapshot. Keep genuinely closed legacy checkpoints usable after upgrade.
+    for key in ("applicability_review_total", "scope_reduction_review_total"):
+        if snapshot_completion.get(key) == 0:
+            snapshot_completion.pop(key, None)
     snapshot = _digest("CS", {"config": project.config, "rows": rows, "material": material, "validity": validity,
-                               "completion": completion})
+                               "completion": snapshot_completion})
     # Raw captures and repeated plan/tool calls deliberately do not count as progress.
     bad_pages = {row["page_id"] for row in inventory["page_coverage"]["unvisited"]}
     bad_functions = {row["function_id"] for row in inventory["page_coverage"]["untriggered"]}
+    unresolved_candidates = {row["id"] for row in inventory["candidates"]}
     progress = _digest("PR", {
         "operations": [{key: row.get(key) for key in ("id", "url", "method", "protocol", "auth", "allowed_roles",
             "ownership", "state_scope", "content_type", "inputs", "ownership_sampling")} for row in rows["operation"]],
@@ -298,6 +450,8 @@ def _state(project, evaluated, inventory, completion):
                                  | {"triggered": function["id"] not in bad_functions}
                                  for function in row.get("functions", [])]} for row in rows["page"]],
         "candidates": [{key: row.get(key) for key in ("id", "kind", "status", "operation_id")}
+                       | {"status": "unverified" if row.get("status") == "dismissed" and row["id"] in unresolved_candidates
+                                      else row.get("status")}
                        | {"input_binding": {key: (row.get("link") or {}).get(key)
                                              for key in ("input_location", "input_selector")}}
                        for row in rows["candidate"]],
@@ -320,15 +474,54 @@ def _state(project, evaluated, inventory, completion):
     no_progress = max(0, no_progress - 1)
     candidates = [row for row in checkpoints if row.get("snapshot_id") == snapshot and row.get("frontier_review")][-MIN_FRONTIER_ROUNDS:]
     cache = {}
-    frontier = [row for row in candidates if _valid_frontier(project, row, inventory, cache)]
+    frontier = [row for row in candidates if isinstance(row["frontier_review"], dict)
+                and row["frontier_review"].get("complete") is True
+                and _valid_frontier(project, row, inventory, cache)]
     unresolved = len(queue) + len(extras)
     return {"snapshot_id": snapshot, "progress_id": progress, "ready_total": ready, "review_total": review,
             "blocked_total": blocked, "actionable_total": ready + review, "unresolved_total": unresolved,
+            "applicability_review_total": len(inventory.get("applicability_reviews", [])),
+            "scope_reduction_review_total": len(inventory.get("scope_reductions", [])) + len(inventory.get("consumer_requirements", [])),
             "no_progress_rounds": no_progress, "checkpoint_id": checkpoints[-1]["id"] if checkpoints else None,
             "frontier_rounds": len(frontier), "frontier_complete": bool(frontier and frontier[-1]["frontier_review"]["complete"]),
             "current_checkpoint": bool(checkpoints and checkpoints[-1].get("snapshot_id") == snapshot),
             "current_frontier": bool(frontier and checkpoints and frontier[-1]["id"] == checkpoints[-1]["id"]),
             "checkpoints": checkpoints}
+
+
+def _exhausted(state, completion, has_operations):
+    """One predicate governs the advertised gate, stop records and final reports."""
+    return bool(has_operations and completion.get("status") == "complete"
+        and not state["actionable_total"] and not state["blocked_total"] and not state["unresolved_total"]
+        and not state.get("applicability_review_total", 0)
+        and not state.get("scope_reduction_review_total", 0)
+        and state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["frontier_complete"]
+        and state["current_checkpoint"] and state["current_frontier"])
+
+
+def _valid_stop(stop, state, can_finalize):
+    if not can_finalize or not stop or stop.get("reason") != "completed" \
+            or stop.get("can_claim_complete") is not True or stop.get("completion_status") != "complete" \
+            or stop.get("frontier_reviewed") is not True or stop.get("reason_basis") != "engine_gate" \
+            or stop.get("snapshot_id") != state["snapshot_id"] or stop.get("checkpoint_id") != state["checkpoint_id"]:
+        return False
+    if "automatic_stop_allowed" in stop and stop["automatic_stop_allowed"] is not True:
+        return False
+    # Revalidate legacy completed receipts against actual current work, not their
+    # labels. Legacy partial receipts never acquire exhaustion permission.
+    if "stop_policy" in stop or "stop_policy_version" in stop:
+        if stop.get("stop_policy") != STOP_POLICY or type(stop.get("stop_policy_version")) is not int \
+                or stop["stop_policy_version"] != STOP_POLICY_VERSION or stop.get("automatic_stop_allowed") is not True:
+            return False
+    remaining = stop.get("remaining")
+    return isinstance(remaining, dict) and all(type(remaining.get(key)) is int and remaining[key] == 0
+        for key in ("ready_total", "review_total", "blocked_total", "unresolved_total"))
+
+
+def _recovery(current):
+    return {"continuation": current, "next_action": current["next_action"],
+            "stop_policy": STOP_POLICY, "checkpoint_action": "plan.checkpoint",
+            "progress_export": {"action": "report.build", "input": {"stage": "draft"}}, "requests_sent": 0}
 
 
 def control(project, evaluated=None, *, inventory=None, security=None, completion=None):
@@ -343,24 +536,33 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
         security, _ = completeness._security(inventory)
     completion = completion if completion is not None else completeness._completion(inventory, security, evaluated)
     state = _state(project, evaluated, inventory, completion)
-    frontier_ready = state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["current_checkpoint"] and state["current_frontier"]
-    can_finalize = not state["actionable_total"] and frontier_ready and bool(inventory["operations"])
-    finalization = next((row for row in reversed(project.list("finalization"))
-                         if row.get("snapshot_id") == state["snapshot_id"]
-                         and row.get("checkpoint_id") == state["checkpoint_id"]), None)
-    reason = ("work_remaining" if state["actionable_total"] else "frontier_review_required" if not frontier_ready
-              else "blocked_preconditions" if state["blocked_total"] else "registered_scope_exhausted")
-    status = "continue" if state["actionable_total"] else "review_frontier" if not frontier_ready \
-        else "blocked" if state["blocked_total"] else "ready_to_finalize"
-    next_action = "plan.next" if state["actionable_total"] else "plan.checkpoint" if not frontier_ready else "plan.finalize"
+    frontier_ready = state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["frontier_complete"] \
+        and state["current_checkpoint"] and state["current_frontier"]
+    can_finalize = _exhausted(state, completion, bool(inventory["operations"]))
+    latest_stop = next((row for row in reversed(project.list("finalization"))
+                       if row.get("snapshot_id") == state["snapshot_id"]
+                       and row.get("checkpoint_id") == state["checkpoint_id"]), None)
+    finalization = latest_stop if _valid_stop(latest_stop, state, can_finalize) else None
+    reason = ("work_remaining" if state["actionable_total"] else "blocked_preconditions" if state["blocked_total"]
+              else "coverage_incomplete" if completion["status"] != "complete"
+              else "frontier_review_required" if not frontier_ready else "registered_scope_exhausted")
+    status = "continue" if state["actionable_total"] else "blocked" if state["blocked_total"] \
+        else "review_coverage" if completion["status"] != "complete" \
+        else "review_frontier" if not frontier_ready else "ready_to_finalize"
+    next_action = "plan.next" if state["actionable_total"] else "plan.audit" if state["blocked_total"] \
+        or completion["status"] != "complete" else "plan.checkpoint" if not frontier_ready else "plan.finalize"
     if state["no_progress_rounds"] >= 2 and state["actionable_total"]:
         status, reason, next_action = "stalled", "no_closure_progress", "plan.audit"
     if not inventory["operations"]:
         status, reason, next_action = "not_started", "inventory_missing", "surface.list"
     if finalization:
         status, reason, next_action = "finalized", finalization["reason"], "report.build"
-    return {"contract_version": 1, "continue_required": finalization is None,
-            "can_finalize": can_finalize, "can_claim_complete": bool(finalization and finalization.get("can_claim_complete")),
+    return {"contract_version": 2, "stop_policy": STOP_POLICY, "stop_policy_version": STOP_POLICY_VERSION,
+            "continue_required": finalization is None, "automatic_stop_allowed": finalization is not None,
+            "can_finalize": can_finalize, "can_claim_complete": finalization is not None,
+            "legacy_finalization_ignored": latest_stop is not None and finalization is None,
+            "applicability_review_total": state.get("applicability_review_total", 0),
+            "scope_reduction_review_total": state.get("scope_reduction_review_total", 0),
             "state": status, "reason_code": reason, "next_action": next_action,
             **{key: state[key] for key in ("snapshot_id", "progress_id", "checkpoint_id", "ready_total", "review_total",
                 "blocked_total", "actionable_total", "unresolved_total", "no_progress_rounds", "frontier_rounds")},
@@ -388,8 +590,9 @@ def checkpoint(project, args):
         project.put("checkpoint", record, create_only=True)
         project.event("plan.checkpoint", {"checkpoint_id": record["id"], "progress_changed": record["progress_changed"]})
         updated = engine.evaluate_coverage(project)["continuation"]
-    return _public(project, {"checkpoint": record, "continuation": updated, "requests_sent": 0,
+        public = _public(project, {"checkpoint": record, "continuation": updated, "requests_sent": 0,
             "note": "Repeated calls or captures are not closure progress. Review existing evidence or change the bounded hypothesis; never auto-replay uncertain writes."})
+    return public
 
 
 def _write_contexts(project, kind, item):
@@ -430,7 +633,7 @@ def _write_contexts(project, kind, item):
 
 def _readback_bindings(project, item, contexts, support, bindings):
     from . import engine
-    from .transport import pointer, response_json
+    from .transport import pointer, response_json, json_equal, has_business_state, control_metadata_field
 
     if not isinstance(bindings, list) or not 1 <= len(bindings) <= 25 or any(not isinstance(row, dict) for row in bindings):
         raise EngineError("reconciliation_evidence", "Uncertain writes require explicit readback_bindings and later read-only business-state evidence")
@@ -450,9 +653,8 @@ def _readback_bindings(project, item, contexts, support, bindings):
             raise EngineError("reconciliation_context", "Readback must preserve the captured fixture's owner, tenant and exact external ID")
         selector = binding.get("selector")
         if not isinstance(selector, str) or not selector.startswith("/") or len(selector) > 512 \
-                or "expected" not in binding or selector.rsplit("/", 1)[-1].lower() in {
-                    "success", "ok", "message", "error", "code", "status", "statuscode", "timestamp", "nonce",
-                    "requestid", "traceid", "correlationid", "duration", "elapsedms"}:
+                or "expected" not in binding or control_metadata_field(selector.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")) \
+                or not has_business_state(binding["expected"]):
             raise EngineError("reconciliation_evidence", "Declare an expected concrete business state, not merely a later 200/ok flag")
         matches = []
         for evidence, artifact in support:
@@ -465,7 +667,8 @@ def _readback_bindings(project, item, contexts, support, bindings):
                     or engine.stamp(artifact["started_at"]) < engine.stamp(item.get("finished_at") or item["started_at"]):
                 continue
             try:
-                if pointer(response_json(artifact), selector) == binding["expected"]:
+                actual = pointer(response_json(artifact), selector)
+                if has_business_state(actual) and json_equal(actual, binding["expected"]):
                     matches.append(evidence["id"])
             except EngineError:
                 continue
@@ -517,6 +720,10 @@ def review(project, args):
             else:
                 raise EngineError("page_adoption_required", "A valid successful browser observation must use page.adopt, not administrative dismissal")
         contexts = _write_contexts(project, kind, item)
+        if status == "reviewed" and set(inventory.get("review_prerequisites", {}).get(identity, [])) & {
+                "resolved_explicit_browser_request_boundary", "complete_browser_network_context",
+                "complete_browser_review_material"}:
+            raise EngineError("browser_execution_blocked", "An explicit browser request boundary or incomplete browser context remains unresolved; preserve the limitation, never replay or archive it by text")
         if status == "reviewed" and any(row.get("state") or row.get("declared")
                 and row.get("actual") != row["declared"] for row in _material(project, item)):
             raise EngineError("review_material", "Missing, changed or over-budget material must remain an explicit blocked review, not verified archive")
@@ -538,8 +745,9 @@ def review(project, args):
         project.put("closure_review", record, create_only=True)
         project.event("plan.review", {"review_id": record["id"], "checklist_id": identity, "status": status})
         updated = engine.evaluate_coverage(project)
-    return _public(project, {"review": record, "continuation": updated["continuation"], "completion": updated["completion"],
+        public = _public(project, {"review": record, "continuation": updated["continuation"], "completion": updated["completion"],
             "requests_sent": 0, "security_obligations_closed": 0})
+    return public
 
 
 def finalize(project, args):
@@ -548,7 +756,18 @@ def finalize(project, args):
     checkpoint_id = _text(args.get("checkpoint_id"), "checkpoint_id", 100)
     reason = args.get("reason")
     if not isinstance(reason, str) or reason not in STOP_REASONS:
-        raise EngineError("stop_reason", "reason must be completed, blocked, budget_exhausted, user_stop or authorization_boundary")
+        current = engine.evaluate_coverage(project)["continuation"]
+        if isinstance(reason, str) and reason in REJECTED_STOP_REASONS:
+            raise EngineError("stop_policy", "Only evidence-bound completed exhaustion permits automatic finalization. "
+                              "Blockers, claimed budgets, user stops and authorization boundaries do not authorize a final stop. "
+                              "Preserve a checkpoint and draft progress for an actual user or host interruption; do not invent a constraint.",
+                              _recovery(current))
+        raise EngineError("stop_reason", "reason must be completed; only evidence-bound exhaustion permits automatic finalization",
+                          _recovery(current))
+    if set(args) - {"checkpoint_id", "reason", "explanation", "reviewer", "project_id"}:
+        raise EngineError("continuation_arguments", "plan.finalize accepts only checkpoint_id, reason, explanation and reviewer. "
+                          "Model flags, policy overrides and purported host events cannot grant stop authority.",
+                          _recovery(engine.evaluate_coverage(project)["continuation"]))
     explanation = _text(args.get("explanation"), "explanation")
     reviewer = _text(args.get("reviewer"), "reviewer", 200)
     with project.transaction():
@@ -559,37 +778,38 @@ def finalize(project, args):
         if not checkpoints or checkpoints[-1]["id"] != checkpoint_id or record["snapshot_id"] != current["snapshot_id"]:
             raise EngineError("checkpoint_stale", "Create a current checkpoint before stopping; scope, evidence or task state changed",
                               {"continuation": current, "next_action": "plan.checkpoint"})
-        if reason in {"completed", "blocked"}:
-            if current["actionable_total"]:
-                raise EngineError("continue_required", "Ready or review work remains; a report or one blocked proof channel is not a finish line",
-                                  {"continuation": current, "next_action": "plan.next"})
-            if not current["can_finalize"]:
-                raise EngineError("frontier_review_required", "Two current, evidence-bound discovery/category/page review rounds are required for bounded exhaustion",
-                                  {"continuation": current, "next_action": "plan.checkpoint"})
+        if current["actionable_total"]:
+            raise EngineError("continue_required", "Ready or review work remains; a report or one blocked proof channel is not a finish line",
+                              _recovery(current))
         inventory = completeness._inventory(project, evaluated)
-        frontier_complete = bool(record.get("frontier_review", {}).get("complete")) if record.get("frontier_review") else False
-        if reason == "completed" and (evaluated["completion"]["status"] != "complete"
-                or current["blocked_total"] or not frontier_complete):
-            raise EngineError("assessment_partial", "Unresolved blockers or applicability boundaries require an explicitly partial stop, not completed",
-                              {"continuation": current, "next_action": "plan.audit"})
-        if reason == "blocked" and not current["blocked_total"] and frontier_complete \
-                and evaluated["completion"]["status"] == "complete":
-            raise EngineError("stop_reason", "No blocked work remains; use completed for this registered scope")
-        if reason == "completed" and not inventory["operations"]:
-            raise EngineError("assessment_not_started", "An empty project is not a completed assessment")
+        frontier = record.get("frontier_review")
+        frontier_complete = isinstance(frontier, dict) and frontier.get("complete") is True
+        if not inventory["operations"]:
+            raise EngineError("assessment_not_started", "An empty project is not a completed assessment", _recovery(current))
+        if evaluated["completion"]["status"] != "complete" or current["blocked_total"] or current["unresolved_total"]:
+            raise EngineError("assessment_partial", "Unresolved blockers and incomplete coverage are not exhaustion. "
+                              "Repair or inspect prerequisites and retain draft progress; automatic partial finalization is forbidden.",
+                              _recovery(current))
+        if not frontier_complete or not current["can_finalize"]:
+            raise EngineError("frontier_review_required", "Two current, complete, evidence-bound discovery/category/page review rounds "
+                              "and the latest complete frontier are required for bounded exhaustion", _recovery(current))
         stop = {"id": project.id("FN"), "checkpoint_id": checkpoint_id, "snapshot_id": current["snapshot_id"],
                 "reason": reason, "explanation": explanation, "reviewer": reviewer, "created_at": now(),
-                "completion_status": evaluated["completion"]["status"], "can_claim_complete": reason == "completed",
+                "stop_policy": STOP_POLICY, "stop_policy_version": STOP_POLICY_VERSION,
+                "completion_status": evaluated["completion"]["status"], "can_claim_complete": True,
+                "automatic_stop_allowed": True,
                 "frontier_reviewed": current["frontier_rounds"] >= MIN_FRONTIER_ROUNDS,
-                "reason_basis": "engine_gate" if reason == "completed" else "projected_declared_blockers" if reason == "blocked"
-                                else "caller_declared_external_constraint",
+                "reason_basis": "engine_gate",
                 "external_constraint_verified": False, "blocker_facts_verified": False,
                 "remaining": {key: current[key] for key in ("ready_total", "review_total", "blocked_total", "unresolved_total")}}
         project.put("finalization", stop, create_only=True)
         project.event("plan.finalized", {"finalization_id": stop["id"], "reason": reason, "can_claim_complete": stop["can_claim_complete"]})
         updated = engine.evaluate_coverage(project)["continuation"]
-    return _public(project, {"finalization": stop, "continuation": updated, "requests_sent": 0,
-            "note": "This is a snapshot-bound registered-scope stop record, not proof that unknown surfaces or vulnerabilities do not exist. External exits and blocker facts are caller declarations, not authenticated host events."})
+        public = _public(project, {"finalization": stop, "continuation": updated, "requests_sent": 0,
+            "note": "Only current evidence-bound registered-scope exhaustion permits this automatic final stop. "
+                    "It is not proof that unknown surfaces or vulnerabilities do not exist. "
+                    "User/host interruption retains checkpoint and draft progress, not permission to finalize early."})
+    return public
 
 
 def require_finalization(project, finalization_id, evaluated=None):
@@ -603,10 +823,16 @@ def require_finalization(project, finalization_id, evaluated=None):
     stop = project.get("finalization", finalization_id, required=False)
     if not stop:
         raise EngineError("finalization_required", "Unknown finalization record in this project", {"continuation": current})
-    if stop.get("snapshot_id") != current["snapshot_id"] or current.get("finalization_id") != stop["id"]:
+    if stop.get("snapshot_id") != current["snapshot_id"] or stop.get("checkpoint_id") != current["checkpoint_id"]:
         raise EngineError("finalization_stale", "The project changed after finalization; continue work and create a new stop record",
-                          {"continuation": current, "next_action": "plan.next"})
-    if stop.get("can_claim_complete") and (current["actionable_total"] or current["blocked_total"]
-            or evaluated["completion"]["status"] != "complete"):
-        raise EngineError("continue_required", "Current coverage cannot support a completed final report", {"continuation": current})
+                          _recovery(current))
+    if not _valid_stop(stop, current, current["can_finalize"]):
+        raise EngineError("finalization_policy", "This stop record does not satisfy the current evidence-bound exhaustion policy. "
+                          "Legacy partial exits remain historical records, never final-report permission; preserve draft progress and continue.",
+                          _recovery(current))
+    if current.get("finalization_id") != stop["id"]:
+        raise EngineError("finalization_stale", "Only the latest current eligible finalization may authorize a final report", _recovery(current))
+    if current["continue_required"] is not False or current["automatic_stop_allowed"] is not True \
+            or current["can_claim_complete"] is not True or evaluated["completion"]["status"] != "complete":
+        raise EngineError("continue_required", "Current coverage cannot support a completed final report", _recovery(current))
     return stop

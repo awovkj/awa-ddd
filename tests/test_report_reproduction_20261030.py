@@ -295,7 +295,7 @@ class ReportReproductionTests(unittest.TestCase):
             prepared["files"]["../escape.txt"] = b"must-not-write"
             return prepared
         with patch.object(reproduction, "prepare_reproduction", side_effect=escaped):
-            with self.assertRaisesRegex(ValueError, "escaped staging"):
+            with self.assertRaisesRegex(ValueError, "escaped staging|artifact.*ledger"):
                 build_report(self.project)
         self.assertFalse((self.project.base / "reports" / "escape.txt").exists())
         self.assertEqual([], list((self.project.base / "reports").glob(".report-*")))
@@ -356,7 +356,7 @@ class ReportReproductionTests(unittest.TestCase):
         self.capture(self.operation("/code/context"), response={"sms_code": "1234"})
         digest = "0" * 28 + "a1234b" + "0" * 30
         original_id = self.project.id
-        with patch.object(self.project, "id", side_effect=lambda prefix: prefix + "-a1234b-fixture" if prefix in {"E", "F", "D"} else original_id(prefix)):
+        with patch.object(self.project, "id", side_effect=lambda prefix: prefix + "-a1234b" + "0" * 26 if prefix in {"E", "F", "D"} else original_id(prefix)):
             evidence = self.capture(self.operation("/code/observation"), response={"content": "您的验证码是：1234，10分钟内有效", "digest": digest})
             finding = self.finding([evidence["id"]])
         _, folder, summary, _ = self.report()
@@ -365,7 +365,7 @@ class ReportReproductionTests(unittest.TestCase):
         self.assertEqual(evidence["id"], step["evidence_id"])
         self.assertEqual(evidence["sha256"], step["source_sha256"])
         self.assertTrue((folder / step["request_file"]).is_file())
-        self.assertIn(digest, step["response_excerpt"])
+        self.assertNotIn(digest, step["response_excerpt"])
         self.assertNotIn("验证码是：1234", step["response_excerpt"])
         redactor = Redactor()
         redactor.slot("1234", "SMS_CODE")

@@ -4,6 +4,8 @@ import z from '@deepseek-ai/schemastery';
 import { DEFAULT_WORKSPACE, safeErrorText } from './bridge.mjs';
 import { toolDefinitions } from './tools.mjs';
 import { apply as applyMode, name as modeName } from './mode.mjs';
+import { apply as applyStopPolicy } from './stop-policy.mjs';
+import { createController as createHostContinuation } from './host-continuation.mjs';
 
 export const name = 'awa-ddd';
 
@@ -23,15 +25,38 @@ export const Config = z.object({
   wslDistribution: z.string().default('kali-linux').description('WSL distribution name. Use a separate assessment workspace for each execution environment.'),
   wslPythonExecutable: z.string().default('python3').description('Linux Python executable name or path for WSL, without shell arguments.'),
   timeoutMs: z.number().min(1000).max(600000).default(120000).description('Per-call engine timeout in milliseconds; cancellation is enforced by the bridge.'),
+  continuationGuard: z.boolean().default(true).description('Use the supported host turn-stopping hook for this agent\'s active assessment work. This never grants target authorization or overrides actual cancellation; engine finalization stays strict when disabled.'),
 });
 
 export function apply(ctx, config = {}) {
   const lifecycle = new AbortController();
   ctx.effect(() => () => lifecycle.abort(new Error('awa-ddd plugin disposed')));
+  let hostContinuation;
+  if (config.continuationGuard !== false) {
+    try {
+      hostContinuation = createHostContinuation(config, { signal: lifecycle.signal,
+        onDiagnostic: diagnostic => {
+          if (!['current_work_steered', 'public_hook_registered'].includes(diagnostic.code)) {
+            console.error(`[${name}] host continuation: ${diagnostic.code}; engine finalization remains guarded.`);
+          }
+        } });
+    } catch (error) {
+      console.error(`[${name}] host continuation unavailable (tools unaffected): ${safeErrorText(error?.message ?? error, 300)}`);
+    }
+  }
 
   // 评估工具是核心能力，任何情况下都要先注册成功。
-  for (const definition of toolDefinitions(defineTool, config, undefined, lifecycle.signal)) {
+  for (const definition of toolDefinitions(defineTool, config, undefined, lifecycle.signal,
+    { observer: hostContinuation?.observe })) {
     ctx.tools.register(definition);
+  }
+  hostContinuation?.attach(ctx);
+
+  // The stop contract is not controlled by the optional penetration toggle.
+  try {
+    applyStopPolicy(ctx);
+  } catch (error) {
+    console.error(`[${name}] stop-policy prompt unavailable (engine gate unaffected): ${safeErrorText(error?.message ?? error, 300)}`);
   }
 
   // 渗透模式是可选的界面/提示能力：缺宿主服务或注册失败只记录，不影响工具。

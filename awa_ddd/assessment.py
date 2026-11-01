@@ -7,7 +7,9 @@ import re
 from urllib.parse import urlsplit, parse_qsl, unquote
 from .store import EngineError, now, canonical
 from .engine import verify_current_evidence, operation_signature, stamp, atomic, credential_header_names
-from .transport import response_json, pointer, headers_map
+from .transport import (response_json, pointer, headers_map, json_equal, control_metadata_field,
+                        control_metadata_value, control_signal_selector, has_business_state,
+                        CONTROL_METADATA_FIELDS, CONTROL_METADATA_VALUES)
 from .scope import bind_operation, normalize_url
 
 
@@ -35,6 +37,70 @@ def _nonempty(value):
     return value is not None and value != "" and value != [] and value != {}
 
 
+_ACCESS_METADATA_FIELDS = CONTROL_METADATA_FIELDS
+_ACCESS_METADATA_VALUES = CONTROL_METADATA_VALUES
+
+
+def _access_metadata_field(value):
+    return control_metadata_field(value)
+
+
+def _protected_business_data(value):
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, dict):
+        return any(not _access_metadata_field(key) and _protected_business_data(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_protected_business_data(item) for item in value)
+    if isinstance(value, str):
+        return bool(value.strip()) and not control_metadata_value(value)
+    return isinstance(value, (int, float))
+
+
+def _authorization_value(observation, selector, *, baseline=False):
+    if not isinstance(selector, str) or not selector.startswith("/") \
+            or _access_metadata_field(selector.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")):
+        raise EngineError("protected_selector", "Authorization proof needs a protected business-data selector, not response flags, errors or transport metadata")
+    if not 200 <= observation[1]["response"]["status"] < 300:
+        raise EngineError("authorization_response", "Protected business data requires a successful response, not an error-status body")
+    document = response_json(observation[1])
+    if baseline and isinstance(document, dict) and (document.get("ok") is False or document.get("success") is False):
+        raise EngineError("baseline_invalid", "The allowed baseline reports business failure rather than a valid protected response")
+    value = pointer(document, selector)
+    if not _protected_business_data(value):
+        raise EngineError("protected_value", "Authorization proof needs actual protected business data, not booleans, empty values or a generic denial result")
+    return value
+
+
+_PLAIN_AUTHORIZATION_DENIAL = re.compile(
+    r"(?:(?:http\s*)?(?:401|403|404)[\s:.-]+)?"
+    r"(?:forbidden|unauthori[sz]ed|(?:access|permission)[\s_-]+denied|denied|not[\s_-]+found"
+    r"|\u65e0\u6743\u9650|\u6743\u9650\u4e0d\u8db3|\u62d2\u7edd\u8bbf\u95ee)[\s.!\u3002\uff01]*",
+    re.IGNORECASE)
+
+
+def _authorization_denial_has_data(observation, selector):
+    """A denial status cannot refute access while selected business data is present."""
+    artifact = observation[1]
+    try:
+        raw = base64.b64decode(artifact["response"]["body_base64"], validate=True)
+        text = raw.decode("utf-8-sig").strip()
+    except (ValueError, KeyError, TypeError, UnicodeError) as exc:
+        raise EngineError("response_json", "A denial response needs intact UTF-8 content before its data can be checked") from exc
+    # Old captures sometimes label a plain Forbidden response as JSON. Only a
+    # complete, finite denial message gets this exception, never a parse failure.
+    if not text or not text.startswith(("{", "[", '"')) and _PLAIN_AUTHORIZATION_DENIAL.fullmatch(text):
+        return False
+    document = response_json(artifact)
+    try:
+        value = pointer(document, selector)
+    except EngineError as exc:
+        if exc.code != "selector":
+            raise
+        return False
+    return _protected_business_data(value)
+
+
 def _same_identity(observations):
     keys={(m.get("actor_id"),m.get("session_id"),m.get("session_generation")) for m,a in observations}
     if len(keys)!=1:
@@ -50,11 +116,113 @@ def _input_view(observation, item, operation):
 def _input_controls(observations, item, operation):
     _same_identity(observations)
     views = [_input_view(o,item,operation) for o in observations]
-    if any(context != views[0][1] for value,context in views[1:]):
+    if any(not _input_context_equal(context, views[0][1]) for value,context in views[1:]):
         raise EngineError("input_binding", "Business controls must change only the bound test input")
     values = [v for v,c in views]
-    if any(values[i] == values[j] for i in range(len(values)) for j in range(i)):
+    if any(_input_value_equal(values[i], values[j]) for i in range(len(values)) for j in range(i)):
         raise EngineError("input_binding", "Normal, variant and sensitivity controls require distinct tested input values")
+
+
+def _input_value_equal(left, right):
+    if isinstance(left, bytes) or isinstance(right, bytes):
+        return type(left) is type(right) and left == right
+    return json_equal(left, right)
+
+
+def _input_context_equal(left, right):
+    # Input contexts contain query/form tuples that serialize as JSON arrays;
+    # preserve that established shape while comparing their JSON value types.
+    try:
+        return json_equal(json.loads(canonical(left)), json.loads(canonical(right)))
+    except (ValueError, TypeError, RecursionError):
+        return False
+
+
+def _json_oracle_result(project, item, operation, observations, oracle):
+    kind = oracle.get("type")
+    outcome, reason = "inconclusive", "Experiment did not establish the requested invariant"
+    if kind == "baseline":
+        if item["kind"] != "baseline" or len(observations) != 1 or "expected" not in oracle:
+            raise EngineError("oracle_binding", "A baseline obligation needs one capture and an expected JSON value")
+        if observations[0][0].get("actor_id") != item.get("actor_id"):
+            raise EngineError("actor_binding", "Baseline used a different actor")
+        if 200 <= observations[0][1]["response"]["status"] < 300 \
+                and json_equal(_value(observations[0], oracle["selector"]), oracle["expected"]):
+            return "refuted", "Declared normal response assertion matched; this is a baseline, not a vulnerability absence claim"
+    elif kind == "semantic_negative":
+        if item["kind"] != "input_test" or len(observations) != 3:
+            raise EngineError("oracle_binding", "Semantic refutation needs an input test and normal/variant/sensitivity captures")
+        _same_identity(observations)
+        if control_signal_selector(oracle.get("selector")):
+            raise EngineError("control_invalid", "Response success or authorization flags are not business sensitivity observables")
+        leaf = re.sub(r"[^a-z0-9]", "", str(oracle.get("selector", "")).rsplit("/", 1)[-1].lower())
+        if leaf in {"requestid", "traceid", "correlationid", "timestamp", "nonce", "elapsedms", "duration"}:
+            raise EngineError("sensitivity", "Transport noise cannot establish business sensitivity")
+        if not all(200 <= artifact["response"]["status"] < 300 for meta, artifact in observations):
+            raise EngineError("control_invalid", "Error responses cannot be used as normal business sensitivity controls")
+        if "baseline_expected" not in oracle or "control_expected" not in oracle \
+                or json_equal(oracle["baseline_expected"], oracle["control_expected"]):
+            raise EngineError("sensitivity", "Declare distinct normal and sensitivity business values")
+        values = [_value(observation, oracle["selector"]) for observation in observations]
+        if not all(has_business_state(value) for value in values):
+            raise EngineError("control_invalid", "Sensitivity controls need actual business values, not denial or acknowledgement messages")
+        if not json_equal(values[0], oracle["baseline_expected"]) or not json_equal(values[2], oracle["control_expected"]):
+            raise EngineError("sensitivity", "Business assertions did not match the controls")
+        _input_controls(observations, item, operation)
+        if json_equal(values[1], values[0]):
+            return "refuted", "No change in the specified business observable under a valid discriminating control; limited to this hypothesis"
+        reason = "Business observable changed; difference requires impact analysis and does not automatically confirm a vulnerability"
+    elif kind == "state_invariant":
+        if item["kind"] != "input_test" or len(observations) < 3:
+            raise EngineError("oracle_binding", "State invariant needs before/action/after captures on an input-test obligation")
+        before, after = observations[0], observations[-1]
+        _same_identity(observations)
+        if not all(200 <= artifact["response"]["status"] < 300 for meta, artifact in observations):
+            raise EngineError("control_invalid", "State observations require successful business responses")
+        resource = before[0].get("resource_id")
+        if not resource or any(meta.get("resource_id") != resource for meta, artifact in observations):
+            raise EngineError("resource_binding", "State experiment requires the same bound resource")
+        times = [stamp(artifact["started_at"]) for meta, artifact in observations]
+        if times != sorted(times) or any(stamp(observations[index - 1][1]["completed_at"]) > times[index]
+                                       for index in range(1, len(times))):
+            raise EngineError("state_order", "State captures must be supplied in actual execution order")
+        if operation["method"] in {"GET", "HEAD", "OPTIONS"}:
+            raise EngineError("state_action", "State conclusions require a captured state-changing action")
+        views = [_input_view(observation, item, operation) for observation in observations]
+        if any(not _input_context_equal(context, views[0][1]) for value, context in views[1:]) \
+                or not _input_value_equal(views[-1][0], views[0][0]):
+            raise EngineError("input_binding", "State readbacks must repeat the baseline input and keep other request inputs fixed")
+        if all(_input_value_equal(value, views[0][0]) for value, context in views[1:-1]):
+            raise EngineError("input_binding", "The state-changing action must vary the bound test input")
+        if control_signal_selector(oracle.get("selector")):
+            raise EngineError("control_invalid", "Response success or authorization flags are not resource business states")
+        old, new = _value(before, oracle["selector"]), _value(after, oracle["selector"])
+        if not all(has_business_state(value) for value in (old, new)):
+            raise EngineError("control_invalid", "State readbacks need actual business state, not denial or acknowledgement messages")
+        if "before_expected" not in oracle or not json_equal(old, oracle["before_expected"]):
+            raise EngineError("baseline_invalid", "Initial business state did not match")
+        if "forbidden_after" in oracle:
+            if json_equal(old, oracle["forbidden_after"]):
+                raise EngineError("baseline_invalid", "Initial state already violates the declared invariant")
+            violation = json_equal(new, oracle["forbidden_after"])
+        elif "max_delta" in oracle:
+            try:
+                if any(isinstance(value, bool) for value in (old, new, oracle["max_delta"])):
+                    raise InvalidOperation()
+                numbers = [Decimal(str(value)) for value in (old, new, oracle["max_delta"])]
+                if not all(value.is_finite() for value in numbers) or numbers[2] < 0:
+                    raise InvalidOperation()
+                violation = abs(numbers[1] - numbers[0]) > numbers[2]
+            except (InvalidOperation, ValueError):
+                raise EngineError("numeric_invariant", "Finite numeric states and a nonnegative maximum delta are required")
+        else:
+            raise EngineError("state_oracle", "Specify forbidden_after or max_delta")
+        return ("confirmed" if violation else "inconclusive",
+                "Declared resource-state invariant was violated" if violation else
+                "No violation observed; a discriminating normal state-transition control is still required for refutation")
+    else:
+        raise EngineError("oracle_binding", "This helper only evaluates JSON baseline, semantic-negative or state-invariant assertions")
+    return outcome, reason
 
 
 def _scenario_observations(project, ids, item, oracle):
@@ -123,8 +291,7 @@ def _scenario_observations(project, ids, item, oracle):
 
 
 def _state_json(observation):
-    from .inputs import json_document
-    return json_document(base64.b64decode(observation[1]["response"]["body_base64"], validate=True))
+    return response_json(observation[1])
 
 
 def _state_readback(project, observations, action_resource, scope):
@@ -192,7 +359,7 @@ def _state_transition(project, item, operation, ids, oracle):
         raise EngineError("resource_binding", "The action must use the acting account's current fixture and request binding")
     action_input, context = _input_view(action, item, operation)
     try:
-        input_matches = "action_input_expected" in oracle and canonical(action_input) == canonical(oracle["action_input_expected"])
+        input_matches = "action_input_expected" in oracle and json_equal(action_input, oracle["action_input_expected"])
     except (ValueError, TypeError):
         input_matches = False
     if not input_matches:
@@ -204,17 +371,19 @@ def _state_transition(project, item, operation, ids, oracle):
         raise EngineError("state_action_success", "Declare a positive action_success_selector/expected business success assertion")
     action_response = _state_json(action)
     if not isinstance(action_response, dict) or action_response.get("success") is False or action_response.get("ok") is False \
-            or pointer(action_response, success_selector) != expected:
+            or not json_equal(pointer(action_response, success_selector), expected):
         raise EngineError("state_action_success", "The state-changing action did not report actual business success")
     scope = _state_readback(project, observations, resource, oracle.get("readback_scope"))
     selector = oracle.get("selector")
     leaf = re.sub(r"[^a-z0-9]", "", str(selector).rsplit("/", 1)[-1].lower())
-    if not isinstance(selector, str) or not selector.startswith("/") or leaf in {
+    if not isinstance(selector, str) or not selector.startswith("/") or control_signal_selector(selector) or leaf in {
             "success", "ok", "message", "error", "code", "statuscode", "requestid", "traceid", "correlationid",
             "timestamp", "nonce", "elapsedms", "duration", "length", "responselength"}:
         raise EngineError("state_selector", "State proof needs a concrete business state, not response flags or transport noise")
     old, new = [pointer(_state_json(observation), selector) for observation in (before, after)]
-    if "before_expected" not in oracle or old != oracle["before_expected"]:
+    if not all(has_business_state(value) for value in (old, new)):
+        raise EngineError("state_readback", "State readbacks need actual business state, not denial or acknowledgement messages")
+    if "before_expected" not in oracle or not json_equal(old, oracle["before_expected"]):
         raise EngineError("baseline_invalid", "The initial associated business state did not match before_expected")
     if ("max_delta" in oracle) == ("forbidden_after" in oracle):
         raise EngineError("state_oracle", "Specify exactly one bounded max_delta or forbidden_after")
@@ -231,9 +400,9 @@ def _state_transition(project, item, operation, ids, oracle):
     else:
         forbidden = oracle["forbidden_after"]
         if any(not isinstance(value, (str, bool, int, float)) or isinstance(value, float) and not Decimal(str(value)).is_finite()
-               for value in (old, new, forbidden)) or old == forbidden:
+               for value in (old, new, forbidden)) or json_equal(old, forbidden):
             raise EngineError("baseline_invalid", "forbidden_after needs finite scalar states and a non-violating initial baseline")
-        violation = new == forbidden
+        violation = json_equal(new, forbidden)
     proof = {"scope": "bounded_state_transition", "scenario_run_id": run["id"],
              "before_evidence_id": ids[0], "action_evidence_id": ids[1], "after_evidence_id": ids[2],
              "step_ids": [oracle[field] for field in ("before_step_id", "action_step_id", "after_step_id")],
@@ -271,7 +440,9 @@ def is_xss_category(value):
 
 
 def _sql_input(item, operation):
-    return item.get("test_family") == "sql_injection" or is_sql_category(item.get("category")) or any(
+    if item.get("test_family") is not None:
+        return item["test_family"] == "sql_injection"
+    return item.get("scope_family") == "sql_injection" or is_sql_category(item.get("category")) or any(
         entry.get("location") == item.get("input_location")
         and entry.get("selector", entry.get("name")) == item.get("input_selector")
         and entry.get("schema_branch") == item.get("schema_branch")
@@ -286,6 +457,11 @@ def _oracle_family(item, operation, oracle):
             and not (family == "xss" and kind == "analyst_runtime"):
         raise EngineError("sql_metadata_required", "A declared SQL input requires metadata/error proof, not a generic observable")
     if family is None:
+        from .completeness import obligation_family
+        if obligation_family(item, operation) == "xss":
+            raise EngineError("xss_runtime_required", "An inferred legacy XSS consumer cannot close on HTTP/static controls; declare the explicit xss family and use a real controlled runtime proof",
+                              {"operation_id": item["operation_id"], "obligation_id": item["id"],
+                               "next_action": "surface.declare_consumer", "help_input": {"name": "surface.declare_consumer"}})
         return
     from .engine import TEST_FAMILIES
     if family not in TEST_FAMILIES or oracle.get("test_family") != family:
@@ -373,11 +549,14 @@ def _extract_value(observation, oracle):
         pattern = re.compile(expression)
         if "value" not in pattern.groupindex:
             raise EngineError("selector", "response_pattern requires a named (?P<value>...) group")
+    except re.error as exc:
+        raise EngineError("selector", "The response pattern is invalid") from exc
+    try:
         raw = base64.b64decode(observation[1]["response"]["body_base64"], validate=True).decode("utf-8")
-        matched = pattern.search(raw)
-        return matched.group("value") if matched else None
-    except (re.error, UnicodeError, ValueError) as exc:
-        raise EngineError("selector", "The response pattern or response encoding is invalid") from exc
+    except (UnicodeError, ValueError, TypeError, KeyError) as exc:
+        raise EngineError("response_encoding", "Pattern assertions require intact UTF-8 response bytes") from exc
+    matched = pattern.search(raw)
+    return matched.group("value") if matched else None
 
 
 def _metadata_expression(value, metadata_type):
@@ -412,7 +591,7 @@ def _sql_metadata(project, item, operation, observations, oracle):
     baseline_channel = {"selector": baseline_selector, "response_pattern": baseline_pattern}
     if bool(baseline_selector) == bool(baseline_pattern) or "baseline_expected" not in oracle or not _nonempty(oracle["baseline_expected"]):
         raise EngineError("baseline_invalid", "Declare a nonempty normal business baseline assertion")
-    if _extract_value(baseline, baseline_channel) != oracle["baseline_expected"]:
+    if not json_equal(_extract_value(baseline, baseline_channel), oracle["baseline_expected"]):
         raise EngineError("baseline_invalid", "The normal business baseline assertion did not match")
     metadata_type = oracle.get("metadata_type")
     if metadata_type not in {"database", "current_user"}:
@@ -437,6 +616,8 @@ def _sql_metadata(project, item, operation, observations, oracle):
     try:
         value = _extract_value(recovered, oracle)
     except EngineError as exc:
+        if exc.code != "selector":
+            raise
         raise EngineError("sql_metadata_value", "The recovery response contains no selected metadata value") from exc
     if value != expected:
         raise EngineError("sql_metadata_value", "The exact declared metadata value was not recovered from the response")
@@ -444,7 +625,7 @@ def _sql_metadata(project, item, operation, observations, oracle):
         try:
             other = _extract_value(obs, oracle)
         except EngineError as exc:
-            if exc.code not in {"selector", "response_json"}:
+            if exc.code != "selector":
                 raise
             other = None
         if other == value:
@@ -478,8 +659,6 @@ def _sqlmap_metadata(project, item, operation, observations, oracle, inputs):
         raise EngineError("sql_metadata_binding", "The operation policy changed after tool execution")
     value = oracle["expected_value"]
     field = oracle["metadata_type"]
-    if value.casefold() in str(inputs[1]).casefold():
-        raise EngineError("sql_metadata_reflection", "The recovered value occurs in the submitted input and could be reflection")
     artifact = project.read_artifact(run)
     if artifact.get("metadata_candidates", {}).get(field) != value or run.get("metadata_candidates", {}).get(field) != value:
         raise EngineError("sql_metadata_value", "The declared database name/user was not recovered in the original sqlmap run")
@@ -504,15 +683,15 @@ def _sqlmap_metadata(project, item, operation, observations, oracle, inputs):
                               "predicates; omit negative_value to rely on the sqlmap transcript directly")
         if not all(200 <= obs[1]["response"]["status"] < 300 for obs in observations):
             raise EngineError("control_invalid", "Blind equality controls must reach successful business responses")
-        if _extract_value(observations[1], baseline_channel) != oracle["baseline_expected"]:
+        if not json_equal(_extract_value(observations[1], baseline_channel), oracle["baseline_expected"]):
             raise EngineError("sql_metadata_control", "The recovered-value predicate did not preserve the valid baseline result")
         try:
             false_result = _extract_value(observations[2], baseline_channel)
         except EngineError as exc:
-            if exc.code not in {"selector", "response_json"}:
+            if exc.code != "selector":
                 raise
             false_result = None
-        if false_result == oracle["baseline_expected"]:
+        if json_equal(false_result, oracle["baseline_expected"]):
             raise EngineError("sql_metadata_control", "The false metadata predicate returned the same business result")
         return {"metadata_type": field, "recovered_value": value, "scope": "database_metadata",
                 "channel": "sqlmap_with_independent_predicates", "tool_run_id": run["id"],
@@ -520,6 +699,8 @@ def _sqlmap_metadata(project, item, operation, observations, oracle, inputs):
                 "negative_evidence_id": observations[2][0]["id"]}
     # Transcript channel: controls must still be real, distinct executions; a
     # scanner banner or an unreachable target is not enough.
+    if value.casefold() in str(inputs[1]).casefold():
+        raise EngineError("sql_metadata_reflection", "The recovered value occurs in the submitted input and could be reflection")
     if not all(200 <= obs[1]["response"]["status"] < 600 for obs in observations):
         raise EngineError("control_invalid", "Each baseline/recovery/negative capture must contain an actual server response")
     return {"metadata_type": field, "recovered_value": value, "scope": "database_metadata",
@@ -799,6 +980,8 @@ def _bound_xss_proof(project, decision):
 def validate_confirmation(project, decision, category=None):
     """Reopen legacy SQL confirmations and prevent analyst review bypassing proof."""
     oracle = decision.get("oracle") or {}
+    if not isinstance(oracle, dict) or (oracle.get("type") is not None and not isinstance(oracle["type"], str)):
+        raise EngineError("oracle", "A stored oracle must have a typed string discriminator")
     bound_item = project.get("obligation", decision["obligation_id"]) if decision.get("obligation_id") else None
     bound_operation = project.get("operation", bound_item["operation_id"]) if bound_item else None
     if bound_item:
@@ -807,28 +990,35 @@ def validate_confirmation(project, decision, category=None):
         if bound_item.get("test_family") and claimed_family and bound_item["test_family"] != claimed_family:
             code = "sql_metadata_required" if claimed_family == "sql_injection" else "xss_runtime_required" if claimed_family == "xss" else "oracle_family"
             raise EngineError(code, "The explicitly claimed finding family does not match its supporting input-test obligation")
+        if oracle.get("type") in {"baseline", "semantic_negative", "state_invariant"}:
+            observations = _observations(project, decision["evidence_ids"], bound_item)
+            outcome, reason = _json_oracle_result(project, bound_item, bound_operation, observations, oracle)
+            if outcome != decision.get("outcome"):
+                raise EngineError("json_assertion", "The stored JSON decision does not satisfy the current typed controls and business-state assertions")
         if oracle.get("type") == "analyst_runtime":
             if category is not None and not is_xss_category(category):
                 raise EngineError("oracle_family", "A bound reviewed XSS runtime proof can only support an XSS finding")
-            if _bound_xss_proof(project, decision) != decision.get("proof"):
+            if not json_equal(_bound_xss_proof(project, decision), decision.get("proof")):
                 raise EngineError("xss_runtime_binding", "Stored reviewed runtime proof differs from its current controls or browser observation")
             return
         if oracle.get("type") == "state_transition" and decision.get("outcome") == "confirmed":
             outcome, reason, proof = _state_transition(project, bound_item, bound_operation, decision["evidence_ids"], oracle)
-            if outcome != "confirmed" or proof != decision.get("proof"):
+            if outcome != "confirmed" or not json_equal(proof, decision.get("proof")):
                 raise EngineError("state_proof", "The stored scenario-state proof differs from its current checkpoints or observations")
-        if oracle.get("type") == "extraction" and bound_item.get("test_family") and decision.get("outcome") == "confirmed":
+        if oracle.get("type") == "extraction" and decision.get("outcome") == "confirmed":
             observations = _observations(project, decision["evidence_ids"], bound_item)
             if len(observations) != 2:
-                raise EngineError("family_proof", "Typed extraction needs two independent input controls")
+                raise EngineError("family_proof", "Extraction needs two independent input controls")
             _input_controls(observations, bound_item, bound_operation)
             try:
                 control = _value(observations[1], oracle["selector"])
-            except EngineError:
+            except EngineError as exc:
+                if exc.code != "selector":
+                    raise
                 control = None
             actual = _family_extraction(bound_item, bound_operation, observations, oracle,
                                         _value(observations[0], oracle["selector"]), control)
-            if actual != decision.get("proof"):
+            if not json_equal(actual, decision.get("proof")):
                 raise EngineError("family_proof", "The stored family-specific extraction proof differs from its observations")
     if oracle.get("type") == "authorization":
         item = project.get("obligation", decision["obligation_id"])
@@ -839,6 +1029,25 @@ def validate_confirmation(project, decision, category=None):
         _authorization_requests(project, observations)
         _independent_principals(project, observations[0], observations[1])
         _require_verified_roles(project, operation, observations)
+        protected = _authorization_value(observations[0], oracle.get("selector"), baseline=True)
+        variant = observations[1]
+        if 200 <= variant[1]["response"]["status"] < 300:
+            try:
+                matches = json_equal(_authorization_value(variant, oracle.get("selector")), protected)
+            except EngineError as exc:
+                if exc.code != "selector":
+                    raise
+                matches = False
+            if decision.get("outcome") in {"confirmed", "refuted"} and not matches:
+                raise EngineError("authorization_proof", "Stored authorization result is not supported by matching protected business data")
+        elif decision.get("outcome") == "refuted":
+            denied = oracle.get("deny_statuses", [401, 403])
+            if not isinstance(denied, list) or any(status not in [401, 403, 404] for status in denied):
+                raise EngineError("deny_statuses", "Only explicit authentication/authorization denial statuses can refute access")
+            if variant[1]["response"]["status"] not in denied or _authorization_denial_has_data(variant, oracle.get("selector")):
+                raise EngineError("authorization_proof", "A stored denial-status refutation is not supported when protected business data remains available")
+        elif decision.get("outcome") == "confirmed":
+            raise EngineError("authorization_proof", "A denial/error status cannot support a stored protected-data disclosure confirmation")
     if decision.get("outcome") != "confirmed":
         return
     if is_xss_category(category) or decision.get("runtime"):
@@ -854,7 +1063,7 @@ def validate_confirmation(project, decision, category=None):
         return
     if proof.get("channel") == "behavioural_diff":
         actual = _sql_behaviour_proof(project, proof)
-        if actual != proof:
+        if not json_equal(actual, proof):
             raise EngineError("sql_metadata_proof", "Stored behavioural proof differs from the supporting observations")
         return
     oracle = decision.get("oracle") or {}
@@ -867,7 +1076,7 @@ def validate_confirmation(project, decision, category=None):
     actual = (_error_channel(project, item, operation, observations, oracle)
               if oracle.get("type") == "error_channel"
               else _sql_metadata(project, item, operation, observations, oracle))
-    if decision.get("proof") != actual:
+    if not json_equal(decision.get("proof"), actual):
         raise EngineError("sql_metadata_proof", "Stored metadata proof differs from the supporting observations")
 
 
@@ -932,20 +1141,17 @@ def evaluate(project,args):
     if not isinstance(oracle,dict):
         raise EngineError("oracle", "A typed oracle is required")
     kind=oracle.get("type")
+    if not isinstance(kind, str):
+        raise EngineError("unsupported_oracle", "A supported typed string oracle discriminator is required")
     ids=args.get("evidence_ids",[])
     _oracle_family(item, operation, oracle)
     observations=[] if kind == "state_transition" else _observations(project,ids,item)
     outcome,reason="inconclusive","Experiment did not establish the requested invariant"
     proof = None
-    if kind=="state_transition":
+    if kind in {"baseline", "semantic_negative", "state_invariant"}:
+        outcome, reason = _json_oracle_result(project, item, operation, observations, oracle)
+    elif kind=="state_transition":
         outcome, reason, proof = _state_transition(project, item, operation, ids, oracle)
-    elif kind=="baseline":
-        if item["kind"]!="baseline" or len(observations)!=1 or "expected" not in oracle:
-            raise EngineError("oracle_binding", "A baseline obligation needs one capture and an expected JSON value")
-        if observations[0][0].get("actor_id") != item.get("actor_id"):
-            raise EngineError("actor_binding", "Baseline used a different actor")
-        if 200<=observations[0][1]["response"]["status"]<300 and _value(observations[0],oracle["selector"])==oracle["expected"]:
-            outcome,reason="refuted","Declared normal response assertion matched; this is a baseline, not a vulnerability absence claim"
     elif kind=="authorization":
         if item["kind"] not in {"access","ownership"} or len(observations)!=2:
             raise EngineError("oracle_binding", "Authorization needs a permission obligation and independent allowed/variant captures")
@@ -969,84 +1175,25 @@ def evaluate(project,args):
             expected_allowed=False
         if not 200<=baseline[1]["response"]["status"]<300:
             raise EngineError("baseline_invalid", "Allowed actor did not reach a valid normal response")
-        protected=_value(baseline,oracle["selector"])
-        if not _nonempty(protected):
-            raise EngineError("baseline_invalid", "Protected baseline value must be present")
+        protected=_authorization_value(baseline,oracle.get("selector"),baseline=True)
         status=variant[1]["response"]["status"]
         denied=oracle.get("deny_statuses",[401,403])
         if not isinstance(denied,list) or any(s not in [401,403,404] for s in denied):
             raise EngineError("deny_statuses", "Only explicit authentication/authorization denial statuses can refute access")
         if status in denied and not expected_allowed:
+            if _authorization_denial_has_data(variant, oracle.get("selector")):
+                raise EngineError("authorization_response", "A denial-status response still contains selected protected business data; inspect the existing evidence instead of refuting access")
             outcome,reason="refuted","The distinct verified actor was denied for this concrete operation/resource"
         elif 200<=status<300:
             try:
-                matches=_value(variant,oracle["selector"])==protected
-            except EngineError:
+                matches=json_equal(_authorization_value(variant,oracle.get("selector")), protected)
+            except EngineError as exc:
+                if exc.code != "selector":
+                    raise
                 matches=False
             if matches:
                 outcome="refuted" if expected_allowed else "confirmed"
                 reason="Expected allowed access matched" if expected_allowed else "A disallowed verified actor received the protected value from the valid allowed baseline"
-    elif kind=="semantic_negative":
-        if item["kind"]!="input_test" or len(observations)!=3:
-            raise EngineError("oracle_binding", "Semantic refutation needs an input test and normal/variant/sensitivity captures")
-        _same_identity(observations)
-        leaf = re.sub(r"[^a-z0-9]", "", str(oracle.get("selector", "")).rsplit("/",1)[-1].lower())
-        if leaf in {"requestid","traceid","correlationid","timestamp","nonce","elapsedms","duration"}:
-            raise EngineError("sensitivity", "Transport noise cannot establish business sensitivity")
-        baseline,variant,control=observations
-        if not all(200<=a["response"]["status"]<300 for m,a in observations):
-            raise EngineError("control_invalid", "Error responses cannot be used as normal business sensitivity controls")
-        if "baseline_expected" not in oracle or "control_expected" not in oracle or oracle["baseline_expected"]==oracle["control_expected"]:
-            raise EngineError("sensitivity", "Declare distinct normal and sensitivity business values")
-        values=[_value(o,oracle["selector"]) for o in observations]
-        if values[0]!=oracle["baseline_expected"] or values[2]!=oracle["control_expected"]:
-            raise EngineError("sensitivity", "Business assertions did not match the controls")
-        _input_controls(observations,item,operation)
-        if values[1]==values[0]:
-            outcome,reason="refuted","No change in the specified business observable under a valid discriminating control; limited to this hypothesis"
-        else:
-            reason="Business observable changed; difference requires impact analysis and does not automatically confirm a vulnerability"
-    elif kind=="state_invariant":
-        if item["kind"]!="input_test" or len(observations)<3:
-            raise EngineError("oracle_binding", "State invariant needs before/action/after captures on an input-test obligation")
-        before,after=observations[0],observations[-1]
-        _same_identity(observations)
-        if not all(200<=a["response"]["status"]<300 for m,a in observations):
-            raise EngineError("control_invalid", "State observations require successful business responses")
-        resource=before[0].get("resource_id")
-        if not resource or any(m.get("resource_id")!=resource for m,a in observations):
-            raise EngineError("resource_binding", "State experiment requires the same bound resource")
-        times=[stamp(a["started_at"]) for m,a in observations]
-        if times!=sorted(times) or any(stamp(observations[i-1][1]["completed_at"]) > times[i] for i in range(1,len(times))):
-            raise EngineError("state_order", "State captures must be supplied in actual execution order")
-        if operation["method"] in {"GET","HEAD","OPTIONS"}:
-            raise EngineError("state_action", "State conclusions require a captured state-changing action")
-        views = [_input_view(o,item,operation) for o in observations]
-        if any(context != views[0][1] for value,context in views[1:]) or views[-1][0] != views[0][0]:
-            raise EngineError("input_binding", "State readbacks must repeat the baseline input and keep other request inputs fixed")
-        if all(value == views[0][0] for value,context in views[1:-1]):
-            raise EngineError("input_binding", "The state-changing action must vary the bound test input")
-        old,new=_value(before,oracle["selector"]),_value(after,oracle["selector"])
-        if "before_expected" not in oracle or old!=oracle["before_expected"]:
-            raise EngineError("baseline_invalid", "Initial business state did not match")
-        if "forbidden_after" in oracle:
-            if old == oracle["forbidden_after"]:
-                raise EngineError("baseline_invalid", "Initial state already violates the declared invariant")
-            violation=new==oracle["forbidden_after"]
-        elif "max_delta" in oracle:
-            try:
-                if any(isinstance(x,bool) for x in [old,new,oracle["max_delta"]]):
-                    raise InvalidOperation()
-                values=[Decimal(str(x)) for x in [old,new,oracle["max_delta"]]]
-                if not all(x.is_finite() for x in values) or values[2]<0:
-                    raise InvalidOperation()
-                violation=abs(values[1]-values[0])>values[2]
-            except (InvalidOperation,ValueError):
-                raise EngineError("numeric_invariant", "Finite numeric states and a nonnegative maximum delta are required")
-        else:
-            raise EngineError("state_oracle", "Specify forbidden_after or max_delta")
-        outcome="confirmed" if violation else "inconclusive"
-        reason="Declared resource-state invariant was violated" if violation else "No violation observed; a discriminating normal state-transition control is still required for refutation"
     elif kind=="sql_metadata":
         proof = _sql_metadata(project, item, operation, observations, oracle)
         outcome, reason = "confirmed", "A database name or current database user was recovered through the bound SQL input with a normal baseline and discriminating negative control"
@@ -1078,13 +1225,17 @@ def evaluate(project,args):
             raise EngineError("control_invalid", "The negative control must be a successful response")
         try:
             value=_value(recovered,selector)
-        except EngineError:
+        except EngineError as exc:
+            if exc.code != "selector":
+                raise
             raise EngineError("sensitivity",
                               "The recovering capture has no value at " + selector
                               + "; declare a selector the successful response actually populates")
         try:
             control_value=_value(control,selector)
-        except EngineError:
+        except EngineError as exc:
+            if exc.code != "selector":
+                raise
             # The control legitimately lacks the value (that is what makes it a control).
             control_value=None
         if not isinstance(value,str) or not value:

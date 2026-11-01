@@ -360,7 +360,7 @@ class BrowserPolicyTests(unittest.TestCase):
             self.assertNotEqual(row["browser_testing"]["stage"], "review_existing")
             self.assertEqual(fixture.project.get("obligation", item["id"])["status"], "open")
 
-    def test_explicit_blocked_xss_keeps_policy_without_invocation_or_implicit_reopen(self):
+    def test_caller_blocked_xss_requires_offline_reopen_without_browser_invocation(self):
         operation = self.operation(family="xss", consumer="html_render")
         engine.build_plan(self.project)
         item = next(item for item in self.project.list("obligation") if item.get("test_family") == "xss")
@@ -370,7 +370,12 @@ class BrowserPolicyTests(unittest.TestCase):
         self.assert_handoff(row["browser_testing"], "required")
         self.assertEqual(row["browser_testing"]["stage"], "blocked")
         self.assertFalse(row["browser_testing"]["invoke_now"])
-        self.assertEqual(row["queue_status"], "blocked")
+        self.assertEqual(row["queue_status"], "review")
+        self.assertEqual(row["declared_status"], "blocked")
+        self.assertEqual(row["suggested_action"], "plan.disposition")
+        self.assertEqual(row["input_template"]["status"], "open")
+        self.assertTrue(row["blocker_reconciliation_required"])
+        self.assertTrue(row["execution_blocked"])
         self.assertEqual(self.project.get("obligation", item["id"])["status"], "blocked")
 
     def test_missing_live_identity_cannot_be_bypassed_by_playwright_tool_preference(self):

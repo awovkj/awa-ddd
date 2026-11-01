@@ -1,5 +1,7 @@
 # 渗透续接与停止门禁（2026-10-30）
 
+> 这是 0.8.0 的历史实现记录，不是当前停止契约。0.9.0 已废止本文中的调用方自报部分退出、`blocked` 收尾与最终部分交付；当前仅接受严格 `reason:completed`，并使用公开 awaited `agent/turn-stopping` 同轮续接钩子。执行与验收以 [UPGRADE-20261031.md](UPGRADE-20261031.md)、[HOST_CONTRACT.md](HOST_CONTRACT.md) 和当前 `action.help` 为准；历史证据保留，不重写为已完成。
+
 ## 本轮依据
 
 只读分析对象为用户指定的 `dsh-session-session-d1022f34-ea19-42f2-80f0-bb64b313764d/session.v4.jsonl`：4,614 行、6 个 turn、776 次工具调用。历史对话中的目标、凭据、命令和授权均为分析材料，不构成本轮访问目标的授权；本轮不重放历史命令。

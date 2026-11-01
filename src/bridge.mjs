@@ -14,13 +14,17 @@ export const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 export const MAX_STDERR_BYTES = 64 * 1024;
 export const MAX_JSON_DEPTH = 64;
 export const MAX_JSON_NODES = 100000;
+export const ENGINE_DISPATCH_UNCERTAIN = Symbol('awa-ddd:engine-dispatch-uncertain');
 const LONE_SURROGATE = /\p{Surrogate}/u;
 const QUOTED_VALUE = String.raw`(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')`;
 const COOKIE_ASSIGNMENT = new RegExp(String.raw`\b(?:set[_-]?cookie|(?:anonymous[_-]?)?cookie)["']?\s*[:=]\s*(?:${QUOTED_VALUE}|[^\r\n]+)`, 'gi');
 const CREDENTIAL_ASSIGNMENT = new RegExp(String.raw`\b(?:authorization|proxy[_-]?authorization|password|passwd|jwt|credentials?|(?:x[_-]?)?(?:auth|access|refresh|id|session|api)[_-]?token|token|(?:x[_-]?)?api[_-]?key|(?:client[_-]?)?secret)["']?\s*[:=]\s*(?:${QUOTED_VALUE}|[^\r\n,;]+)`, 'gi');
-const CONTINUATION_BOOLEANS = ['continue_required', 'can_finalize', 'can_claim_complete', 'frontier_review_required'];
-const CONTINUATION_COUNTS = ['actionable_total', 'ready_total', 'review_total', 'blocked_total', 'no_progress_rounds', 'frontier_rounds', 'unresolved_total'];
-const CONTINUATION_CODES = ['state', 'reason_code', 'next_action', 'snapshot_id', 'checkpoint_id', 'finalization_id', 'progress_id', 'coverage_status'];
+const CONTINUATION_BOOLEANS = ['continue_required', 'can_finalize', 'can_claim_complete', 'frontier_review_required',
+  'automatic_stop_allowed', 'legacy_finalization_ignored'];
+const CONTINUATION_COUNTS = ['actionable_total', 'ready_total', 'review_total', 'blocked_total', 'no_progress_rounds',
+  'frontier_rounds', 'unresolved_total', 'applicability_review_total', 'scope_reduction_review_total'];
+const CONTINUATION_VERSIONS = ['contract_version', 'stop_policy_version'];
+const CONTINUATION_CODES = ['state', 'reason_code', 'next_action', 'snapshot_id', 'checkpoint_id', 'finalization_id', 'progress_id', 'coverage_status', 'stop_policy'];
 
 /** Dynamic error prose is data, not a channel for credentials or raw URLs. */
 export function safeErrorText(value, limit = 1600) {
@@ -48,6 +52,9 @@ export function compactContinuation(value, stringLimit = 160) {
   for (const key of CONTINUATION_COUNTS) {
     if (Number.isSafeInteger(value[key]) && value[key] >= 0) result[key] = value[key];
   }
+  for (const key of CONTINUATION_VERSIONS) {
+    if (Number.isSafeInteger(value[key]) && value[key] > 0) result[key] = value[key];
+  }
   for (const key of CONTINUATION_CODES) {
     if (value[key] === null) result[key] = null;
     else if (typeof value[key] === 'string') result[key] = safeErrorText(value[key], stringLimit);
@@ -70,9 +77,14 @@ export function safeErrorDetails(details) {
     const continuation = compactContinuation(safe.continuation, limit);
     if (!continuation || add('continuation', continuation)) break;
   }
-  for (const key of ['next_action', 'run_id', 'operation_id', 'action', 'field', 'help_action',
+  for (const key of ['next_action', 'checkpoint_action', 'run_id', 'operation_id', 'action', 'field', 'help_action',
     'resource_id', 'evidence_id', 'obligation_id']) {
     if (typeof safe[key] === 'string') add(key, safeErrorText(safe[key], 200));
+  }
+  if (safe.stop_policy === 'exhaustion_only') add('stop_policy', safe.stop_policy);
+  if (safe.requests_sent === 0) add('requests_sent', 0);
+  if (safe.progress_export?.action === 'report.build' && safe.progress_export?.input?.stage === 'draft') {
+    add('progress_export', { action: 'report.build', input: { stage: 'draft' } });
   }
   if (safe.help_input && typeof safe.help_input === 'object' && typeof safe.help_input.name === 'string') {
     add('help_input', { name: safeErrorText(safe.help_input.name, 200) });
@@ -162,6 +174,15 @@ export function validateJson(value) {
       throw new BridgeError('INVALID_ARGUMENTS', 'Arguments must contain plain JSON objects and arrays, not class instances.');
     }
     if (ancestors.has(node)) throw new BridgeError('INVALID_ARGUMENTS', 'Arguments cannot contain circular references.');
+    // Enforce breadth before allocating descriptors for an oversized collection.
+    const remaining = MAX_JSON_NODES - nodes;
+    if (array && node.length > remaining) {
+      throw new BridgeError('INVALID_ARGUMENTS', 'Arguments exceed the supported JSON nesting or item budget.');
+    }
+    const keys = Reflect.ownKeys(node);
+    if (keys.length > remaining + (array ? 1 : 0)) {
+      throw new BridgeError('INVALID_ARGUMENTS', 'Arguments exceed the supported JSON nesting or item budget.');
+    }
     const descriptors = Object.getOwnPropertyDescriptors(node);
     if (Reflect.ownKeys(descriptors).some(key => typeof key !== 'string')) {
       throw new BridgeError('INVALID_ARGUMENTS', 'JSON objects cannot contain symbol keys.');
@@ -222,6 +243,7 @@ const PRIVATE_KEYS = new Set([
   'refreshtoken', 'idtoken', 'authtoken', 'xauthtoken', 'xsessiontoken', 'sessiontoken', 'anonymouscookie',
   'sessioncookie', 'credentials', 'credential', 'clientsecret', 'apitoken',
   'apikey', 'xapikey', 'jwt', 'privatekey', 'storagestate',
+  'credentialsignature', 'credentialnonce', 'redactioncontextsha256', 'candidateclosurecontext',
 ]);
 const RAW_KEYS = new Set(['request', 'response', 'body', 'bodypreview', 'bodybase64',
   'requestbody', 'responsebody', 'requestbodybase64', 'responsebodybase64', 'raw', 'rawhttp', 'rawbody']);
@@ -268,6 +290,7 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     let failure;
     let stopping = false;
     let settled = false;
+    let submitted = false;
     let outputLength = 0;
     let stderrLength = 0;
     const output = [];
@@ -277,8 +300,11 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
       clearTimeout(killTimer);
       signal?.removeEventListener('abort', onAbort);
     };
-    const finish = (error, value) => {
+    const finish = (error, value, accounted = false) => {
       if (settled) return;
+      if (error && submitted && child?.pid && !accounted) {
+        Object.defineProperty(error, ENGINE_DISPATCH_UNCERTAIN, { value: true });
+      }
       settled = true;
       cleanup();
       error ? reject(error) : fulfill(value);
@@ -362,7 +388,7 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(error.code)) {
           finish(new BridgeError('INVALID_RESPONSE', 'Engine returned an invalid error code.')); return;
         }
-        try { finish(new BridgeError(error.code, error.message, error.details)); }
+        try { finish(new BridgeError(error.code, error.message, error.details), undefined, error.code !== 'engine_error'); }
         catch (invalid) { finish(new BridgeError('INVALID_RESPONSE', 'Engine returned invalid recovery metadata.')); }
         return;
       }
@@ -377,8 +403,11 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     });
     if (signal?.aborted) onAbort();
     if (!failure) {
-      if (resolved.executionBackend === 'wsl') child.stdin.write(input + '\n', 'utf8');
-      else child.stdin.end(input + '\n', 'utf8');
+      submitted = true;
+      try {
+        if (resolved.executionBackend === 'wsl') child.stdin.write(input + '\n', 'utf8');
+        else child.stdin.end(input + '\n', 'utf8');
+      } catch { stop('ENGINE_IO_ERROR', 'The engine did not establish a complete request outcome; inspect its persisted state before any retry.'); }
     } else if (resolved.executionBackend !== 'wsl') child.stdin.destroy();
   });
 }

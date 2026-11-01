@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
+import secrets
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, quote_plus, unquote, urlsplit
 
-from .store import EngineError, contained, now
+from .store import EngineError, canonical, contained, now
 from .scope import normalize_url, origin, require_scope
 from .transport import headers_map
 
@@ -420,6 +422,10 @@ def _actions(args):
         if step["type"] in {"click", "fill", "waitForSelector"} and (
                 not isinstance(step.get("selector"), str) or not step["selector"].strip()):
             raise EngineError("browser_actions", "This action needs a selector")
+        if step["type"] == "fill":
+            if step.get("value") is not None and not isinstance(step["value"], str):
+                raise EngineError("browser_actions", "Fill values must be text or null")
+            step["value"] = step.get("value") or ""
         for field, default, limit in (("timeout", 5000, 20000), ("ms", 500, 10000),
                                       ("settleMs", 0, 10000)):
             if field in step:
@@ -530,6 +536,9 @@ def _successful(project, raw):
     mutations = raw.get("write_requests") or []
     if mutations and not raw.get("write_authorized"):
         return False
+    if any(not isinstance(item, dict) or type(item.get("status")) is not int or not 200 <= item["status"] < 600
+           for item in mutations):
+        return False
     try:
         require_scope(project.config, raw.get("url"))
         require_scope(project.config, raw.get("finalUrl"))
@@ -541,7 +550,8 @@ def _successful(project, raw):
             request = item.get("request", item)
             request_url = require_scope(project.config, request["url"])
             if request.get("method", "GET").upper() not in {"GET", "HEAD", "OPTIONS"}:
-                if not item.get("write"):
+                status = item.get("status", (item.get("response") or {}).get("status"))
+                if not item.get("write") or type(status) is not int or not 200 <= status < 600:
                     return False
             if item.get("blocked") or item.get("error"):
                 return False
@@ -557,8 +567,343 @@ def _successful(project, raw):
     return True
 
 
+def _redaction_inputs(actions):
+    values = []
+    available = True
+    for action in actions or []:
+        if not isinstance(action, dict) or action.get("action", action.get("type")) != "fill":
+            continue
+        if "value" not in action:
+            available = False
+            continue
+        value = action["value"]
+        if value is None:
+            continue
+        if not isinstance(value, (str, int, float, bool)):
+            available = False
+            continue
+        text = value if isinstance(value, str) else str(value)
+        if text and not re.fullmatch(r"AWA-XSS-[a-fA-F0-9]{16,64}", text) and text not in values:
+            values.append(text)
+    return values, available
+
+
+def _learn_private_value(redactor, value):
+    placeholder = redactor.slot(value, "BROWSER_INPUT")
+    if value:
+        for alias in {value, quote(value, safe=""), quote_plus(value),
+                      json.dumps(value, ensure_ascii=True)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}:
+            redactor.aliases[alias] = placeholder
+        redactor._pattern = None
+
+
+def _private_redaction_context(values):
+    return {"browser_fill_values": list(values), "redaction_nonce": secrets.token_hex(32)}
+
+
+def learn_redaction_context(project, redactor):
+    """Learn protected fill values; return legacy unavailable IDs, never secrets."""
+    unavailable = {"page_visit_ids": [], "run_ids": []}
+    for kind in ("run", "page_visit"):
+        for record in project.list(kind):
+            if kind == "run" and record.get("kind") != "browser":
+                continue
+            context = record.get("credentials")
+            values = context.get("browser_fill_values") if isinstance(context, dict) else None
+            valid = isinstance(values, list) and len(values) <= 50 \
+                and all(isinstance(value, str) for value in values) \
+                and isinstance(context.get("redaction_nonce"), str) \
+                and re.fullmatch(r"[a-f0-9]{64}", context["redaction_nonce"]) is not None \
+                and record.get("redaction_context_sha256") == hashlib.sha256(canonical(context).encode("utf-8")).hexdigest()
+            if (record.get("redaction_context_required") or record.get("redaction_context_checked")) and not valid:
+                raise EngineError("browser_redaction_context", "Required private browser redaction context is missing or changed; no browser content was published")
+            if valid:
+                for value in values:
+                    _learn_private_value(redactor, value)
+            legacy_fill = kind == "page_visit" and record.get("source") == "local_playwright" and any(
+                isinstance(action, dict) and action.get("action", action.get("type")) == "fill"
+                for action in record.get("actions", []))
+            if record.get("redaction_context_available") is False or legacy_fill and not record.get("redaction_context_checked"):
+                unavailable["page_visit_ids" if kind == "page_visit" else "run_ids"].append(record["id"])
+    return unavailable
+
+
+def public_metadata(project, record, *, raw=None):
+    from .engine import credential_header_names
+    from .reproduction import Redactor, _learn_header, _secret_key
+
+    raw = record if raw is None else raw
+    redactor = Redactor()
+    contexts = learn_redaction_context(project, redactor)
+    redactor.learn(raw)
+    redactor.learn(record)
+
+    def learn_keys(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                redactor.learn_text(key)
+                learn_keys(item)
+        elif isinstance(value, list):
+            for item in value:
+                learn_keys(item)
+
+    learn_keys(raw)
+    credential_names = {"cookie", "set-cookie", "authorization", "proxy-authorization",
+                        "x-api-key", "x-auth-token", "x-session-token"}
+    for session in project.list("session"):
+        names = credential_header_names(session)
+        credential_names.update(names)
+        for name in names:
+            _learn_header(redactor, name, session["headers"][name])
+
+    # Learn cookie/auth subtokens and URL secrets before rendering any prose.
+    network = raw.get("network", raw.get("requests", []))
+    for item in network if isinstance(network, list) else []:
+        if not isinstance(item, dict):
+            continue
+        header_sets = [item.get("request_headers"), item.get("response_headers")]
+        for side in ("request", "response"):
+            nested = item.get(side)
+            if isinstance(nested, dict):
+                header_sets.append(nested.get("headers"))
+        for headers in header_sets:
+            pairs = headers.items() if isinstance(headers, dict) else headers if isinstance(headers, list) else ()
+            for pair in pairs:
+                if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                    continue
+                name, value = pair
+                if isinstance(name, str) and isinstance(value, str) and (
+                        name.lower() in credential_names or _secret_key(name)):
+                    _learn_header(redactor, name, value)
+
+    def locator(value):
+        try:
+            return redactor.url(value)[:4000]
+        except (TypeError, ValueError):
+            return redactor.prose(value)
+
+    urls = []
+
+    def collect_locators(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in {"url", "finalUrl", "location"} and isinstance(item, str):
+                    urls.append((value, key))
+                collect_locators(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect_locators(item)
+
+    collect_locators(record)
+    for item, key in urls:
+        if isinstance(item.get(key), str):
+            locator(item[key])
+
+    schema_keys = {"id", "kind", "url", "finalUrl", "status", "signals", "hasApp", "forms", "inputs", "buttons", "links",
+                   "textLength", "selectorCount", "title", "console", "dialogs", "actions", "source_meta", "type", "message",
+                   "text", "action", "selector", "index", "action_index", "ok", "error", "blocked", "reason", "location",
+                   "method", "blocked_requests", "write_requests", "write_authorized", "navigation_trail", "network_count",
+                   "observation_status", "complete", "source", "trust", "machine_authenticated", "scope_enforced", "note",
+                   "artifact_path", "sha256", "created_at", "started_at", "finished_at", "completed_at", "session_id", "session_generation",
+                   "actor_id", "operation_id", "obligation_id", "resource_id", "page_id", "function_id", "page_visit_id", "visit_id",
+                   "run_id", "planned_page_visit_id", "page_ids", "functions", "pages", "pages_visited", "functions_triggered",
+                   "unvisited", "untriggered", "name", "trigger", "apis", "triggered", "trigger_status", "visited", "visit_status",
+                   "blocked_reason", "page_adoption", "page_adoption_error", "next_action", "run_status", "error_code", "effect",
+                   "allow_write", "target_origin", "action_count", "dispatch_attempted", "request_signature", "credential_signature",
+                   "actor_signature", "credential_header_names", "redaction_context_required", "redaction_context_available",
+                   "redaction_context_checked", "redaction_context_sha256", "source_file_sha256", "headless", "network_truncated"}
+
+    def safe_key(key):
+        return key if key in schema_keys else redactor.prose(key, 160)
+
+    numeric_secrets = {int(value): placeholder for value, placeholder in redactor.values.items()
+                       if re.fullmatch(r"[0-9]{1,64}", value)}
+
+    def sensitive_fields(value, sensitive=False, field="SECRET", untrusted=False):
+        if isinstance(value, dict):
+            declared = value.get("name")
+            result = {}
+            for key, item in value.items():
+                if key == "redaction_context_sha256":
+                    continue
+                structural = field == "signals" and key in _STRUCTURAL_SIGNALS and (
+                    key == "hasApp" and type(item) is bool or key != "hasApp" and type(item) is int and item >= 0)
+                if structural:
+                    result[key] = item
+                else:
+                    result[key] = sensitive_fields(item, sensitive or _secret_key(key) or
+                        (key == "value" and _secret_key(declared)), str(key),
+                        untrusted or field == "signals" or key in {"source_meta", "console", "dialogs"})
+            return result
+        if isinstance(value, list):
+            return [sensitive_fields(item, sensitive, field, untrusted) for item in value]
+        if sensitive and value is not None:
+            return redactor.slot(value, field)
+        if untrusted and isinstance(value, (int, float)) and not isinstance(value, bool):
+            candidates = [str(value)]
+            if isinstance(value, float) and value.is_integer():
+                candidates.append(str(int(value)))
+            for candidate in candidates:
+                if candidate in redactor.values:
+                    return redactor.values[candidate]
+            if value in numeric_secrets:
+                return numeric_secrets[value]
+        return value
+
+    def scrub_keys(value):
+        if isinstance(value, dict):
+            return {safe_key(key): scrub_keys(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub_keys(item) for item in value]
+        return value
+
+    public = scrub_keys(redactor.metadata(sensitive_fields(record)))
+
+    def restore_locators(original, sanitized):
+        if isinstance(original, dict) and isinstance(sanitized, dict):
+            for key, item in original.items():
+                public_key = safe_key(key)
+                if public_key not in sanitized:
+                    continue
+                if key in {"url", "finalUrl", "location"} and isinstance(item, str):
+                    sanitized[public_key] = locator(item)
+                    if sanitized[public_key] != item:
+                        sanitized[public_key + "_redacted"] = True
+                        sanitized["locator_requires_binding"] = True
+                        sanitized["native_input_requires_binding"] = True
+                        sanitized["requestable"] = False
+                else:
+                    restore_locators(item, sanitized[public_key])
+        elif isinstance(original, list) and isinstance(sanitized, list):
+            for item, safe_item in zip(original, sanitized):
+                restore_locators(item, safe_item)
+
+    restore_locators(record, public)
+
+    with project._lock:
+        known_ids = {row[0] for row in project.connection.execute("SELECT id FROM entities").fetchall()}
+    known_ids.add(project.project_id)
+    pages = project.list("page")
+    for page in pages:
+        known_ids.update(item["id"] for item in page.get("functions", []) if isinstance(item, dict) and isinstance(item.get("id"), str))
+    handle_keys = {"id", "project_id", "session_id", "actor_id", "operation_id", "obligation_id", "resource_id",
+                   "evidence_id", "decision_id", "finding_id", "candidate_id", "page_id", "function_id", "run_id",
+                   "visit_id", "page_visit_id", "checkpoint_id", "finalization_id", "planned_page_visit_id"}
+
+    def restore_handles(original, sanitized):
+        if isinstance(original, dict) and isinstance(sanitized, dict):
+            for key, item in original.items():
+                public_key = safe_key(key)
+                if public_key not in sanitized:
+                    continue
+                if key in handle_keys and isinstance(item, str) and item in known_ids:
+                    sanitized[public_key] = item
+                elif key.endswith("_ids") and isinstance(item, list) and isinstance(sanitized[public_key], list):
+                    for index, identity in enumerate(item):
+                        if isinstance(identity, str) and identity in known_ids and index < len(sanitized[public_key]):
+                            sanitized[public_key][index] = identity
+                else:
+                    restore_handles(item, sanitized[public_key])
+        elif isinstance(original, list) and isinstance(sanitized, list):
+            for item, safe_item in zip(original, sanitized):
+                restore_handles(item, safe_item)
+
+    restore_handles(record, public)
+
+    # Ledger handles/digests are control data, even when a custom identity header
+    # happens to equal an actor ID. Raw observation fields remain private.
+    for key in ("id", "run_id", "artifact_path", "sha256", "session_id", "actor_id", "created_at", "started_at", "finished_at", "completed_at", "source_file_sha256",
+                "request_signature", "credential_signature", "actor_signature",
+                "screenshot", "screenshot_sha256", "html", "html_sha256", "after_actions_html", "after_actions_html_sha256"):
+        if key in record:
+            public[key] = record[key]
+
+    missing = set(contexts["page_visit_ids"])
+    missing_runs = set(contexts["run_ids"])
+    missing_visits = [item for item in project.list("page_visit") if item["id"] in missing]
+    missing_urls = {item[key] for item in missing_visits for key in ("url", "finalUrl") if isinstance(item.get(key), str)}
+    missing_pages = {page["id"] for page in pages if page.get("page_visit_id", page.get("visit_id")) in missing or page.get("url") in missing_urls}
+    missing_functions = {item["id"] for page in pages if page["id"] in missing_pages for item in page.get("functions", [])
+                         if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    trusted_metadata = {item["id"]: item for item in missing_visits + pages + project.list("run")}
+    trusted_metadata.update({item["id"]: item for page in pages for item in page.get("functions", [])
+                             if isinstance(item, dict) and isinstance(item.get("id"), str)})
+    safe_codes = {"kind": {"page_visit", "browser"}, "source": {"local_playwright", "imported_mcp"},
+                  "trust": {"observed_render", "imported_mcp"}, "observation_status": {"visited", "BLOCKED"},
+                  "status": {"running", "interrupted", "succeeded", "failed"}, "method": {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"},
+                  "action": _ACTION_TYPES, "type": _ACTION_TYPES | {"alert", "confirm", "prompt", "log", "error"},
+                  "effect": {"read_only", "test_resource_write"}, "visit_status": {"visited", "BLOCKED"},
+                  "trigger_status": {"triggered", "BLOCKED"}, "next_action": {"run.inspect", "page.adopt"}}
+
+    def restore_codes(original, sanitized):
+        if isinstance(original, dict) and isinstance(sanitized, dict):
+            for key, item in original.items():
+                public_key = safe_key(key)
+                if public_key not in sanitized:
+                    continue
+                if isinstance(item, str) and item in safe_codes.get(key, set()):
+                    sanitized[public_key] = item
+                else:
+                    restore_codes(item, sanitized[public_key])
+        elif isinstance(original, list) and isinstance(sanitized, list):
+            for item, safe_item in zip(original, sanitized):
+                restore_codes(item, safe_item)
+
+    restore_codes(record, public)
+
+    def omit_unavailable(original, sanitized, inherited=False):
+        if isinstance(original, dict) and isinstance(sanitized, dict):
+            def member(value, collection):
+                return isinstance(value, str) and value in collection
+            unavailable = inherited or member(original.get("id"), missing | missing_runs | missing_pages | missing_functions) \
+                or member(original.get("page_visit_id", original.get("visit_id")), missing) \
+                or member(original.get("page_id"), missing_pages) or member(original.get("function_id"), missing_functions) \
+                or member(original.get("url"), missing_urls)
+            if unavailable:
+                sanitized["redaction_context_status"] = "unavailable"
+            for key, item in original.items():
+                public_key = safe_key(key)
+                if public_key not in sanitized:
+                    continue
+                if unavailable and key not in schema_keys:
+                    sanitized.pop(public_key, None)
+                elif unavailable and isinstance(item, str):
+                    identity = next((original.get(field) for field in ("id", "function_id", "page_id")
+                                     if isinstance(original.get(field), str)), None)
+                    trusted = trusted_metadata.get(identity, {})
+                    if key in handle_keys and item in known_ids or item in safe_codes.get(key, set()) \
+                            or key in {"artifact_path", "sha256", "created_at", "started_at", "finished_at", "completed_at", "request_signature", "redaction_context_sha256"} \
+                            and trusted.get(key) == item:
+                        sanitized[public_key] = item
+                    elif key == "message" and re.fullmatch(r"AWA-XSS-[a-fA-F0-9]{16,64}", item) \
+                            and redactor.replace(item) == item:
+                        sanitized[public_key] = item
+                    else:
+                        sanitized[public_key] = "[browser content omitted: redaction context unavailable]"
+                        if key in {"url", "finalUrl", "location"}:
+                            sanitized[public_key + "_redacted"] = True
+                            sanitized["locator_requires_binding"] = True
+                            sanitized["native_input_requires_binding"] = True
+                            sanitized["requestable"] = False
+                else:
+                    omit_unavailable(item, sanitized[public_key], unavailable)
+        elif isinstance(original, list) and isinstance(sanitized, list):
+            for index, (item, safe_item) in enumerate(zip(original, sanitized)):
+                if inherited and isinstance(item, str) and item not in known_ids:
+                    sanitized[index] = "[browser content omitted: redaction context unavailable]"
+                else:
+                    omit_unavailable(item, safe_item, inherited)
+
+    omit_unavailable(record, public)
+    return public
+
+
+def _public_observation(project, record, raw):
+    return public_metadata(project, record, raw=raw)
+
+
 def _record_observation(project, raw, visit_id, source, *, session=None, actor=None, attachments=None,
-                        source_file_sha256=None):
+                        source_file_sha256=None, run_id=None, input_secrets=None, redaction_context=None):
     # Keep the original observation (including external declarations) exclusively
     # in the artifact. Only the explicit rendering fields become ledger metadata.
     path, digest = project.artifact(visit_id, raw)
@@ -595,6 +940,15 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
         record.update(attachments)
     if source_file_sha256:
         record["source_file_sha256"] = source_file_sha256
+    if run_id is not None:
+        record["run_id"] = run_id
+    derived, available = _redaction_inputs(raw.get("actions"))
+    values = derived if input_secrets is None else input_secrets
+    available = available if input_secrets is None else True
+    context = _private_redaction_context(values) if redaction_context is None else redaction_context
+    record.update(credentials=context, redaction_context_required=bool(values), redaction_context_checked=available,
+                  redaction_context_available=available,
+                  redaction_context_sha256=hashlib.sha256(canonical(context).encode("utf-8")).hexdigest())
     with project.transaction():
         project.put("page_visit", record, create_only=True)
         project.event("browser.imported_mcp" if source == "imported_mcp" else "browser.visited",
@@ -604,13 +958,15 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
     if source == "local_playwright" and succeeded:
         try:
             adopted = adopt_visit(project, {"page_visit_id": visit_id})
-            return {**record, "page_ids": adopted["page_ids"], "page_adoption": "adopted"}
+            return {**_public_observation(project, record, raw),
+                    "page_ids": adopted["page_ids"], "page_adoption": "adopted"}
         except (EngineError, OSError, ValueError) as exc:
             # Do not hide an already persisted browser observation if the local
             # page ledger could not be updated. Adoption itself is transactional.
-            return {**record, "page_adoption": "incomplete", "page_adoption_error": getattr(exc, "code", "page_adoption_failed"),
+            return {**_public_observation(project, record, raw), "page_adoption": "incomplete",
+                    "page_adoption_error": getattr(exc, "code", "page_adoption_failed"),
                     "next_action": "page.adopt"}
-    return record
+    return _public_observation(project, record, raw)
 
 
 def visit(project, args):
@@ -627,6 +983,8 @@ def visit(project, args):
     wait_until = args.get("wait_until", "domcontentloaded")
     if wait_until not in {"domcontentloaded", "load", "networkidle"}:
         raise EngineError("browser_arguments", "Unsupported wait_until")
+    if "allow_write" in args and not isinstance(args["allow_write"], bool):
+        raise EngineError("browser_arguments", "allow_write must be a boolean")
     extra, session_headers, session_origin, credentials, session, actor = _browser_identity(project, args, url)
     # Writes stay opt-in at project level, exactly like http.capture's
     # allow_mutation. A single visit can opt out but cannot silently escalate.
@@ -658,35 +1016,88 @@ def visit(project, args):
         "actionSettleMs": action_settle_ms, "afterActionsHtml": str(after) if after else None,
         "allowWrite": allow_write, "holdMs": int(hold_ms),
     }
-    with tempfile.TemporaryDirectory() as tmp:
-        spec_path, script_path = Path(tmp) / "spec.json", Path(tmp) / "visit.cjs"
-        spec_path.write_text(json.dumps(spec, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-        script_path.write_text(_VISIT, encoding="utf-8")
-        deadline = timeout + settle_ms / 1000 + hold_ms / 1000 + 15 + sum(
-            action.get("timeout", 5000) / 1000 + action.get("ms", 0) / 1000
-            + action.get("settleMs", action_settle_ms) / 1000 for action in actions)
-        try:
-            process = subprocess.run([state["node"], str(script_path), state["module_root"], str(spec_path)],
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                     timeout=deadline)
-        except subprocess.TimeoutExpired:
-            raise EngineError("browser_timeout", "Browser visit exceeded its deadline") from None
-        except OSError as exc:
-            raise EngineError("browser_failed", "Could not start the browser process: " + type(exc).__name__) from None
+    from .contracts import _validate_json
+    from .engine import actor_signature, credential_header_names, credential_signature, stable
+    from .inputs import json_document
+
+    input_secrets, _ = _redaction_inputs(actions)
+    redaction_context = _private_redaction_context(input_secrets)
+    run, claimed = None, False
     try:
-        raw = json.loads(process.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        raise EngineError("browser_failed", "Browser produced no parseable observation") from None
-    if not isinstance(raw, dict) or raw.get("url") != url:
-        raise EngineError("browser_observation", "Browser output does not match the requested URL")
-    _network(raw)
-    attachments = {}
-    for key, path in (("screenshot", screenshot), ("html", html), ("after_actions_html", after)):
-        if path and path.exists():
-            attachments[key] = path.relative_to(project.base).as_posix()
-            attachments[key + "_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return _record_observation(project, raw, visit_id, "local_playwright",
-                               session=session, actor=actor, attachments=attachments)
+        with tempfile.TemporaryDirectory() as tmp:
+            spec_path, script_path = Path(tmp) / "spec.json", Path(tmp) / "visit.cjs"
+            spec_path.write_text(json.dumps(spec, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            script_path.write_text(_VISIT, encoding="utf-8")
+            deadline = timeout + settle_ms / 1000 + hold_ms / 1000 + 15 + sum(
+                action.get("timeout", 5000) / 1000 + action.get("ms", 0) / 1000
+                + action.get("settleMs", action_settle_ms) / 1000 for action in actions)
+            run = {"id": project.id("RUN"), "kind": "browser", "status": "running", "started_at": now(),
+                   "method": "GET", "target_origin": origin(url), "planned_page_visit_id": visit_id,
+                   "allow_write": allow_write, "effect": "test_resource_write" if allow_write else "read_only",
+                   "session_id": session["id"] if session else None,
+                   "session_generation": session["generation"] if session else None,
+                   "actor_id": actor["id"] if actor else None,
+                   "actor_signature": actor_signature(actor) if actor else None,
+                   "credential_header_names": credential_header_names(session) if session else [],
+                   "credential_signature": credential_signature(session) if session else None,
+                   "credentials": redaction_context, "redaction_context_required": bool(input_secrets),
+                   "redaction_context_checked": True, "redaction_context_available": True,
+                   "redaction_context_sha256": hashlib.sha256(canonical(redaction_context).encode("utf-8")).hexdigest(),
+                   "request_signature": stable("BR", {"redaction_nonce": redaction_context["redaction_nonce"],
+                       **{key: spec[key] for key in ("url", "scope", "exclude", "headers", "sessionHeaders", "sessionOrigin", "credentialHeaders",
+                           "actions", "allowWrite", "headless", "waitUntil", "timeout", "settleMs", "actionSettleMs")}}),
+                   "action_count": len(actions), "dispatch_attempted": True}
+            project.claim(run)
+            claimed = True
+            project.event("browser.started", {"run_id": run["id"], "page_visit_id": visit_id, "allow_write": allow_write})
+            process = subprocess.run([state["node"], str(script_path), state["module_root"], str(spec_path)],
+                                     capture_output=True, text=True, encoding="utf-8", errors="strict",
+                                     timeout=deadline)
+        if process.returncode != 0:
+            raise EngineError("browser_failed", "The owned browser runtime exited unsuccessfully")
+        if not isinstance(process.stdout, str) or len(process.stdout.encode("utf-8")) > _OBSERVATION_BUDGET:
+            raise EngineError("browser_observation", "Browser output exceeds its budget or is not UTF-8 text")
+        try:
+            raw = json_document(process.stdout.strip().splitlines()[-1])
+            _validate_json(raw)
+        except (EngineError, ValueError, IndexError, UnicodeError, TypeError, RecursionError):
+            raise EngineError("browser_observation", "Browser produced no bounded, unambiguous UTF-8 observation") from None
+        if not isinstance(raw, dict) or raw.get("url") != url:
+            raise EngineError("browser_observation", "Browser output does not match the requested URL")
+        _network(raw)
+        attachments = {}
+        for key, path in (("screenshot", screenshot), ("html", html), ("after_actions_html", after)):
+            if path and path.exists():
+                attachments[key] = path.relative_to(project.base).as_posix()
+                attachments[key + "_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        public = _record_observation(project, raw, visit_id, "local_playwright", run_id=run["id"],
+                                     session=session, actor=actor, attachments=attachments, input_secrets=input_secrets,
+                                     redaction_context=redaction_context)
+        saved = project.get("page_visit", visit_id)
+        run.update(status="succeeded" if saved["complete"] else "interrupted", finished_at=now(),
+                   page_visit_id=visit_id, artifact_path=saved["artifact_path"], sha256=saved["sha256"],
+                   observation_status=saved["observation_status"])
+        if not saved["complete"]:
+            run.update(error_code="browser_observation_incomplete", next_action="run.inspect")
+        project.put("run", run)
+        project.event("browser.finished", {"run_id": run["id"], "page_visit_id": visit_id, "status": run["status"]})
+        return {**public, "run_id": run["id"], "run_status": run["status"],
+                **({"next_action": "run.inspect"} if run["status"] != "succeeded" else {})}
+    except Exception as exc:
+        if not claimed:
+            raise
+        code = "browser_timeout" if isinstance(exc, subprocess.TimeoutExpired) else getattr(exc, "code", "browser_failed")
+        message = ("Browser visit exceeded its deadline; execution effects remain unverified" if code == "browser_timeout"
+                   else str(exc) if isinstance(exc, EngineError) else "Browser execution did not produce a verified terminal observation")
+        run.update(status="interrupted", finished_at=now(), error_code=code, next_action="run.inspect")
+        try:
+            saved = project.get("page_visit", visit_id, required=False)
+            if saved:
+                run.update(page_visit_id=visit_id, artifact_path=saved["artifact_path"], sha256=saved["sha256"])
+            project.put("run", run)
+        except Exception:
+            message += "; the final checkpoint could not be saved, so inspect the claimed run"
+        raise EngineError(code, message, {"run_id": run["id"], "next_action": "run.inspect"}) from exc
 
 
 def import_observation(project, args):
@@ -695,9 +1106,13 @@ def import_observation(project, args):
     if not path.is_file() or path.is_symlink() or path.stat().st_size > _OBSERVATION_BUDGET:
         raise EngineError("browser_import", "Expected a bounded local observation JSON file")
     try:
+        from .contracts import _validate_json
+        from .inputs import json_document
+
         data = path.read_bytes()
-        raw = json.loads(data.decode("utf-8-sig"))
-    except (OSError, ValueError, UnicodeError):
+        raw = json_document(data)
+        _validate_json(raw)
+    except (EngineError, OSError, ValueError, UnicodeError, TypeError, RecursionError):
         raise EngineError("browser_import", "Could not read the observation JSON") from None
     if not isinstance(raw, dict):
         raise EngineError("browser_observation", "Observation must be an object")
@@ -784,6 +1199,9 @@ def adopt_visit(project, args):
 def register_function(project, args):
     page = project.get("page", args["page_id"])
     require_scope(project.config, page["url"])
+    if args.get("function_id") is not None and (not isinstance(args["function_id"], str)
+            or not args["function_id"].strip() or len(args["function_id"]) > 200):
+        raise EngineError("function_id", "function_id must be a nonempty local handle of at most 200 characters")
     func_id = args.get("function_id") or project.id("FN")
     functions = list(page.get("functions") or [])
     entry = next((f for f in functions if f["id"] == func_id), None)

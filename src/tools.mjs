@@ -1,6 +1,6 @@
 /** Grouped native tools. All actions dispatch through the same bounded bridge. */
 import { HarnessError } from '@deepseek-ai/dsh-llm';
-import { invokeEngine, resolveConfig, redactActionResult, safeErrorText, safeErrorDetails, compactContinuation, BridgeError } from './bridge.mjs';
+import { invokeEngine, resolveConfig, redactActionResult, safeErrorText, safeErrorDetails, compactContinuation, BridgeError, ENGINE_DISPATCH_UNCERTAIN } from './bridge.mjs';
 import { ACTION_GROUPS, READ_ACTIONS } from './actions.mjs';
 import { GUIDANCE } from './tool-guidance.mjs';
 
@@ -16,7 +16,7 @@ const DETAIL_HINTS = Object.freeze({
   'plan.audit': 'Follow next_offset for the complete closure checklist; unresolved work is not a security finding or an exclusion.',
   'plan.checkpoint': 'Inspect continuation and persist actual progress after each round; no_progress_rounds requires a changed hypothesis or evidence review, not repeated requests.',
   'plan.review': 'Administrative review does not close a security obligation, candidate or running execution. Recheck plan.audit and continuation.',
-  'plan.finalize': 'Use the current finalization_id only for report.build stage:final. A partial exit never becomes completed coverage; changed project state requires a new checkpoint and finalization.',
+  'plan.finalize': 'Only reason:completed after strict registered-scope exhaustion is accepted. Budget/user/authorization/blocked declarations cannot authorize automatic stopping. Preserve interrupted work as a checkpoint and draft; a current validated finalization_id is required for report.build stage:final.',
   'finding.list': 'Page finding.list with offset/limit to inspect complete redacted finding records.',
   'report.coverage': 'Follow next_offset using report.coverage; report.build exports the complete local snapshot.',
   'surface.list': 'Follow next_offset using surface.list, or call surface.inspect with operation_id.',
@@ -181,9 +181,9 @@ export const GROUPS = Object.freeze([
     fields: GUIDANCE.awa_browser },
   { name: 'awa_candidate',
     description: 'Work the unresolved-discovery ledger. Candidates are clues from imports and parsing, never evidence: linking records lineage to an operation without closing any coverage obligation.',
-    fields: 'candidate.list: project_id, optional status (unverified/linked/dismissed/any, default unverified), kind, offset, limit (1..500, default 50); follow next_offset. candidate.inspect: candidate_id, returns the full record and its linked operation. candidate.link: candidate_id, operation_id, optional input_location and input_selector together (the input must already be registered on that operation); the candidate URL must equal the operation URL. candidate.dismiss: candidate_id, reason (required); dismissal is not a test and does not change any denominator. candidate.reopen: candidate_id, reason (required); use it after the source file changed.' },
+    fields: 'candidate.list: project_id, optional status (unverified/linked/dismissed/any, default unverified), kind, offset, limit (1..500, default 50); follow next_offset. candidate.inspect: candidate_id, returns the source record and its linked operation, never private closure context. candidate.link: candidate_id, operation_id, optional input_location and input_selector together (the input must already be registered on that operation); the candidate URL must equal the operation URL. candidate.dismiss: candidate_id, reason (required), optional basis:outside_scope|duplicate_operation; duplicate_operation also requires operation_id. Reason-only/legacy dismissals remain actionable candidate review, not exhaustion. The engine revalidates concrete declared-scope exclusion (not mutable excludes), or exact ordinary route/method/protocol/input/schema plus current typed security coverage; dynamic sources, scanner findings or a baseline alone cannot establish duplicate closure. Source/scope/evidence changes reopen review without changing history. candidate.reopen: candidate_id, reason (required); follow the generated audit template to trace unverified exclusions. Dismissal/linking never creates security evidence or changes coverage denominators.' },
   { name: 'awa_plan',
-    description: 'Build shared obligations, browser_testing requirements and a persisted continuation/stop contract. Required and assisted both mandate needed Playwright work; stage/invoke_now preserve control preparation and offline review. The projection is not execution or proof. Empty queues and successful reports do not authorize stopping. Unknown inputs, missing identities and invalid evidence remain visible; only guarded finalization records a completed or explicit partial exit.',
+    description: 'Build shared obligations, browser_testing requirements and a persisted exhaustion-only continuation contract. Required and assisted both mandate needed Playwright work; stage/invoke_now preserve control preparation and offline review. The projection is not execution or proof. Empty queues, findings, elapsed time and successful drafts never authorize stopping. Unknown inputs, missing identities and invalid evidence remain visible; only strict completed finalization permits automatic stopping.',
     fields: GUIDANCE.awa_plan },
   { name: 'awa_execute',
     description: 'Execute scoped HTTP captures and explicit business scenarios, recording immutable evidence and resource state. Requests must belong to the configured project scope. After a timeout recover the recorded run before retrying a state-changing operation.',
@@ -192,14 +192,14 @@ export const GROUPS = Object.freeze([
     description: 'Evaluate observations with typed controls, record supported findings and inspect evidence metadata. Stale identities or invalid evidence cannot close coverage; summaries omit raw HTTP and credentials.',
     fields: GUIDANCE.awa_assess },
   { name: 'awa_report',
-    description: 'Export a Chinese evidence-backed report and redacted reproduction bundle using the plan evaluator. Default drafts are not stop permission; final delivery requires a current guarded finalization. Report generation never sends target traffic and cannot prevent a free-text host turn from ending.',
-    fields: 'report.coverage: offset (default 0),limit:1..100 (default 25); follow render_recovery before next_offset when a page is shortened. report.build: optional output_dir (local directory), stage:draft (default)|final. Draft success never authorizes stopping. Final requires finalization_id from plan.finalize bound to the current project snapshot; any resumed material change requires a fresh checkpoint/finalization. Chinese report/summary, manifest digests, redacted HTTP/body files and PowerShell/POSIX curl plus bounded sqlmap templates. Replace credential/test-resource placeholders before authorized manual replay; generated commands are not executed. Partial exits retain exact stop reasons and remaining/resume tasks, never complete coverage. Withdrawn/superseded findings remain historical without new attack templates.' },
+    description: 'Export a Chinese evidence-backed report and redacted reproduction bundle using the plan evaluator. Default drafts are not stop permission; final delivery requires current strict completed exhaustion. Report generation never sends target traffic. The supported awaited host turn-stopping guard can steer the same normally closing turn; it cannot retract streamed text or override real abort/termination.',
+    fields: 'report.coverage: offset (default 0),limit:1..100 (default 25); follow render_recovery before next_offset when a page is shortened. report.build: optional output_dir (local directory), stage:draft (default)|final. Draft success never authorizes stopping. Final requires finalization_id from a strict completed plan.finalize bound to the current snapshot/checkpoint, complete coverage and zero ready/review/blocked/unresolved tasks; partial or inconsistent stops are rejected before material preparation, never exported as final-partial. Actual user/host interruption preserves checkpoint and draft only. Any resumed material change requires a fresh checkpoint/finalization. Chinese report/summary, manifest digests, redacted HTTP/body files and PowerShell/POSIX curl plus bounded sqlmap templates. Replace credential/test-resource placeholders before authorized manual replay; generated commands are not executed. Withdrawn/superseded findings remain historical without new attack templates.' },
   { name: 'awa_external',
     description: 'Discover local Yakit/sqlmap and loopback TscanPlus MCP. Persist scoped HTTP replay, local result retrieval, bounded project summaries and unverified route candidates. Never execute generic TscanPlus scans, POC, cracking or route suggestions. Tool output stays unverified until independent accepted evidence supports a typed decision.',
     fields: GUIDANCE.awa_external },
 ].map(group => Object.freeze({ ...group, actions: ACTION_GROUPS[group.name] })));
 
-export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, ownerSignal) {
+export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, ownerSignal, options = {}) {
   const settings = resolveConfig(config);
   return GROUPS.map(group => defineTool({
     name: group.name,
@@ -231,7 +231,24 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
         const payload = { ...input, ...(args.project_id !== undefined ? { project_id: args.project_id } : {}) };
         const callerSignal = exec?.signal;
         const signal = ownerSignal && callerSignal ? AbortSignal.any([callerSignal, ownerSignal]) : ownerSignal ?? callerSignal;
-        return await invoke(settings, args.action, payload, { signal });
+        const invocation = Object.freeze({ action: args.action, project_id: payload.project_id,
+          agent: exec?.agent, callerSignal, signal });
+        const observe = async event => {
+          if (typeof options?.observer !== 'function') return;
+          try { await options.observer(Object.freeze({ ...event, invocation })); }
+          catch { console.error('[awa-ddd] optional host-continuation observer failed; the engine outcome is preserved.'); }
+        };
+        await observe({ phase: 'start' });
+        try {
+          const value = await invoke(settings, args.action, payload, { signal });
+          await observe({ phase: 'success', ok: value?.ok === true });
+          return value;
+        } catch (error) {
+          const runPattern = args.action === 'scenario.run' ? /^SC-[A-Za-z0-9_-]+$/ : /^RUN-[A-Za-z0-9_-]+$/;
+          await observe({ phase: 'failure', claimed_run: typeof error?.details?.run_id === 'string'
+            && runPattern.test(error.details.run_id), dispatch_uncertain: error?.[ENGINE_DISPATCH_UNCERTAIN] === true });
+          throw error;
+        }
       } catch (error) { throw asHostError(error); }
     },
   }));
