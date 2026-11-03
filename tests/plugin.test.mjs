@@ -10,6 +10,7 @@ import { HarnessError } from '@deepseek-ai/dsh-llm';
 import * as plugin from '../src/index.mjs';
 import { ACTIONS, BridgeError, PACKAGE_ROOT, resolveConfig } from '../src/bridge.mjs';
 import { GROUPS, toolDefinitions, renderToolResult, MAX_RENDER_BYTES } from '../src/tools.mjs';
+import { ARM_ACTIONS } from '../src/host-continuation.mjs';
 
 const config = { workspace: join(tmpdir(), 'awa-ddd-plugin-test-state') };
 
@@ -69,7 +70,7 @@ test('every engine action appears in exactly one native tool enum', () => {
   const actions = GROUPS.flatMap(group => group.actions);
   assert.equal(actions.length, new Set(actions).size);
   assert.deepEqual([...actions].sort(), [...ACTIONS].sort());
-  assert.equal(actions.length, 60);
+  assert.equal(actions.length, 63);
 });
 
 test('actual dsh defineTool validates action enums before calling the Python bridge', async () => {
@@ -162,6 +163,44 @@ test('offline help, readiness, preflight and artifact actions route through thei
   assert.equal(surface.isConcurrencySafe({ action: 'surface.batch' }), false);
   assert.equal(assess.isConcurrencySafe({ action: 'finding.update' }), false);
   assert.match(surface.parameters.properties.input.description, /action\.help/);
+});
+
+test('recon prepares or aggregates collected information without another tool group or a target-execution arm', async () => {
+  const calls = [];
+  const definitions = toolDefinitions(defineTool, config, async (_settings, action, args) => {
+    calls.push({ action, args });
+    return { ok: true, data: { mode: args.mode, requests_sent: 0, items: [], information_is_proof: false } };
+  });
+  assert.equal(definitions.length, 10);
+  assert.equal(ARM_ACTIONS.includes('surface.recon'), false);
+  const surface = definitions.find(tool => tool.name === 'awa_surface');
+  assert.ok(surface.parameters.properties.action.enum.includes('surface.recon'));
+  for (const mode of ['prepare', 'aggregate']) {
+    const input = { mode, section: 'overview', offset: 0, limit: 10 };
+    const result = await surface.execute({ action: 'surface.recon', project_id: 'p', input }, {});
+    assert.deepEqual(calls.at(-1), { action: 'surface.recon', args: { project_id: 'p', ...input } });
+    assert.equal(result.data.requests_sent, 0);
+    assert.equal(result.data.information_is_proof, false);
+    assert.equal(surface.isConcurrencySafe({ action: 'surface.recon', input }), false,
+      'offline aggregation persists its baseline; it is not a concurrency-safe action');
+  }
+  assert.match(surface.parameters.properties.input.description, /Prepare collection first/);
+  assert.match(surface.parameters.properties.input.description, /No target traffic or auto-registration/);
+});
+
+test('native recon help keeps the Python phase and section contract aligned with the surface group', async () => {
+  const definitions = toolDefinitions(defineTool, { ...config, timeoutMs: 10000 });
+  const project = definitions.find(tool => tool.name === 'awa_project');
+  const help = (await project.execute({ action: 'action.help', input: { name: 'surface.recon' } }, {})).data;
+  assert.equal(help.action, 'surface.recon');
+  assert.equal(help.group, 'awa_surface');
+  assert.equal(help.project_required, true);
+  assert.equal(help.required.length, 0);
+  for (const field of ['mode', 'section', 'offset', 'limit']) assert.ok(Object.hasOwn(help.fields, field), field);
+  for (const mode of ['prepare', 'aggregate']) assert.ok(help.fields.mode.includes(mode), mode);
+  for (const section of ['overview', 'technologies', 'functions', 'clues', 'collection']) {
+    assert.ok(help.fields.section.includes(section), section);
+  }
 });
 
 test('bounded presentation is valid JSON, explicitly partial and does not truncate the canonical result', () => {

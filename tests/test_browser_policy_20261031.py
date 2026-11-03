@@ -251,7 +251,10 @@ class BrowserPolicyTests(unittest.TestCase):
             self.assertEqual(row["browser_testing"]["stage"], "identify_consumer")
             self.assertFalse(row["browser_testing"]["invoke_now"])
             self.assertIsNone(row["browser_testing"].get("native_visit_input"))
-            self.assertEqual(row["suggested_action"], "browser.visit")
+            self.assertEqual(row["suggested_action"], "evidence.inspect")
+            self.assertTrue(row["control_candidate_review_required"])
+            self.assertEqual([capture["id"] for capture in captures], row["control_candidate_evidence_ids"])
+            self.assertEqual({"evidence_id": captures[0]["id"]}, row["input_template"])
             self.assertEqual(fixture.project.get("obligation", item["id"])["status"], "open")
 
     def test_bound_existing_runtime_is_reviewed_offline_without_auto_confirmation(self):

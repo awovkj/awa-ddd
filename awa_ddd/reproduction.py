@@ -33,6 +33,18 @@ _ASSIGNED_VALUE = re.compile(
     r"api[_-]?key|(?:client[_-]?)?secret)\s*[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9._~+/-]{4,})"
 )
 _XML_VALUE = re.compile(r"<([A-Za-z_][\w:.-]*)\b[^>]*>([^<>]+)</\1\s*>")
+_FIELD_ASSIGNMENT = re.compile(
+    r'''(?P<key>["']?[A-Za-z_][A-Za-z0-9_.-]*["']?)\s*[:=]\s*'''
+    r'''(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/%=-]+)'''
+)
+_AUTH_QUOTED = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+_AUTH_PARAMETER = r"[A-Za-z_][A-Za-z0-9_-]*[ \t]*=[ \t]*(?:" + _AUTH_QUOTED + r"|[A-Za-z0-9._~+/%:@=-]+)"
+_AUTH_ASSIGNMENT = re.compile(
+    r'''(?i)(?<![A-Za-z0-9_.-])(?P<key>["']?(?:proxy[-_]?authorization|authorization)["']?)\s*[:=]\s*'''
+    r"(?P<value>" + _AUTH_QUOTED + r"|[A-Za-z][A-Za-z0-9_-]*[ \t]+(?:"
+    + _AUTH_PARAMETER + r"(?:[ \t]*,[ \t]*" + _AUTH_PARAMETER + r")*|"
+    + _AUTH_QUOTED + r"|[A-Za-z0-9._~+/%=-]+))"
+)
 _MAX_EXCERPT = 3500
 
 
@@ -46,11 +58,42 @@ def _secret_key(value):
         or name.endswith(("token", "apikey", "signature", "smscode", "verificationcode"))
 
 
+def _assignment_scalar(token):
+    quoted = len(token) >= 2 and token[0] in {"'", '"'} and token[-1] == token[0]
+    if quoted and token[0] == '"':
+        try:
+            return json.loads(token), token[0]
+        except ValueError:
+            return None, None
+    return (token[1:-1], token[0]) if quoted else (token, "")
+
+
+def _authorization_credentials(value):
+    matched = re.fullmatch(r"([A-Za-z][A-Za-z0-9_-]*)[ \t]+(.+)", str(value).strip())
+    if not matched:
+        return []
+    scheme, token = matched.groups()
+    result = [(token.strip(), "AUTH_TOKEN")]
+    if scheme.lower() == "basic":
+        try:
+            decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+            result.append((decoded, "BASIC_CREDENTIAL"))
+            _, separator, password = decoded.partition(":")
+            if separator:
+                result.append((password, "PASSWORD"))
+        except (ValueError, UnicodeError):
+            pass
+    return result
+
+
 class Redactor:
     """Keep the same replacement for a secret in prose, URLs, and HTTP templates."""
 
     def __init__(self):
         self.values = {}
+        # Submitted short fields are not automatically project-wide secret seeds.
+        # Trusted private contexts and response secrets promote them into values.
+        self.field_values = {}
         self.aliases = {}
         self._pattern = None
         self._content_pattern = None
@@ -60,11 +103,12 @@ class Redactor:
         if value is None or isinstance(value, (dict, list, bool)):
             return "<AWA_" + kind + "_REPLACE>"
         text = str(value)
-        if not text or text in self.values.values():
+        if not text or text in self.placeholders:
             return text
         if text not in self.values:
             label = re.sub(r"[^A-Z0-9_]", "_", kind.upper())[:40] or "SECRET"
-            self.values[text] = "<AWA_" + label + "_" + str(len(self.values) + 1) + ">"
+            self.values[text] = self.field_values.pop(text, None) or (
+                "<AWA_" + label + "_" + str(len(self.values) + len(self.field_values) + 1) + ">")
             # Very short values are replaced by field, not across unrelated prose.
             if len(text) >= 4:
                 for alias in {text, quote(text, safe=""), quote_plus(text),
@@ -77,6 +121,22 @@ class Redactor:
                     if len(line.strip()) >= 8 and not line.strip().startswith("-----"):
                         self.slot(line.strip(), kind + "_LINE")
         return self.values[text]
+
+    @property
+    def placeholders(self):
+        return set(self.values.values()) | set(self.field_values.values())
+
+    def field_slot(self, value, kind="SECRET", *, allow_new=False):
+        text = str(value) if value is not None and not isinstance(value, (dict, list, bool)) else ""
+        if text in self.values:
+            return self.values[text]
+        if text in self.field_values:
+            return self.field_values[text]
+        if allow_new and 0 < len(text) <= 3 and text not in self.placeholders:
+            label = re.sub(r"[^A-Z0-9_]", "_", kind.upper())[:40] or "SECRET"
+            self.field_values[text] = "<AWA_" + label + "_" + str(len(self.values) + len(self.field_values) + 1) + ">"
+            return self.field_values[text]
+        return self.slot(value, kind)
 
     def replace(self, value):
         text = "" if value is None else str(value)
@@ -107,8 +167,27 @@ class Redactor:
 
     def content(self, value):
         """Untrusted prose has no opaque-ID substring exception."""
-        self.learn_text(value)
-        return self._replace_content_literals(self.replace(value))
+        self.learn_text(value, preserve_field_scope=True)
+        text = self._replace_content_literals(self.replace(value))
+        if not self.field_values:
+            return text
+
+        def assignment(match):
+            if not _secret_key(match.group("key").strip("\"'")):
+                return match.group(0)
+            decoded, delimiter = _assignment_scalar(match.group("value"))
+            if not isinstance(decoded, str):
+                return match.group(0)
+            placeholder = self.field_values.get(unquote_plus(decoded))
+            if placeholder is None:
+                return match.group(0)
+            replacement = delimiter + placeholder + delimiter
+            return match.group(0)[:match.start("value") - match.start()] + replacement
+
+        text = _FIELD_ASSIGNMENT.sub(assignment, text)
+        return _XML_VALUE.sub(lambda match: match.group(0)[:match.start(2) - match.start()] +
+            self.field_values[match.group(2)] + match.group(0)[match.end(2) - match.start():]
+            if _secret_key(match.group(1)) and match.group(2) in self.field_values else match.group(0), text)
 
     def _replace_literals(self, text):
         if self.aliases:
@@ -125,27 +204,50 @@ class Redactor:
         text = re.sub(r"\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}\b", "<AWA_TOKEN_REPLACE>", text)
         return text
 
-    def learn_text(self, text):
+    def learn_text(self, text, *, field_only=False, preserve_field_scope=False):
+        def learn(value, kind="SECRET"):
+            if field_only or preserve_field_scope and str(value) in self.field_values:
+                self.field_slot(value, kind, allow_new=field_only)
+            else:
+                self.slot(value, kind)
+
         for pattern in (_CHINESE_VALUE, _ASSIGNED_VALUE):
             for match in pattern.finditer(str(text)):
-                self.slot(match.group(1))
+                learn(match.group(1))
+        auth_fields = set()
+        for match in _AUTH_ASSIGNMENT.finditer(str(text)):
+            value, _ = _assignment_scalar(match.group("value"))
+            if isinstance(value, str):
+                auth_fields.add((match.start("key"), match.end("key")))
+                learn(value, _normal_key(match.group("key")).upper())
+                for credential, kind in _authorization_credentials(value):
+                    learn(credential, kind)
+        for match in _FIELD_ASSIGNMENT.finditer(str(text)):
+            # Learning only the scheme would hide it before the public redactor
+            # can identify the credential that follows it.
+            if (match.start("key"), match.end("key")) in auth_fields:
+                continue
+            if _secret_key(match.group("key").strip("\"'")):
+                value, _ = _assignment_scalar(match.group("value"))
+                if isinstance(value, str):
+                    learn(unquote_plus(value), _normal_key(match.group("key")).upper())
         for match in _XML_VALUE.finditer(str(text)):
             if _secret_key(match.group(1)):
-                self.slot(match.group(2), "XML_SECRET")
+                learn(match.group(2), "XML_SECRET")
 
-    def learn(self, value, sensitive=False, key="SECRET"):
+    def learn(self, value, sensitive=False, key="SECRET", *, field_only=False):
         if isinstance(value, dict):
             declared = value.get("name")
             for name, item in value.items():
                 private = sensitive or _secret_key(name) or (name == "value" and _secret_key(declared))
-                self.learn(item, private, _normal_key(name).upper() or key)
+                self.learn(item, private, _normal_key(name).upper() or key, field_only=field_only)
         elif isinstance(value, list):
             for item in value:
-                self.learn(item, sensitive, key)
+                self.learn(item, sensitive, key, field_only=field_only)
         elif sensitive:
-            self.slot(value, key)
+            self.field_slot(value, key, allow_new=True) if field_only else self.slot(value, key)
         elif isinstance(value, str):
-            self.learn_text(value)
+            self.learn_text(value, field_only=field_only)
 
     def structured(self, value, sensitive=False, key="SECRET"):
         if isinstance(value, dict):
@@ -161,7 +263,7 @@ class Redactor:
         if isinstance(value, list):
             return [self.structured(item, sensitive, key) for item in value]
         if sensitive and value is not None:
-            return self.slot(value, key)
+            return self.field_slot(value, key)
         if type(value) in (int, float):
             if str(value) in self.values:
                 return self.values[str(value)]
@@ -175,13 +277,13 @@ class Redactor:
 
     def prose(self, value, limit=4000):
         from .reporting import safe_text
-        return safe_text(self.content(value), limit, preserve_placeholders=set(self.values.values()))
+        return safe_text(self.content(value), limit, preserve_placeholders=self.placeholders)
 
     def metadata(self, value):
         from .reporting import safe_metadata
         if isinstance(value, dict):
             return safe_metadata({key: self.metadata(item) for key, item in value.items()},
-                                 preserve_placeholders=set(self.values.values()))
+                                 preserve_placeholders=self.placeholders)
         if isinstance(value, list):
             return [self.metadata(item) for item in value]
         return self.prose(value) if isinstance(value, str) else value
@@ -193,12 +295,12 @@ class Redactor:
             return [self.scrub_generated(item) for item in value]
         return self.replace(value) if isinstance(value, str) else value
 
-    def form(self, text):
+    def form(self, text, *, field_only=False):
         result = []
         for field in text.split("&"):
             name, separator, value = field.partition("=")
             if separator and _secret_key(unquote_plus(name)):
-                value = self.slot(unquote_plus(value), _normal_key(unquote_plus(name)).upper())
+                value = self.field_slot(unquote_plus(value), _normal_key(unquote_plus(name)).upper(), allow_new=field_only)
             result.append(self.content(name) + separator + self.content(value))
         return "&".join(result)
 
@@ -239,18 +341,8 @@ def _learn_header(redactor, name, value):
                         except CookieError:
                             pass
     elif lower in {"authorization", "proxy-authorization"}:
-        scheme, separator, token = str(value).partition(" ")
-        if separator and token:
-            redactor.slot(token.strip(), "AUTH_TOKEN")
-            if scheme.lower() == "basic":
-                try:
-                    decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
-                    redactor.slot(decoded, "BASIC_CREDENTIAL")
-                    _, separator, password = decoded.partition(":")
-                    if separator:
-                        redactor.slot(password, "PASSWORD")
-                except (ValueError, UnicodeError):
-                    pass
+        for credential, kind in _authorization_credentials(value):
+            redactor.slot(credential, kind)
 
 
 def _content_type(headers):
@@ -258,16 +350,16 @@ def _content_type(headers):
     return next((str(value) for key, value in items if str(key).lower() == "content-type"), "")
 
 
-def _learn_body(redactor, data, content_type):
+def _learn_body(redactor, data, content_type, *, field_only=False):
     try:
         text = data.decode("utf-8")
     except UnicodeError:
         return
-    redactor.learn_text(text)
+    redactor.learn_text(text, field_only=field_only)
     if _json_media(text, content_type):
         from .inputs import json_document
         try:
-            redactor.learn(json_document(data))
+            redactor.learn(json_document(data), field_only=field_only)
         except EngineError:
             # Learn every duplicate occurrence for prose redaction, but never use
             # this permissive pass as a request template or assessment proof.
@@ -275,29 +367,90 @@ def _learn_body(redactor, data, content_type):
                 declared = next((item for name, item in pairs if name == "name"), None)
                 for name, item in pairs:
                     redactor.learn(item, _secret_key(name) or (name == "value" and _secret_key(declared)),
-                                   _normal_key(name).upper())
+                                   _normal_key(name).upper(), field_only=field_only)
                 return dict(pairs)
             try:
                 json.loads(text, object_pairs_hook=learn_pairs)
             except (ValueError, TypeError, RecursionError):
                 pass
     elif "application/x-www-form-urlencoded" in content_type:
-        redactor.form(text)
+        redactor.form(text, field_only=field_only)
     elif "multipart/" in content_type:
         from .inputs import _multipart
         try:
             for name, (start, end) in _multipart(data, content_type).items():
                 field = data[start:end].decode("utf-8")
                 if _secret_key(name):
-                    redactor.slot(field, "FORM_SECRET")
+                    redactor.field_slot(field, "FORM_SECRET", allow_new=True) if field_only else redactor.slot(field, "FORM_SECRET")
                 else:
-                    redactor.learn_text(field)
+                    redactor.learn_text(field, field_only=field_only)
         except (EngineError, UnicodeError):
             pass
 
 
+def _submitted_field_scope(artifact):
+    """Limit short submitted values to fields, without asserting credential validity."""
+    if artifact.get("complete") is not True:
+        return False
+    response = artifact.get("response") or {}
+    if not isinstance(response, dict):
+        return False
+    status = response.get("status")
+    if type(status) is int and 400 <= status <= 599:
+        return True
+    from .inputs import json_document
+    try:
+        value = json_document(_body_bytes(artifact, "response"))
+    except (EngineError, KeyError, TypeError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get("success") is False
+
+
 def _json_media(text, content_type):
     return "json" in content_type.lower() or text.lstrip("\ufeff \t\r\n")[:1] in {"{", "["}
+
+
+class _ArtifactRedactor(Redactor):
+    """Protect submitted-value echoes only in their related response/proof."""
+
+    def __init__(self, parent, prepared, scoped):
+        super().__init__()
+        self.parent = parent
+        self.scoped = scoped
+        self.values = dict(prepared.values)
+        self.aliases = dict(prepared.aliases)
+
+    def slot(self, value, kind="SECRET"):
+        text = str(value) if value is not None and not isinstance(value, (dict, list, bool)) else ""
+        if text in self.scoped and text not in self.parent.values:
+            return super().slot(value, kind)
+        placeholder = self.parent.slot(value, kind)
+        if text in self.parent.values:
+            self.values[text] = self.parent.values[text]
+            self.aliases.update(self.parent.aliases)
+            self._pattern = None
+        return placeholder
+
+
+def _artifact_redactor(redactor, artifacts):
+    prepared = Redactor()
+    prepared.values = dict(redactor.values)
+    prepared.aliases = dict(redactor.aliases)
+    for artifact in artifacts:
+        if not _submitted_field_scope(artifact):
+            continue
+        request = artifact.get("request") or {}
+        _learn_body(prepared, _body_bytes(artifact, "request"), _content_type(request.get("headers") or {}),
+                    field_only=True)
+    if not prepared.field_values:
+        return redactor
+    scoped = set(prepared.field_values)
+    from .browser import _learn_private_value
+    for value in scoped:
+        if value in redactor.field_values:
+            prepared.field_values[value] = redactor.field_values[value]
+        _learn_private_value(prepared, value)
+    return _ArtifactRedactor(redactor, prepared, scoped)
 
 
 def _multipart_body(redactor, data, content_type):
@@ -317,7 +470,7 @@ def _multipart_body(redactor, data, content_type):
         framing = data[previous:start].decode("utf-8")
         if redactor.content(framing) != framing:
             raise EngineError("reproduction_binary", "Protected multipart framing requires an explicit new binding")
-        clean = redactor.slot(text, "FORM_SECRET") if _secret_key(name) else redactor.content(text)
+        clean = redactor.field_slot(text, "FORM_SECRET") if _secret_key(name) else redactor.content(text)
         segments += [data[previous:start], clean.encode("utf-8")]
         previous = end
     tail = data[previous:]
@@ -435,7 +588,8 @@ def _step(project, redactor, evidence, artifact, decision, index, folder, files)
                 if name.lower() in names or _secret_key(name) else redactor.content(value)
     url = redactor.url(request["url"])
     body, body_text, changed = _safe_body(redactor, _body_bytes(artifact, "request"), _content_type(raw_headers))
-    response_data, response_text, _ = _safe_body(redactor, _body_bytes(artifact, "response"), _content_type(response.get("headers") or []))
+    response_redactor = _artifact_redactor(redactor, [artifact])
+    response_data, response_text, _ = _safe_body(response_redactor, _body_bytes(artifact, "response"), _content_type(response.get("headers") or []))
     identity = evidence["id"]
     stem = f"{index + 1:02d}-" + _component(identity, "E")
     step = {"number": index + 1, "role": _role(decision, identity, index), "evidence_id": identity,
@@ -451,7 +605,7 @@ def _step(project, redactor, evidence, artifact, decision, index, folder, files)
             "response_excerpt": response_text[:_MAX_EXCERPT], "response_truncated": len(response_text) > _MAX_EXCERPT,
             "body_redacted": changed, "request_template_available": body is not None,
             "response_body_available": response_data is not None, "state_changing": method not in {"GET", "HEAD", "OPTIONS"}}
-    step["response_observables"] = _response_observables(redactor, artifact, decision)
+    step["response_observables"] = _response_observables(response_redactor, artifact, decision)
     if evidence.get("actor_id"):
         actor = project.get("actor", evidence["actor_id"], required=False) or {}
         step["subject"] = redactor.prose(actor.get("subject"))
@@ -638,7 +792,11 @@ def prepare_reproduction(project, findings, *, context=None):
                 for name, value in items:
                     if str(name).lower() in names or _secret_key(name):
                         _learn_header(redactor, name, value)
-                _learn_body(redactor, _body_bytes(artifact, side), _content_type(headers))
+                # A failed response does not prove a submitted password invalid.
+                # Only short request fields use local scope; headers, browser fill
+                # and response secrets always retain global protection.
+                _learn_body(redactor, _body_bytes(artifact, side), _content_type(headers),
+                            field_only=side == "request" and _submitted_field_scope(artifact))
             redactor.url(artifact["request"]["url"])
         except (EngineError, OSError, ValueError, KeyError, TypeError):
             continue
@@ -650,7 +808,10 @@ def prepare_reproduction(project, findings, *, context=None):
                 pass
         for key in ("title", "impact", "remediation", "limitations", "lifecycle_reason"):
             redactor.learn(finding.get(key))
-    details = {}
+    if redactor.field_values:
+        warnings.append("Short submitted values from unsuccessful responses are masked at sensitive field/assignment positions. "
+                        "This does not establish that a credential is invalid; session, browser-input and response secrets remain globally protected.")
+    details, finding_projections = {}, {}
     from .engine import _decision_valid, verify_current_evidence
     from .assessment import is_sql_category, validate_confirmation
     for finding in findings:
@@ -665,9 +826,11 @@ def prepare_reproduction(project, findings, *, context=None):
             decision = project.get("decision", finding["decision_id"])
             _decision_valid(project, decision)
             validate_confirmation(project, decision, finding.get("category"))
+            related_artifacts = []
             for index, identity in enumerate(decision.get("evidence_ids") or []):
                 try:
                     evidence, artifact = verify_current_evidence(project, identity)
+                    related_artifacts.append(artifact)
                     detail["steps"].append(_step(project, redactor, evidence, artifact, decision, index, folder, files))
                 except (EngineError, OSError, ValueError, KeyError, TypeError) as exc:
                     detail["limitations"].append("证据 " + redactor.prose(identity) + " 无法生成复现材料：" +
@@ -687,7 +850,10 @@ def prepare_reproduction(project, findings, *, context=None):
                 detail["limitations"].append("未自动补造资源创建步骤：先自行创建并验证初始状态，再替换历史资源绑定值；写后通过正常读取核对状态、余额或属主，最后恢复/删除 fixture。")
             if decision.get("mode") == "analyst":
                 detail["limitations"].append("该结论经过人工复核；响应摘录是实际材料，不把人工影响推断升级为机器验证或更大攻击范围。")
-            detail["decision_reason"] = redactor.prose(decision.get("reason"))
+            proof_redactor = _artifact_redactor(redactor, related_artifacts)
+            detail["decision_reason"] = proof_redactor.prose(decision.get("reason"))
+            finding_projections[finding["id"]] = {
+                key: proof_redactor.metadata(finding[key]) for key in ("proof", "reason") if key in finding}
             detail["oracle_type"] = (decision.get("oracle") or {}).get("type")
             if is_sql_category(finding.get("category")):
                 detail["sqlmap"] = _sqlmap(project, redactor, finding, decision, detail["steps"], folder)
@@ -726,4 +892,5 @@ def prepare_reproduction(project, findings, *, context=None):
             files[path] = clean
         else:
             files[path] = redactor.content(data.decode("utf-8")).encode("utf-8")
-    return {"finding_details": redactor.scrub_generated(details), "files": files, "redactor": redactor, "warnings": warnings}
+    return {"finding_details": redactor.scrub_generated(details), "finding_projections": finding_projections,
+            "files": files, "redactor": redactor, "warnings": warnings}

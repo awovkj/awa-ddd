@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awa-ddd"
-version = "0.9.0"
-description = "Local evidence-driven security assessment engine for DeepSeek Harness"
+version = "2.0.0"
+description = "Evidence-driven security assessment engine for DeepSeek Harness: Universe, Hypothesis, Recipe and Campaign"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -14,5 +14,5 @@ dependencies = []
 [project.scripts]
 awa-ddd = "awa_ddd.__main__:main"
 
-[tool.setuptools]
-packages = ["awa_ddd"]
+[tool.setuptools.packages.find]
+include = ["awa_ddd*"]

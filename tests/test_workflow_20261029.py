@@ -162,7 +162,8 @@ class WorkflowTests(unittest.TestCase):
             result = workflow.next_work(self.project, {})
         self.assertEqual(result["ready_total"], 1)
         self.assertEqual(result["review_total"], 1)
-        self.assertEqual(result["work_items"][0]["suggested_action"], "http.preflight")
+        self.assertEqual(result["work_items"][0]["suggested_action"], "surface.declare_consumer")
+        self.assertTrue(any(row["suggested_action"] == "http.preflight" for row in result["work_items"]))
         self.assertEqual(before, self.project.list("obligation"))
         network.assert_not_called()
 

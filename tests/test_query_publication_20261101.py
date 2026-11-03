@@ -75,7 +75,9 @@ class QueryPublicationTests(unittest.TestCase):
         business = int(secret) if secret.isdigit() else secret
         operation = self.fixture.register(self.fixture.url, inputs=[{
             "name": secret, "selector": secret, "location": "query", "consumer": "html_render",
-            "schema_branch": business, "test_families": ["xss"]}])
+            "schema_branch": secret, "array_template": [business], "test_families": ["xss"]}])
+        metadata = next(entry for entry in operation["inputs"] if "array_template" in entry)
+        self.assertNotEqual(business, metadata["array_template"][0])
         for unavailable in (False, True):
             with self.subTest(secret=secret, unavailable=unavailable):
                 if unavailable:
@@ -88,7 +90,7 @@ class QueryPublicationTests(unittest.TestCase):
                     self.assertEqual({"name": "surface.inspect"}, item["help_input"])
                     self.assertNotEqual(secret, item["input_selector"])
                 self.assertEqual("surface.inspect", checklist["action"])
-                self.assertNotEqual(business, row["schema_branch"])
+                self.assertNotEqual(secret, row["schema_branch"])
                 self.assertIsInstance(row["schema_branch"], str)
                 policy = row["browser_testing"]
                 self.assertEqual("required", policy["requirement"])
@@ -113,7 +115,7 @@ class QueryPublicationTests(unittest.TestCase):
     def test_prepare_credential_is_only_restored_in_the_actual_browser_stage(self):
         self.assert_secret_case("prepare")
 
-    def test_short_numeric_credential_keeps_counts_but_redacts_a_numeric_business_branch(self):
+    def test_short_numeric_credential_keeps_counts_but_redacts_numeric_business_metadata(self):
         self.assert_secret_case("1")
 
     def test_leading_zero_credential_keeps_counts_but_redacts_its_numeric_alias(self):

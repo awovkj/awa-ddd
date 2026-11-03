@@ -130,10 +130,12 @@ def _input_value_equal(left, right):
 
 
 def _input_context_equal(left, right):
+    from .inputs import control_context
+
     # Input contexts contain query/form tuples that serialize as JSON arrays;
     # preserve that established shape while comparing their JSON value types.
     try:
-        return json_equal(json.loads(canonical(left)), json.loads(canonical(right)))
+        return json_equal(json.loads(canonical(control_context(left))), json.loads(canonical(control_context(right))))
     except (ValueError, TypeError, RecursionError):
         return False
 
@@ -485,11 +487,24 @@ def _category_family(value):
     if is_xss_category(value):
         return "xss"
     normalized = re.sub(r"[^a-z0-9]", "", str(value).casefold())
-    aliases = {"business_logic": ("businesslogic",), "ssrf": ("ssrf", "serversiderequestforgery"),
+    aliases = {"access_control": ("accesscontrol", "authorization", "idor", "horizontalprivilege", "verticalprivilege"),
+               "business_logic": ("businesslogic",), "ssrf": ("ssrf", "serversiderequestforgery"),
                "xxe": ("xxe", "xmlexternalentity"), "path_traversal": ("pathtraversal", "directorytraversal", "localfileinclusion"),
                "command_injection": ("commandinjection",), "template_injection": ("templateinjection", "ssti"),
                "deserialization": ("deserialization",), "file_upload": ("fileupload", "unrestrictedupload")}
-    return next((family for family, terms in aliases.items() if any(term in normalized for term in terms)), None)
+    family = next((family for family, terms in aliases.items() if any(term in normalized for term in terms)), None)
+    if family is not None:
+        return family
+    # Concrete Chinese mechanism names retain the same family identity. Broad
+    # disclosure/authentication/RCE labels are deliberately not guessed here.
+    text = str(value).casefold()
+    localized = {"access_control": ("越权", "访问控制", "授权绕过"),
+                 "business_logic": ("业务逻辑", "交易篡改", "状态篡改"),
+                 "ssrf": ("服务端请求伪造",), "xxe": ("XML 外部实体".casefold(), "外部实体注入"),
+                 "path_traversal": ("路径穿越", "目录穿越"), "command_injection": ("命令注入",),
+                 "template_injection": ("模板注入",), "deserialization": ("反序列化",),
+                 "file_upload": ("文件上传",)}
+    return next((family for family, terms in localized.items() if any(term in text for term in terms)), None)
 
 
 def _family_extraction(item, operation, observations, oracle, value, control_value):
@@ -1080,6 +1095,48 @@ def validate_confirmation(project, decision, category=None):
         raise EngineError("sql_metadata_proof", "Stored metadata proof differs from the supporting observations")
 
 
+def current_machine_proof(project, identity, category):
+    """Inspect one current typed positive proof; never create or close work."""
+    if not isinstance(identity, str) or not identity or len(identity) > 128:
+        raise EngineError("finding_decision", "A current typed proof decision ID is required")
+    decision = project.get("decision", identity)
+    if decision.get("mode") != "machine" or decision.get("outcome") != "confirmed":
+        raise EngineError("finding_proof", "Binding requires an existing confirmed machine proof; analyst text and runtime labels do not qualify",
+                          {"next_action": "assessment.evaluate", "help_input": {"name": "assessment.evaluate"}})
+    item = project.get("obligation", decision.get("obligation_id"), required=False)
+    if not item or item.get("superseded") or item.get("status") != "evaluated" \
+            or item.get("decision_id") != decision["id"]:
+        raise EngineError("finding_proof_current", "The proof must be the current evaluated decision of a non-superseded obligation")
+    operation = project.get("operation", item["operation_id"])
+    if decision.get("operation_id") != operation["id"] \
+            or decision.get("operation_signature") != operation_signature(operation):
+        raise EngineError("finding_proof_current", "The proof operation or its current signature no longer matches")
+    oracle = decision.get("oracle") or {}
+    kind = oracle.get("type") if isinstance(oracle, dict) else None
+    if item.get("kind") in {"access", "ownership"} and kind == "authorization":
+        family = "access_control"
+    elif item.get("kind") == "input_test":
+        family = item.get("test_family")
+        # Genuine legacy SQL metadata proofs already implement the strict SQL
+        # channel, even before explicit test_families were introduced.
+        if family is None and _sql_input(item, operation):
+            family = "sql_injection"
+        allowed = {"sql_injection": {"sql_metadata", "error_channel"},
+                   "xxe": {"extraction"}, "ssrf": {"extraction"}, "path_traversal": {"extraction"},
+                   "business_logic": {"state_invariant", "state_transition"}}
+        if kind not in allowed.get(family, set()):
+            raise EngineError("finding_proof", "This obligation and oracle do not provide an implemented typed positive proof",
+                              {"next_action": "action.help", "help_input": {"name": "assessment.evaluate"}})
+    else:
+        raise EngineError("finding_proof", "Baselines, setup and review declarations are not positive security proofs")
+    if _category_family(category) != family:
+        raise EngineError("oracle_family", "The concrete finding category must match the proof's vulnerability family")
+    from .engine import _decision_valid
+    _decision_valid(project, decision)
+    validate_confirmation(project, decision, category)
+    return decision, item, operation
+
+
 def _authorization_requests(project, observations):
     identity_headers = set()
     for meta,artifact in observations:
@@ -1314,7 +1371,11 @@ def record_finding(project,args):
         if is_sql_category(args["category"]):
             proof_id = args.get("proof_decision_id", args.get("decision_id"))
             if proof_id:
+                if not isinstance(proof_id, str) or args.get("decision_id", proof_id) != proof_id:
+                    raise EngineError("finding_decision", "Supply one unambiguous SQL proof decision ID")
                 source_decision = project.get("decision", proof_id)
+                from .engine import _decision_valid
+                _decision_valid(project, source_decision)
                 validate_confirmation(project, source_decision, args["category"])
                 if source_decision.get("outcome") != "confirmed":
                     raise EngineError("finding_decision", "The metadata proof must be confirmed")
@@ -1338,6 +1399,14 @@ def record_finding(project,args):
                 if args.get("evidence_ids") is not None and args["evidence_ids"] != ids:
                     raise EngineError("evidence_binding", "Analyst evidence must match sql_evidence")
                 source_decision = None
+        elif args.get("proof_decision_id") is not None and not is_xss_category(args["category"]):
+            proof_id = args["proof_decision_id"]
+            if args.get("decision_id", proof_id) != proof_id:
+                raise EngineError("finding_decision", "Supply one unambiguous typed proof decision ID")
+            source_decision, _, _ = current_machine_proof(project, proof_id, args["category"])
+            ids = list(source_decision["evidence_ids"])
+            if args.get("evidence_ids") is not None and args["evidence_ids"] != ids:
+                raise EngineError("evidence_binding", "Analyst evidence must exactly match the typed proof's evidence IDs and order")
         else:
             source_decision = None
             ids = args.get("evidence_ids", [])
@@ -1350,7 +1419,8 @@ def record_finding(project,args):
                     "reason": args["reason"], "evidence_ids": ids, "created_at": now()}
         if source_decision:
             for key in ("obligation_id", "operation_id", "operation_signature", "oracle", "oracle_version", "proof"):
-                decision[key] = source_decision[key]
+                if key in source_decision:
+                    decision[key] = source_decision[key]
             decision["proof_decision_id"] = source_decision["id"]
         if sql_evidence:
             decision["proof"] = sql_evidence

@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { types } from 'node:util';
-import { ACTIONS } from './actions.mjs';
+import { ALL_ACTIONS as VALID_ACTIONS } from './actions.mjs';
 export { ACTIONS } from './actions.mjs';
 
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -81,6 +81,24 @@ export function safeErrorDetails(details) {
     'resource_id', 'evidence_id', 'obligation_id']) {
     if (typeof safe[key] === 'string') add(key, safeErrorText(safe[key], 200));
   }
+  const recoveryEnums = {
+    test_family: ['access_control', 'sql_injection', 'xss', 'ssrf', 'xxe', 'path_traversal', 'command_injection',
+      'template_injection', 'deserialization', 'file_upload', 'business_logic', 'generic'],
+    oracle_type: ['baseline', 'authorization', 'semantic_negative', 'extraction', 'sql_metadata', 'error_channel', 'state_invariant', 'state_transition'],
+    framing_issue: ['utf8_bom', 'invalid_multipart'],
+    repair: ['rewrite_utf8_without_bom', 'rebuild_exact_multipart'],
+  };
+  for (const [key, values] of Object.entries(recoveryEnums)) {
+    if (values.includes(safe[key])) add(key, safe[key]);
+  }
+  const oracleFields = new Set(['type', 'selector', 'expected', 'test_family', 'baseline_expected', 'control_expected',
+    'expect', 'expected_value', 'source_reference', 'metadata_type', 'response_pattern', 'before_expected',
+    'scenario_run_id', 'before_step_id', 'action_step_id', 'after_step_id', 'action_input_expected',
+    'action_success_selector', 'action_success_expected', 'readback_scope']);
+  if (Array.isArray(safe.required_fields) && safe.required_fields.length <= 24 &&
+      safe.required_fields.every(field => oracleFields.has(field))) {
+    add('required_fields', [...safe.required_fields]);
+  }
   if (safe.stop_policy === 'exhaustion_only') add('stop_policy', safe.stop_policy);
   if (safe.requests_sent === 0) add('requests_sent', 0);
   if (safe.progress_export?.action === 'report.build' && safe.progress_export?.input?.stage === 'draft') {
@@ -117,6 +135,7 @@ export function resolveConfig(config = {}) {
   const executionBackend = config.executionBackend ?? 'native';
   const wslDistribution = config.wslDistribution ?? 'kali-linux';
   const wslPythonExecutable = config.wslPythonExecutable ?? 'python3';
+  const assessmentModel = config.assessmentModel ?? 'v1';
   if (typeof workspace !== 'string' || !isAbsolute(workspace) || workspace.includes('\0')) {
     throw new BridgeError('INVALID_CONFIG', 'workspace must be an absolute local directory.');
   }
@@ -141,8 +160,11 @@ export function resolveConfig(config = {}) {
   if (typeof wslPythonExecutable !== 'string' || !/^[A-Za-z0-9_./][A-Za-z0-9_./+-]*$/.test(wslPythonExecutable)) {
     throw new BridgeError('INVALID_CONFIG', 'wslPythonExecutable must be a Linux executable name or path, without shell arguments.');
   }
+  if (!['v1', 'v2'].includes(assessmentModel)) {
+    throw new BridgeError('INVALID_CONFIG', 'assessmentModel must be v1 or v2.');
+  }
   return Object.freeze({ workspace: resolve(workspace), pythonExecutable, timeoutMs,
-    executionBackend, wslDistribution, wslPythonExecutable });
+    executionBackend, wslDistribution, wslPythonExecutable, assessmentModel });
 }
 
 /** Reject values JSON.stringify would silently change, omit or execute. */
@@ -217,7 +239,7 @@ export function validateJson(value) {
 }
 
 export function validateRequest(action, args) {
-  if (!ACTIONS.includes(action)) throw new BridgeError('UNKNOWN_ACTION', 'Unsupported awa-ddd action.');
+  if (!VALID_ACTIONS.includes(action)) throw new BridgeError('UNKNOWN_ACTION', 'Unsupported awa-ddd action.');
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     throw new BridgeError('INVALID_ARGUMENTS', 'Action arguments must be a JSON object.');
   }
@@ -272,6 +294,16 @@ export function redactActionResult(action, value) {
     if (typeof description === 'string' && key.length <= 160) fields[key] = safeErrorText(description, 2000);
   }
   safe.fields = fields;
+  if (value.action === 'assessment.evaluate' && value.oracle_contracts && typeof value.oracle_contracts === 'object'
+      && !Array.isArray(value.oracle_contracts)) {
+    // "authorization" is a schema discriminator here, not a captured header.
+    const contracts = Object.create(null);
+    for (const kind of ['baseline', 'authorization', 'semantic_negative', 'extraction', 'sql_metadata', 'error_channel', 'state_invariant', 'state_transition']) {
+      const shape = value.oracle_contracts[kind];
+      if (shape && typeof shape === 'object' && !Array.isArray(shape)) contracts[kind] = redactResult(shape);
+    }
+    safe.oracle_contracts = contracts;
+  }
   return safe;
 }
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, deque
+import re
 from urllib.parse import urlsplit, urlunsplit
 
 from . import engine
@@ -29,12 +30,14 @@ def pick(row, fields):
 def operation_view(operation, *, detail=False):
     row = pick(operation, ("id", "url", "method", "protocol", "auth", "allowed_roles", "ownership", "state_scope", "content_type", "operation_name", "ownership_sampling"))
     row["url"] = safe_url(operation["url"])
-    row["input_count"] = len(operation.get("inputs") or [])
+    entries = operation.get("inputs")
+    row["input_count"] = len(entries) if isinstance(entries, list) else None
     if detail:
         # Arbitrary imported source text stays in the local record, not the model context.
         row["inputs"] = [pick(entry, ("name", "location", "selector", "consumer", "schema_branch", "schema_type", "required", "test_families"))
-                         for entry in operation.get("inputs", [])[:100]]
-        row["inputs_truncated"] = row["input_count"] > 100
+                         if isinstance(entry, dict) else {"registration_error": "input_not_object"}
+                         for entry in (entries if isinstance(entries, list) else [])[:100]]
+        row["inputs_truncated"] = isinstance(entries, list) and len(entries) > 100
     return row
 
 
@@ -50,25 +53,42 @@ def list_surfaces(project, args):
 def inspect_surface(project, args):
     operation = project.get("operation", args["operation_id"])
     # Inputs have their own cursor so a large schema cannot hide precise selectors.
+    entries = operation.get("inputs")
     inputs = [pick(entry, ("name", "location", "selector", "consumer", "schema_branch", "schema_type", "required", "test_families"))
-              for entry in operation.get("inputs", [])]
+              if isinstance(entry, dict) else {"registration_error": "input_not_object"}
+              for entry in entries] if isinstance(entries, list) else []
     input_page = page(inputs, args)
-    gaps = {gap["id"]: gap for gap in engine.evaluate_coverage(project)["gaps"]}
+    identity_error = None
+    try:
+        gaps = {gap["id"]: gap for gap in engine.evaluate_coverage(project)["gaps"]}
+    except EngineError as exc:
+        if exc.code not in {"input", "input_selector", "input_schema_branch"}:
+            raise
+        # The repair pointer must remain readable, but no saved status may be
+        # presented as accepted coverage when identity validation failed.
+        gaps = {}
+        identity_error = {"code": exc.code, "operation_id": exc.details.get("operation_id"),
+                          "field": exc.details.get("field", "inputs")}
     obligations = []
     for obligation in project.list("obligation"):
         if obligation.get("operation_id") != operation["id"] or obligation.get("superseded"):
             continue
         row = pick(obligation, ("id", "kind", "actor_id", "baseline_actor_id", "resource_id", "status", "input_selector", "input_location", "schema_branch", "test_family", "tenant_boundary", "decision_id"))
-        if obligation["id"] in gaps:
+        if identity_error is not None:
+            row.update(status="open", reason_code="input_identity_invalid", next_action="action.help")
+        elif obligation["id"] in gaps:
             row.update(pick(gaps[obligation["id"]], ("status", "gap_id", "reason_code", "reason", "next_action", "operator_reason")))
         obligations.append(row)
+    total = input_page.pop("total")
     return {"operation": operation_view(operation), "inputs": input_page.pop("items"),
-            "input_total": input_page.pop("total"), **input_page,
+            "input_total": total if isinstance(entries, list) else None, **input_page,
             "obligation_total": len(obligations), "obligations": obligations[:25],
             "obligations_truncated": len(obligations) > 25,
             "resources": [pick(row, ("id", "owner_actor_id", "request_binding")) for row in project.list("resource")
                           if row.get("operation_id") == operation["id"]][:10],
-            "next_action": "plan.next"}
+            "next_action": "action.help" if identity_error is not None else "plan.next",
+            **({"inspection_limited": True, "input_identity_error": identity_error,
+                "help_input": {"name": "surface.register"}} if identity_error is not None else {})}
 
 
 def register_batch(project, args):
@@ -161,13 +181,23 @@ def capture_preflight(project, args):
             "next_action": "http.capture", "limitation": "Preflight is a point-in-time check; capture rechecks the same gates before execution."}
 
 
-def _live_sessions(project):
+def _live_sessions(project, *, renewable=None):
     live = {}
     for session in project.list("session"):
         try:
             engine.session_valid(project, session)
             live.setdefault(session["actor_id"], []).append(session)
-        except (EngineError, OSError, ValueError, KeyError):
+        except EngineError as exc:
+            if renewable is None or exc.code != "session_expired":
+                continue
+            try:
+                actor = engine._verified_session_actor(project, session)
+                if actor.get("roles") and not session.get("verification_assertion", {}).get("roles_selector"):
+                    continue
+                renewable.setdefault(session["actor_id"], []).append(session)
+            except (EngineError, OSError, ValueError, TypeError, KeyError):
+                continue
+        except (OSError, ValueError, KeyError):
             continue
     return live
 
@@ -230,13 +260,19 @@ def _query_scope_binding_possible(config, url):
     return False
 
 
-def _work_item(project, gap, operations, live, observations, foreign_actors=()):
+def _work_item(project, gap, operations, live, observations, foreign_actors=(), parameter=None, *, resources=None, config=None):
     operation = operations[gap["operation_id"]]
+    config = project.config if config is None else config
     kind = gap["obligation_kind"]
     row = pick(gap, ("id", "gap_id", "operation_id", "obligation_kind", "input_location", "input_selector", "schema_branch", "test_family", "tenant_boundary", "actor_id", "baseline_actor_id", "resource_id", "status", "reason_code", "next_action", "operator_reason"))
     row["obligation_id"] = gap["id"]
     row["method"], row["url"] = operation["method"], safe_url(operation["url"])
     row["missing_prerequisites"] = []
+    if parameter is not None:
+        row.update(parameter_coverage_id=parameter["id"], parameter_test_status=parameter["status"],
+                   selected_input_observation_count=parameter["observation_count"],
+                   selected_input_variant_observed=parameter["has_input_variant"],
+                   controls_are_candidates_only=True)
     setup = {"auth_review": "surface.register", "input_review": "surface.declare_consumer",
              "identity_setup": "identity.actor", "ownership_setup": "identity.resource"}
     if kind in setup:
@@ -252,10 +288,10 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
         return row
     from .assessment import _authorized
     try:
-        engine.require_scope(project.config, operation["url"])
+        engine.require_scope(config, operation["url"])
     except (EngineError, ValueError, TypeError):
         row["missing_prerequisites"].append("exact_scoped_url_query_binding" if
-            _query_scope_binding_possible(project.config, operation["url"]) else "authorized_operation_scope")
+            _query_scope_binding_possible(config, operation["url"]) else "authorized_operation_scope")
         row["execution_blocked"] = True
     allowed = [session for actor_id, session in live.items() if _authorized(project, operation, actor_id)] if operation["auth"] != "unknown" else []
     actor_id = gap.get("actor_id")
@@ -281,14 +317,15 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
         row["missing_prerequisites"].append("verified_session_for_target_origin")
     if operation["auth"] == "unknown":
         row["missing_prerequisites"].append("declared_access_policy")
-    resources = [item for item in project.list("resource") if item["operation_id"] == operation["id"]]
+    if resources is None:
+        resources = [item for item in project.list("resource") if item["operation_id"] == operation["id"]]
     resource = next((item for item in resources if item["id"] == gap.get("resource_id")), None)
     if resource is None and session:
         resource = next((item for item in resources if item["owner_actor_id"] == session["actor_id"]), None)
     if "{" in operation["url"] or "}" in operation["url"]:
         row["missing_prerequisites"].append("concrete_url_with_bound_path_values")
     if operation["method"] not in {"GET", "HEAD", "OPTIONS"}:
-        if not project.config.get("allow_mutation"):
+        if not config.get("allow_mutation"):
             row["missing_prerequisites"].append("project_allow_mutation")
         if not resource and not (operation.get("state_scope") == "actor" and session):
             row["missing_prerequisites"].append("matching_test_resource_or_declared_actor_state")
@@ -356,6 +393,18 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
             row["proof_channels"] = ["sql_metadata", "error_channel"]
             if operation["method"] not in {"GET", "HEAD", "OPTIONS"}:
                 row["proof_channels"].append("analyst_write_side_business_proof")
+        candidates = parameter.get("control_candidate_evidence_ids", []) if parameter is not None else []
+        if candidates and operation["auth"] != "unknown":
+            row.update(queue_status="review", suggested_action="evidence.inspect", help_input={"name": "evidence.inspect"},
+                       input_template={"evidence_id": candidates[0]}, evidence_ids=list(candidates),
+                       observation_total=len(candidates), control_candidate_evidence_ids=list(candidates),
+                       control_candidate_review_required=True,
+                       assessment_followup_action="finding.record" if family == "xss" else "assessment.evaluate",
+                       note_zh="Saved same-context exact-input captures are comparison candidates only. Inspect their inputs and responses offline before choosing control roles and an oracle; do not replay requests or close the obligation from these references.")
+            row["required_experiment_fields"].append(
+                "Verify the saved baseline/variant/control roles, business assertions and family-specific proof requirements; comparison candidates are not accepted evidence by themselves.")
+            if row["missing_prerequisites"]:
+                row["execution_blocked"] = True
     if row["missing_prerequisites"]:
         existing = observations.get(operation["id"], [])
         if operation["auth"] == "unknown":
@@ -370,7 +419,7 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=()):
                         or _authorized(project, operation, item.get("actor_id"))]
         else:
             existing = [item for item in existing if item.get("actor_id") == actor_id]
-        if existing:
+        if existing and not row.get("control_candidate_review_required"):
             row.update(queue_status="review", execution_blocked=True, suggested_action="evidence.inspect",
                        input_template={"evidence_id": existing[-1]["id"]},
                        evidence_ids=[item["id"] for item in existing[-5:]],
@@ -427,6 +476,113 @@ def _reconcile_declared_blocker(row, gap):
     return row
 
 
+def _coverage_priority(row):
+    if row["suggested_action"] in {"evidence.inspect", "finding.record"}:
+        return 2
+    if row["obligation_kind"] in {"input_test", "input_review"}:
+        if not row.get("selected_input_variant_observed"):
+            return 0 if not row.get("selected_input_observation_count", 0) else 1
+        return 2
+    if row["suggested_action"] in {"evidence.inspect", "assessment.evaluate", "finding.record"}:
+        return 2
+    return 4 if row["obligation_kind"] == "baseline" else 3
+
+
+def _renewal_candidates(project, row, operation, sessions):
+    from .assessment import _authorized
+
+    if operation["auth"] == "unknown" or {"authorized_operation_scope", "exact_scoped_url_query_binding"}.intersection(row["missing_prerequisites"]):
+        return []
+    eligible = {actor_id: session for actor_id, session in sessions.items()
+                if operation["auth"] != "restricted" or session.get("verification_assertion", {}).get("roles_selector")}
+    allowed = [actor_id for actor_id in eligible if _authorized(project, operation, actor_id)]
+    selected = {}
+    for prerequisite in row["missing_prerequisites"]:
+        if prerequisite == "live_verified_session_for_actor":
+            identities = [row.get("actor_id")]
+        elif prerequisite == "live_verified_owner_baseline":
+            identities = [row.get("baseline_actor_id")]
+        elif prerequisite in {"live_verified_allowed_session", "verified_allowed_baseline"}:
+            identities = allowed[:1]
+        else:
+            continue
+        for identity in identities:
+            if identity not in eligible:
+                continue
+            session = eligible[identity]
+            candidate = selected.setdefault(session["id"], {
+                "session_id": session["id"], "actor_id": identity, "generation": session["generation"],
+                "expires_at": session["expires_at"], "prerequisites": [], "action": "identity.session",
+                "input_template": {"session_id": session["id"], "renew": True},
+                "automatic_execution_allowed": False, "renewal_is_login": False})
+            candidate["prerequisites"].append(prerequisite)
+    return list(selected.values())
+
+
+def _preparation_actions(row, operation):
+    """Concrete offline handoff, not invented target workflows or execution approval."""
+    mappings = {
+        "authorized_operation_scope": ("surface.inspect", ["actual_authorization"],
+            "Inspect the fixed scope offline. Only actual authorization may change it; do not widen scope to remove a blocker."),
+        "exact_scoped_url_query_binding": ("surface.inspect", ["exact_authorized_url"],
+            "Choose the intended exact URL from authorized sources. Scope rules are not request values and each control must remain in scope."),
+        "concrete_url_with_bound_path_values": ("surface.inspect", ["exact_test_resource_values", "url"],
+            "Inspect the registered path selector and bind a real permitted test resource before preflight; do not guess another user's resource."),
+        "declared_access_policy": ("surface.register", ["auth", "allowed_roles_if_restricted"],
+            "Declare the actual access policy from trusted authorization documentation. A past HTTP 200 is not a policy declaration."),
+        "project_allow_mutation": ("project.status", ["explicit_write_authorization"],
+            "Verify explicit write authorization first. Do not set allow_mutation merely to bypass a failed preflight."),
+        "matching_test_resource_or_declared_actor_state": ("identity.resource", ["owner_actor_id", "external_id", "request_binding"],
+            "Prepare a disposable owned fixture with an exact request binding. Business inputs cannot be relabeled as fixture-free actor state."),
+        "server_verified_role_membership": ("identity.verify", ["session_id", "operation_id", "subject_selector", "roles_selector"],
+            "Use an authorized identity endpoint that actually returns subject and role membership. Do not infer roles from a label, a client UI or a 200 response."),
+        "verified_session_for_target_origin": ("identity.verify", ["session_id", "operation_id", "subject_selector"],
+            "Register and verify a separate session at this target origin. Never forward credentials verified at another origin."),
+    }
+    session_prerequisites = {"live_verified_session_for_actor", "live_verified_allowed_session", "verified_allowed_baseline",
+                             "live_verified_owner_baseline"}
+    actions = []
+    for prerequisite in row["missing_prerequisites"]:
+        if prerequisite in session_prerequisites:
+            candidate = next((item for item in row.get("session_renewal_candidates", [])
+                              if prerequisite in item["prerequisites"]), None)
+            if candidate is not None:
+                actions.append({"prerequisite": prerequisite, "action": "identity.session",
+                    "help_input": {"name": "identity.session"}, "input_template": dict(candidate["input_template"]),
+                    "required_input_fields": ["confirm_unchanged_server_credentials"],
+                    "instruction": "This expired session retains current identity and credential bindings for this origin. Manually renew its local liveness only if the server credentials are unchanged; renewal is not login. Changed credentials need a new generation and actual verification. Never automatically replay a request.",
+                    "automatic_execution_allowed": False})
+                continue
+            action, required, instruction = "identity.session", ["actor_id", "headers", "identity.verify"], (
+                "Use a real authorized test account, register its current credentials privately, then run identity.verify with the exact subject selector. "
+                "Same-generation renewal requires unchanged credentials; changed credentials need a new generation and verification. Existing evidence may still be reviewed offline.")
+        else:
+            action, required, instruction = mappings.get(prerequisite, ("action.help", [prerequisite],
+                "Inspect the named capability or browser prerequisite offline and supply the exact required fields; do not automatically replay a target request."))
+        item = {"prerequisite": prerequisite, "action": action, "help_input": {"name": action if action != "action.help" else "browser.import_mcp"},
+                "required_input_fields": required, "instruction": instruction, "automatic_execution_allowed": False}
+        if action == "surface.inspect":
+            item["input_template"] = {"operation_id": operation["id"]}
+        elif action == "identity.resource":
+            item["input_template"] = {"operation_id": operation["id"]}
+        elif prerequisite == "live_verified_session_for_actor" and row.get("actor_id"):
+            item["input_template"] = {"actor_id": row["actor_id"]}
+        actions.append(item)
+    row["preparation_actions"] = actions
+    if any(re.search(r"captcha|sms.?code|otp|verify.?code|verification.?code|auth.?token", str(entry.get("name") or entry.get("selector") or ""), re.I)
+           for entry in operation.get("inputs", [])):
+        row["session_continuity"] = {
+            "hint_only": True, "automatic_cookie_forwarding": False,
+            "anonymous_input_field": "anonymous_cookie", "authenticated_input_field": "session_id",
+            "instructions": [
+                "Preserve the same-origin anonymous cookie jar privately across captcha/SMS issuance and verification; Set-Cookie attributes are not Cookie request values.",
+                "Use anonymous_cookie only for public flows and never together with session_id. Authenticated work requires a registered verified session.",
+                "A failed factor or a satisfied captcha does not test every factor. Test each registered factor and token lifecycle separately with exact controls.",
+                "Do not assume exhausted attempts, missing OTP state or unpaid resources require a payment. Inspect authorized workflow documentation and prepare a disposable fixture or authorized test account."],
+        }
+    return row
+
+
 def _fair_work_items(rows):
     lanes = {}
     for row in rows:
@@ -436,12 +592,35 @@ def _fair_work_items(rows):
                 kind if kind in {"baseline", "input_review"} else "setup")
         lanes.setdefault(lane, []).append(row)
     for key, values in lanes.items():
-        values.sort(key=lambda row: (row["queue_status"] != "ready", row["suggested_action"] != "assessment.evaluate",
+        values.sort(key=lambda row: (_coverage_priority(row), row["queue_status"] != "ready",
+                                    row["suggested_action"] not in {"assessment.evaluate", "evidence.inspect", "finding.record"},
                                     row["method"] not in {"GET", "HEAD", "OPTIONS"}, row["operation_id"], row["gap_id"]))
-        lanes[key] = deque(values)
+        def by_operation(items):
+            operations = {}
+            for row in items:
+                operations.setdefault(row["operation_id"], deque()).append(row)
+            result = deque()
+            active = deque(operations.values())
+            while active:
+                pending = active.popleft()
+                result.append(pending.popleft())
+                if pending:
+                    active.append(pending)
+            return result
+        primary = by_operation([row for row in values if _coverage_priority(row) < 2])
+        followup = by_operation([row for row in values if _coverage_priority(row) >= 2])
+        balanced = deque()
+        # Fresh parameters lead, but existing evidence gets a bounded review slot.
+        while primary or followup:
+            for _ in range(2):
+                if primary:
+                    balanced.append(primary.popleft())
+            if followup:
+                balanced.append(followup.popleft())
+        lanes[key] = balanced
     security = ["input_test:" + family for family in engine.TEST_FAMILIES if "input_test:" + family in lanes]
     first = security + (["access"] if "access" in lanes else [])
-    order = first + (["input_review", "baseline", "setup"] if first else ["baseline", "input_review", "setup"])
+    order = first + (["input_review", "baseline", "setup"] if first else ["input_review", "baseline", "setup"])
     order += sorted(key for key in lanes if key not in order)
     balanced = []
     while any(lanes.values()):
@@ -453,23 +632,38 @@ def _fair_work_items(rows):
 
 def queue_inventory(project, evaluated, inventory=None):
     """Build readiness without evaluating again or claiming a network request."""
-    operations = {item["id"]: item for item in project.list("operation")}
-    live = _live_sessions(project)
+    operations = inventory["operations"] if inventory is not None else {item["id"]: item for item in project.list("operation")}
+    config = project.config
+    resources_by_operation = {}
+    for resource in project.list("resource"):
+        resources_by_operation.setdefault(resource["operation_id"], []).append(resource)
+    renewable = {}
+    live = _live_sessions(project, renewable=renewable)
     if inventory is None:
         observations = _observations(project)
     else:
         observations = {}
         for item in inventory["observations"]:
             observations.setdefault(item["operation_id"], []).append(item)
+    from .parameter_coverage import snapshot as parameter_snapshot
+    parameters = parameter_snapshot(project, evaluated, inventory=inventory)
+    by_obligation = {identity: parameter for parameter in parameters["items"] for identity in parameter["obligation_ids"]}
     from .browser_policy import Context, for_work_item
     browser_context = Context(project)
-    sessions_by_operation, rows = {}, []
+    sessions_by_operation, renewable_by_operation, rows = {}, {}, []
     for gap in evaluated["gaps"]:
         operation_id = gap["operation_id"]
         if operation_id not in sessions_by_operation:
             sessions_by_operation[operation_id] = _operation_sessions(project, operations[operation_id], live)
         compatible, foreign = sessions_by_operation[operation_id]
-        row = _work_item(project, gap, operations, compatible, observations, foreign)
+        row = _work_item(project, gap, operations, compatible, observations, foreign, by_obligation.get(gap["id"]),
+                         resources=resources_by_operation.get(operation_id, []), config=config)
+        if renewable and row["missing_prerequisites"]:
+            if operation_id not in renewable_by_operation:
+                renewable_by_operation[operation_id] = _operation_sessions(project, operations[operation_id], renewable)[0]
+            candidates = _renewal_candidates(project, row, operations[operation_id], renewable_by_operation[operation_id])
+            if candidates:
+                row["session_renewal_candidates"] = candidates
         evidence_ids = set(row.get("evidence_ids", []))
         evidence = [item for item in observations.get(operation_id, []) if item["id"] in evidence_ids]
         policy = row["browser_testing"] = for_work_item(browser_context, operations[operation_id], gap, row, evidence)
@@ -500,7 +694,8 @@ def queue_inventory(project, evaluated, inventory=None):
                            "evidence_ids": [refs["baseline_evidence_id"], refs["attack_evidence_id"]],
                            "runtime_visit_id": refs["runtime_visit_id"]})
             row["required_experiment_fields"] += ["consumer_url", "runtime_marker", "analyst reviewer/reason and supported impact"]
-        elif policy["must_call_playwright"] and policy["stage"] in {"identify_consumer", "browser_runtime", "browser_assist"}:
+        elif policy["must_call_playwright"] and policy["stage"] in {"identify_consumer", "browser_runtime", "browser_assist"} \
+                and not row.get("control_candidate_review_required"):
             row["queue_status"] = "review"
             if policy["native_supported"]:
                 row.update(suggested_action="browser.visit", help_input={"name": "browser.visit"},
@@ -510,7 +705,7 @@ def queue_inventory(project, evaluated, inventory=None):
                            input_template={"name": "browser.import_mcp"})
             row["required_experiment_fields"] += policy["required_input_fields"]
             row["browser_handoff_note"] = "Use actual host Playwright tools first; this template is a bounded native fallback, not authorization. Fill the missing exact URL/interaction inputs before invocation."
-        rows.append(_reconcile_declared_blocker(row, gap))
+        rows.append(_preparation_actions(_reconcile_declared_blocker(row, gap), operations[operation_id]))
     return rows
 
 
@@ -519,15 +714,16 @@ def next_work(project, args):
     include_blocked = args.get("include_blocked", False)
     if type(include_blocked) is not bool:
         raise EngineError("arguments", "include_blocked must be a boolean")
-    evaluated = engine.evaluate_coverage(project)
-    rows = queue_inventory(project, evaluated)
+    from .completeness import evaluate_with_inventory, followups
+    from .parameter_coverage import public_page as parameter_page
+    evaluated, inventory = evaluate_with_inventory(project)
+    rows = inventory["queue"]
     counts = Counter(row["queue_status"] for row in rows)
     selected = _fair_work_items([row for row in rows if row["queue_status"] != "blocked"])
     blocked = _fair_work_items([row for row in rows if row["queue_status"] == "blocked"])
     if include_blocked:
         selected += blocked
-    from .completeness import followups
-    closure = followups(project, evaluated, min(limit, 10))
+    closure = followups(project, evaluated, min(limit, 10), inventory=inventory)
     from .browser_policy import summarize
     browser_summary = summarize([row["browser_testing"] for row in rows])
     followup_summary = closure.pop("browser_followup_summary")
@@ -540,7 +736,9 @@ def next_work(project, args):
             "blocked_sample": blocked[:min(5, limit)], **closure,
             "requests_sent": 0, "coverage_ratio": evaluated["coverage_ratio"],
             "security_coverage": evaluated["security_coverage"], "completion": evaluated["completion"],
-            "queue_policy": "family_round_robin", "closure_action": "plan.audit",
+            "parameter_coverage": parameter_page(inventory["parameter_coverage_snapshot"],
+                {"parameter_limit": min(limit, 3), **args}),
+            "queue_policy": "coverage_first", "queue_fairness": "family_and_operation_round_robin", "closure_action": "plan.audit",
             "browser_testing_summary": browser_summary,
             "limitation": "Readiness is not approval, execution, or completed coverage. Fill the exact experiment fields and preflight every request; imported tool output remains untrusted."}
 

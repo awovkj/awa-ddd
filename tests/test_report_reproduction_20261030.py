@@ -213,10 +213,21 @@ class ReportReproductionTests(unittest.TestCase):
                     self.assertNotIn(secret, exported)
 
     def test_opaque_or_malformed_multipart_has_no_execution_template(self):
+        from awa_ddd.store import EngineError
         bodies = [b'--fixture\r\nContent-Disposition: form-data; name="file"; filename="blob.bin"\r\nContent-Type: application/octet-stream\r\n\r\nPRIVATE-OPAQUE\r\n--fixture--\r\n',
                   b'--fixture\r\nContent-Disposition: form-data; name="password"\r\n\r\nPRIVATE-MALFORMED']
         for index, body in enumerate(bodies):
-            evidence = self.capture(self.operation("/opaque-" + str(index)), body=body,
+            operation = self.operation("/opaque-" + str(index))
+            if index == 1:
+                counts = {kind: len(self.project.list(kind)) for kind in ("run", "evidence")}
+                with patch.object(engine, "request") as network, self.assertRaises(EngineError) as caught:
+                    engine.capture(self.project, {"operation_id": operation["id"], "body": body,
+                        "headers": {"Content-Type": "multipart/form-data; boundary=fixture"}, "effect": "read_only"})
+                self.assertEqual("multipart_framing", caught.exception.code)
+                network.assert_not_called()
+                self.assertEqual(counts, {kind: len(self.project.list(kind)) for kind in counts})
+                continue
+            evidence = self.capture(operation, body=body,
                                     headers={"Content-Type": "multipart/form-data; boundary=fixture"}, effect="read_only")
             finding = self.finding([evidence["id"]])
             _, _, summary, _ = self.report()

@@ -19,8 +19,8 @@ def _unique_json_object(pairs):
 
 
 def _dispatch(workspace,action,args):
-    from .contracts import CONTRACTS, NO_PROJECT
-    if isinstance(action, str) and action in CONTRACTS and action not in NO_PROJECT and isinstance(args, dict) and args.get("project_id") is not None:
+    from .contracts import CONTRACTS, ALL_CONTRACTS, NO_PROJECT
+    if isinstance(action, str) and action in ALL_CONTRACTS and action not in NO_PROJECT and isinstance(args, dict) and args.get("project_id") is not None:
         from .publication import invoke
         with Project(workspace, args["project_id"]) as project:
             return invoke(project, action, args, _project_dispatch)
@@ -43,6 +43,48 @@ def _dispatch(workspace,action,args):
 
 
 def _project_dispatch(project, action, args):
+    if action.startswith("campaign."):
+        from . import v2api
+        handler = {
+            "campaign.start": v2api.campaign_start, "campaign.status": v2api.campaign_status,
+            "campaign.next": v2api.campaign_next, "campaign.checkpoint": v2api.campaign_checkpoint,
+            "campaign.finish": v2api.campaign_finish, "campaign.migrate": v2api.campaign_migrate,
+            "campaign.rollback": v2api.campaign_rollback,
+        }.get(action)
+        if handler:
+            return handler(project, args)
+    if action.startswith("recon."):
+        from . import v2api
+        handler = {
+            "recon.snapshot": v2api.recon_snapshot, "recon.import": v2api.recon_import,
+            "recon.routes": v2api.recon_routes, "recon.hypotheses": v2api.recon_hypotheses,
+            "recon.capabilities": v2api.capabilities_view,
+        }.get(action)
+        if handler:
+            return handler(project, args)
+    if action.startswith("test."):
+        from . import v2api
+        handler = {
+            "test.run": v2api.test_run, "test.run_browser": v2api.test_run_browser,
+            "test.run_scenario": v2api.test_run_scenario, "test.run_external": v2api.test_run_external,
+            "test.record_external": v2api.test_record_external, "test.inspect": v2api.test_inspect,
+        }.get(action)
+        if handler:
+            return handler(project, args)
+    if action.startswith("review."):
+        from . import v2api
+        handler = {
+            "review.finding": v2api.review_finding, "review.bind": v2api.review_bind,
+            "review.disposition": v2api.review_disposition, "review.evidence": v2api.review_evidence,
+        }.get(action)
+        if handler:
+            return handler(project, args)
+    if action == "report.matrix":
+        from . import v2api
+        return v2api.report_matrix_view(project, args)
+    if action == "report.compare":
+        from . import v2api
+        return v2api.report_compare(project, args)
     if action=="project.update":
         return engine.update_project(project,args)
     if action=="project.status":
@@ -52,6 +94,9 @@ def _project_dispatch(project, action, args):
         from . import workflow
         return {"surface.list":workflow.list_surfaces,"surface.inspect":workflow.inspect_surface,
                 "surface.batch":workflow.register_batch}[action](project,args)
+    if action == "surface.recon":
+        from .reconnaissance import profile
+        return profile(project, args)
     if action=="surface.register":
         operation=engine.register_operation(project,args.get("operation",args))
         engine.build_plan(project)
@@ -178,12 +223,30 @@ def _project_dispatch(project, action, args):
             from . import browser
             return browser.public_metadata(project,run)
         return run
+    if action=="assessment.prepare":
+        from .assessment_preparation import prepare
+        return prepare(project,args)
     if action=="assessment.evaluate":
         from .assessment import evaluate
-        return evaluate(project,args)
+        from .oracle_contracts import recover
+        try:
+            return evaluate(project,args)
+        except EngineError as exc:
+            raise recover(project, args, exc) from None
     if action=="finding.record":
         from .assessment import record_finding
-        return record_finding(project,args)
+        from .oracle_contracts import recover
+        try:
+            return record_finding(project,args)
+        except EngineError as exc:
+            raise recover(project, args, exc, action=action) from None
+    if action=="finding.bind":
+        from .finding_binding import bind_finding
+        from .oracle_contracts import recover
+        try:
+            return bind_finding(project,args)
+        except EngineError as exc:
+            raise recover(project, args, exc, action=action) from None
     if action=="finding.list":
         from .workflow import findings_page
         return findings_page(project,args)
@@ -247,6 +310,10 @@ def _project_dispatch(project, action, args):
         result["usable_for_new_requests"] = result["usable"] and result["usable_for_new_requests"]
         return result
     if action=="report.build":
+        if project.config.get("assessment_model") == "v2":
+            from .reporting import build_v2_report
+            return build_v2_report(project,args.get("output_dir"),stage=args.get("stage", "draft"),
+                                   campaign_id=args.get("campaign_id"))
         from .reporting import build_report
         return build_report(project,args.get("output_dir"), stage=args.get("stage", "draft"),
                             finalization_id=args.get("finalization_id"))

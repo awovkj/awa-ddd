@@ -519,7 +519,7 @@ test('a genuine pending ordinary user turn wins even when injected metadata is a
   h.controller.dispose();
 });
 
-test('only this controller tracked steering IDs deduplicate unconsumed continuation', async () => {
+test('tracked notice IDs deduplicate pending input and unchanged consumed handoffs stay unfinished', async () => {
   const h = setup();
   const subject = agent('tracked-steering');
   const signal = await h.step(subject);
@@ -530,8 +530,156 @@ test('only this controller tracked steering IDs deduplicate unconsumed continuat
   assert.equal(subject.steered.length, 1);
   await h.step(subject, { signal, messages: [subject.steered[0]] });
   await h.stop(subject);
-  assert.equal(h.calls.length, 2);
+  assert.deepEqual(h.calls.map(call => call[1]), ['plan.audit', 'plan.audit', 'plan.checkpoint']);
+  assert.equal(subject.steered.length, 1);
+  assert.equal(h.controller.status().stalled_checkpoints, 1);
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+});
+
+test('checkpoint and no-progress counter churn cannot rearm a consumed no-progress notice', async () => {
+  let round = 0;
+  const h = setup({ query: async () => audit({ progress_id: 'PR-stable',
+    checkpoint_id: 'CP-' + round, no_progress_rounds: round++, snapshot_id: 'CS-' + round }) });
+  const subject = agent('checkpoint-churn');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  for (let index = 0; index < 5; index++) {
+    await h.step(subject, { signal, messages: index === 0 ? [subject.steered[0]] : [] });
+    await h.stop(subject);
+  }
+  assert.equal(subject.steered.length, 1);
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, 1);
+  assert.equal(h.controller.status().duplicate_work_suppressed, 5);
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+});
+
+test('previously notified progress states cannot form an A/B steering cycle', async () => {
+  let progress = 'PR-a';
+  const h = setup({ query: async () => audit({ progress_id: progress }) });
+  const subject = agent('progress-cycle');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  for (const value of ['PR-b', 'PR-a', 'PR-b', 'PR-a']) {
+    await h.step(subject, { signal, messages: subject.inbox.nextStep.splice(0) });
+    progress = value;
+    await h.stop(subject);
+  }
   assert.equal(subject.steered.length, 2);
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, 2);
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+});
+
+test('a failed stall checkpoint is bounded and never causes replay or false finalization', async () => {
+  const h = setup({ query: async (_settings, action) => {
+    if (action === 'plan.checkpoint') throw new Error('synthetic-private-checkpoint-failure');
+    return audit({ progress_id: 'PR-checkpoint-failure' });
+  } });
+  const subject = agent('stall-checkpoint-failure');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  for (let index = 0; index < 3; index++) {
+    await h.step(subject, { signal, messages: index === 0 ? [subject.steered[0]] : [] });
+    await h.stop(subject);
+  }
+  assert.equal(subject.steered.length, 1);
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, 1);
+  assert.equal(h.controller.status().stalled_checkpoints, 0);
+  assert.equal(h.controller.status().bound_projects, 1);
+  assert.doesNotMatch(JSON.stringify(h.diagnostics), /synthetic-private-checkpoint-failure/);
+  h.controller.dispose();
+});
+
+test('fresh checkpoint progress from a parallel worker is handed off before the boundary closes', async () => {
+  for (const frontier of [false, true]) {
+    const h = setup({ query: async (_settings, action) => audit({ progress_id: action === 'plan.checkpoint' && !frontier
+      ? 'PR-new-worker-progress' : 'PR-original', frontier_rounds: action === 'plan.checkpoint' && frontier ? 1 : 0 }) });
+    const subject = agent('parallel-checkpoint-progress-' + frontier);
+    const signal = await h.step(subject);
+    await h.call(subject, 'plan.next');
+    await h.stop(subject);
+    await h.step(subject, { signal, messages: [subject.steered[0]] });
+    await h.stop(subject);
+    assert.equal(subject.steered.length, 2, 'a fresh progress/frontier state is not an unchanged handoff');
+    assert.equal(h.controller.status().bound_projects, 1);
+    assert.deepEqual(h.calls.map(call => call[1]), ['plan.audit', 'plan.audit', 'plan.checkpoint']);
+    h.controller.dispose();
+  }
+});
+
+test('fresh checkpoint completion only unbinds after the strict finalization predicate succeeds', async () => {
+  for (const finalized of [false, true]) {
+    const h = setup({ query: async (_settings, action) => action === 'plan.checkpoint' ? finalized ? finalAudit()
+      : audit({ ready_total: 0, review_total: 0, actionable_total: 0, blocked_total: 0, unresolved_total: 0,
+        can_finalize: true, frontier_rounds: 2, frontier_review_required: false, coverage_status: 'complete' }) : audit() });
+    const subject = agent('parallel-checkpoint-finalization-' + finalized);
+    const signal = await h.step(subject);
+    await h.call(subject, 'plan.next');
+    await h.stop(subject);
+    await h.step(subject, { signal, messages: [subject.steered[0]] });
+    await h.stop(subject);
+    assert.equal(h.controller.status().bound_projects, finalized ? 0 : 1);
+    assert.equal(subject.steered.length, finalized ? 1 : 2, 'can_finalize alone never drops unfinished work');
+    assert.ok(h.calls.every(call => ['plan.audit', 'plan.checkpoint'].includes(call[1])));
+    h.controller.dispose();
+  }
+});
+
+test('overlapping public stopping callbacks await only one offline audit', async () => {
+  const waiting = deferred();
+  const h = setup({ query: () => waiting.promise });
+  const subject = agent('overlapping-boundary');
+  await h.step(subject);
+  await h.call(subject, 'plan.next');
+  const first = h.stop(subject);
+  await h.stop(subject);
+  assert.equal(h.calls.length, 1);
+  waiting.resolve(audit());
+  await first;
+  assert.equal(subject.steered.length, 1);
+  h.controller.dispose();
+});
+
+test('omitted bound projects receive later handoff pages rather than being silently deduplicated', async () => {
+  const h = setup();
+  const subject = agent('many-bound-projects');
+  const signal = await h.step(subject);
+  for (let index = 0; index < 10; index++) await h.call(subject, 'plan.next', 'project-' + index);
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 1);
+  assert.match(subject.steered[0].content[0].text, /"project_id":"project-0"/);
+  assert.doesNotMatch(subject.steered[0].content[0].text, /"project_id":"project-9"/);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2);
+  assert.match(subject.steered[1].content[0].text, /"project_id":"project-9"/);
+  assert.equal(h.controller.status().bound_projects, 10);
+  h.controller.dispose();
+});
+
+test('identical success/failure audit oscillation cannot repeatedly restart recovery notices', async () => {
+  let unavailable = true;
+  const h = setup({ query: async () => {
+    if (unavailable) throw new Error('synthetic alternating dependency failure');
+    return audit({ progress_id: 'PR-recovery-stable' });
+  } });
+  const subject = agent('recovery-oscillation');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  for (const failed of [false, true, false, true, false, true]) {
+    await h.step(subject, { signal, messages: subject.inbox.nextStep.splice(0) });
+    unavailable = failed;
+    await h.stop(subject);
+  }
+  assert.equal(subject.steered.length, 3, 'one recovery, one new work state and one new failure episode');
+  assert.equal(h.controller.status().recovery_steers, 2);
+  assert.equal(h.controller.status().bound_projects, 1);
   h.controller.dispose();
 });
 

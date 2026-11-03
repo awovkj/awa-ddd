@@ -2,8 +2,6 @@
 from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
-from email.parser import Parser
-from email.utils import collapse_rfc2231_value
 import hashlib
 import json
 import os
@@ -32,6 +30,39 @@ def normalize_test_families(value):
     if len(set(value)) != len(value):
         raise EngineError("test_families", "test_families must not contain duplicate hypotheses")
     return sorted(value)
+
+
+def _validate_input_identity(entry, operation_id=None):
+    details = {"next_action": "surface.inspect", "help_action": "action.help",
+               "help_input": {"name": "surface.register"}}
+    if operation_id is not None:
+        details["operation_id"] = operation_id
+    if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"].strip() \
+            or not isinstance(entry.get("location"), str) \
+            or entry["location"] not in {"query", "path", "header", "cookie", "body", "graphql"}:
+        raise EngineError("input", "Input requires a nonempty name and supported location", details)
+    selector = entry.get("selector", entry["name"])
+    root_selector = selector == "" and entry["location"] in {"body", "graphql"}
+    if not isinstance(selector, str) or not selector.strip() and not root_selector:
+        raise EngineError("input_selector", "Input selector must be an exact string; omit it to use the name or explicitly declare a JSON root",
+                          {**details, "field": "selector"})
+    branch = entry.get("schema_branch")
+    if branch is not None and not isinstance(branch, str):
+        raise EngineError("input_schema_branch", "Input schema_branch must be a string or null",
+                          {**details, "field": "schema_branch"})
+
+
+def _validate_operation_inputs(operation, *, registered=True):
+    entries = operation.get("inputs", [])
+    if (registered and "id" in operation and "inputs" not in operation) \
+            or not isinstance(entries, list) or len(entries) > 4096:
+        raise EngineError("input", "Operation inputs must be an array of at most 4096 entries",
+                          {"operation_id": operation.get("id"), "next_action": "surface.inspect"})
+    for entry in entries:
+        _validate_input_identity(entry, operation.get("id"))
+        if registered and "selector" not in entry:
+            raise EngineError("input_selector", "Registered input is missing its exact selector; inspect its source before repair",
+                              {"operation_id": operation.get("id"), "field": "selector", "next_action": "surface.inspect"})
 
 
 def stamp(value):
@@ -109,10 +140,10 @@ def register_operation(project, hint):
     media = str(hint.get("content_type", "")).lower()
     identity = stable("O", [url, method, protocol, name, media])
     existing = project.get("operation", identity, required=False) or {}
+    _validate_operation_inputs(existing)
+    _validate_operation_inputs({"id": identity, "inputs": hint.get("inputs", [])}, registered=False)
     inputs = {}
     for entry in existing.get("inputs", []) + list(hint.get("inputs", [])):
-        if not isinstance(entry, dict) or not isinstance(entry.get("name"),str) or entry.get("location") not in {"query","path","header","cookie","body","graphql"}:
-            raise EngineError("input", "Input requires name and supported location")
         normalized = {k:entry[k] for k in ("name","location","selector","source","consumer","schema_branch","schema_type","required","array_template","schema_locator","test_families") if k in entry}
         if "test_families" in normalized:
             normalized["test_families"] = normalize_test_families(normalized["test_families"])
@@ -490,7 +521,24 @@ def _pointer_exists(response, selector):
         return False
 
 
+def _identity_selector_boundary(assertion):
+    selected = {}
+    for field in ("subject_selector", "tenant_selector", "roles_selector"):
+        selector = assertion.get(field)
+        if selector is None:
+            continue
+        if not isinstance(selector, str) or not selector.startswith("/") or re.search(r"~(?![01])", selector):
+            raise EngineError("identity_assertion", field + " must be a nonempty JSON Pointer")
+        tokens = tuple(token.replace("~1", "/").replace("~0", "~") for token in selector[1:].split("/"))
+        if tokens in selected:
+            raise EngineError("identity_selector_boundary", field + " and " + selected[tokens]
+                              + " must select distinct subject, tenant and role fields; an account identifier is not role membership")
+        selected[tokens] = field
+
+
 def _assert_identity(actor, response, assertion):
+    _identity_selector_boundary(assertion)
+    effective = dict(assertion)
     try:
         observed = pointer(response,assertion["subject_selector"])
     except EngineError:
@@ -513,6 +561,8 @@ def _assert_identity(actor, response, assertion):
             raise EngineError("tenant_mismatch",
                               "Actor declares tenant_id " + repr(actor["tenant_id"])
                               + "; supply tenant_selector, or create the actor without tenant_id when the server does not expose one")
+        effective["tenant_selector"] = selector
+        _identity_selector_boundary(effective)
         tenant = pointer(response, selector)
         if not isinstance(tenant, (str, int)) or isinstance(tenant, bool) or str(tenant) != actor["tenant_id"]:
             raise EngineError("tenant_mismatch", "Tenant assertion differs from the declared tenant_id")
@@ -526,6 +576,8 @@ def _assert_identity(actor, response, assertion):
             raise EngineError("roles_unverified",
                               "Actor declares roles " + repr(actor["roles"])
                               + "; supply roles_selector pointing at the server-side role list, or create the actor with roles=[] and rely on access-policy checks instead")
+        effective["roles_selector"] = selector
+        _identity_selector_boundary(effective)
         roles = pointer(response, selector)
         roles = [roles] if isinstance(roles,str) else roles
         if not isinstance(roles,list) or any(not isinstance(role, str) for role in roles) or set(roles) != set(actor["roles"]):
@@ -621,6 +673,8 @@ def _jsonish(value):
 def _same_binding_value(candidate, expected):
     if isinstance(candidate, bool) or isinstance(expected, bool):
         return False
+    if isinstance(candidate, bytes) or isinstance(expected, bytes):
+        return type(candidate) is type(expected) and candidate == expected
     left, right = _jsonish(candidate), _jsonish(expected)
     if isinstance(left, (dict, list)) or isinstance(right, (dict, list)):
         try:
@@ -644,39 +698,27 @@ def _search_json_key(value, key):
 
 
 def _multipart_parts(raw, content_type):
-    match = re.search(r"boundary=\"?([^\";]+)\"?", content_type or "", re.I)
-    if not match:
+    if (content_type or "").split(";", 1)[0].strip().lower() != "multipart/form-data":
         return {}
-    boundary = match.group(1)
-    parts = {}
-    for chunk in raw.split("--" + boundary):
-        if not chunk or chunk.strip() in {"", "--"}:
-            continue
-        head, sep, content = chunk.partition("\r\n\r\n")
-        if not sep:
-            continue
-        message = Parser().parsestr(head.lstrip("\r\n") + "\r\n\r\n", headersonly=True)
-        dispositions = message.get_all("content-disposition", [])
-        if message.defects:
-            raise EngineError("resource_ambiguous", "Malformed multipart headers cannot identify a unique test resource")
-        if len(dispositions) > 1:
-            raise EngineError("resource_ambiguous", "Repeated multipart disposition headers cannot identify a unique test resource")
-        if not dispositions:
-            continue
-        parameters = message.get_params([], header="content-disposition", unquote=True)[1:]
-        names = [value for key, value in parameters if key.lower() == "name"]
-        filenames = [value for key, value in parameters if key.lower() == "filename"]
-        if len(names) > 1 or len(filenames) > 1:
-            raise EngineError("resource_ambiguous", "Repeated multipart disposition parameters cannot identify a unique test resource")
-        if names:
-            name = collapse_rfc2231_value(names[0]) if isinstance(names[0], tuple) else names[0]
-            if name in parts:
-                raise EngineError("resource_ambiguous", "Repeated multipart field names cannot identify a unique test resource")
-            parts[name] = {
-                "content": content[:-2] if content.endswith("\r\n") else content,
-                "filename": (collapse_rfc2231_value(filenames[0]) if isinstance(filenames[0], tuple) else filenames[0]) if filenames else None,
-            }
-    return parts
+    from .inputs import parse_multipart
+    wire = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+    try:
+        parsed = parse_multipart(wire, content_type)
+    except EngineError as exc:
+        if exc.code == "input_ambiguous":
+            raise EngineError("resource_ambiguous", "Multipart framing or disposition does not identify a unique test resource", exc.details) from exc
+        raise
+    return {name: {**part, "content": wire[part["content_span"][0]:part["content_span"][1]]}
+            for name, part in parsed["parts"].items()}
+
+
+def _multipart_binding_value(value):
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="strict")
+        except UnicodeError:
+            return value
+    return value
 
 
 def _body_candidates(body, selector, content_type):
@@ -686,36 +728,42 @@ def _body_candidates(body, selector, content_type):
     names. A file part contributes both its content and filename; callers may bind
     either the uploaded bytes or the client-supplied filename.
     """
+    multipart_media = (content_type or "").split(";", 1)[0].strip().lower() == "multipart/form-data"
     if isinstance(body, (bytes, bytearray)):
-        raw = bytes(body).decode("utf-8", "replace")
+        wire = bytes(body)
+        raw = "" if multipart_media else bytes(body).decode("utf-8", "replace")
     elif isinstance(body, str):
+        wire = body.encode("utf-8")
         raw = body
     elif body is None:
         return []
     else:
         raw = canonical(body)
+        wire = raw.encode("utf-8")
+    parts = _multipart_parts(wire, content_type)
+    if parts:
+        from .inputs import multipart_selection
+        aliases = {"filename", "file.filename", "content", "file.content"}
+        if selector in parts and selector not in aliases and not selector.endswith((".filename", ".content")):
+            values = [_multipart_binding_value(parts[selector]["content"])]
+            if parts[selector]["filename"] is not None:
+                values.append(parts[selector]["filename"])
+            return values
+        try:
+            _, _, _, value = multipart_selection({"parts": parts}, wire, selector)
+        except EngineError as exc:
+            if exc.code == "input_binding":
+                return []
+            if exc.code == "input_ambiguous":
+                raise EngineError("resource_ambiguous", "Multipart selector matches multiple part or attribute interpretations", exc.details) from exc
+            raise
+        return [_multipart_binding_value(value)]
     if selector.startswith("/"):
         parsed = _jsonish(raw)
         try:
             return [pointer(parsed, selector)]
         except EngineError:
             return []
-    parts = _multipart_parts(raw, content_type)
-    if selector in parts:
-        values = [parts[selector]["content"]]
-        if parts[selector].get("filename"):
-            values.append(parts[selector]["filename"])
-        return values
-    if selector in {"filename", "file.filename"}:
-        values = [item["filename"] for item in parts.values() if item.get("filename")]
-        if len(values) > 1:
-            raise EngineError("resource_ambiguous", "A multipart filename alias matches multiple parts; bind the exact form field")
-        return values
-    if selector in {"content", "file.content"}:
-        values = [item["content"] for item in parts.values()]
-        if len(values) > 1:
-            raise EngineError("resource_ambiguous", "A multipart content alias matches multiple parts; bind the exact form field")
-        return values
     parsed = _jsonish(raw)
     found = _search_json_key(parsed, selector)
     if len(found) > 1:
@@ -782,6 +830,7 @@ def preflight_capture(project, args, *, for_identity=False):
     if not isinstance(args, dict):
         raise EngineError("arguments", "Capture arguments must be an object")
     operation = project.get("operation",args["operation_id"])
+    _validate_operation_inputs(operation)
     url = require_scope(project.config,args.get("url") or operation["url"])
     params = bind_operation(operation,url,operation["method"])
     if "{" in url or "}" in url:
@@ -870,6 +919,8 @@ def preflight_capture(project, args, *, for_identity=False):
         if "content-type" in headers and headers["content-type"].split(";",1)[0].lower() != operation["content_type"].split(";",1)[0]:
             raise EngineError("media_binding", "Request content type does not match operation")
         headers.setdefault("content-type",operation["content_type"])
+    if (headers.get("content-type") or "").split(";", 1)[0].strip().lower() == "multipart/form-data":
+        _multipart_parts(encoded_body, headers["content-type"])
     if operation["protocol"] == "graphql":
         try:
             doc = json.loads(body) if isinstance(body, (str, bytes)) else body
@@ -983,6 +1034,7 @@ def verify_identity(project,args):
     assertion = {k:args.get(k) for k in ("subject_selector","tenant_selector","roles_selector")}
     if not assertion["subject_selector"]:
         raise EngineError("identity_assertion", "A server-side subject JSON Pointer is required")
+    _identity_selector_boundary(assertion)
     evidence = capture(project,args,for_identity=True)
     artifact = project.read_artifact(evidence)
     if not evidence["complete"] or artifact["response"]["status"] != 200:
@@ -1002,7 +1054,8 @@ def verify_identity(project,args):
         session.update(verified_at=now(),verification_evidence_id=evidence["id"],verification_assertion=assertion,
                        actor_signature=actor_signature(actor))
         project.put("session",session)
-    return {"session":public_session(session),"evidence_id":evidence["id"]}
+    return {"session":public_session(session),"evidence_id":evidence["id"],
+            "identity_assertion_limitation": "Distinct selectors verify declared values, not arbitrary field semantics. Use an authorized self-profile endpoint and actual subject-bound role and tenant membership; another account's fields are not identity proof."}
 
 
 def _path_shape(url):
@@ -1123,6 +1176,7 @@ def build_plan(project):
     for resource in resources:
         owned_by_operation.setdefault(resource["operation_id"], []).append(resource)
     for operation in project.list("operation"):
+        _validate_operation_inputs(operation)
         cases = []
         if operation["auth"] == "unknown":
             cases.append({"kind":"auth_review"})
@@ -1321,7 +1375,7 @@ def _tested_surfaces(obligations, status_by_id=None):
     return operation_ids, inputs
 
 
-def _method_coverage(project, tested_operation_ids=None):
+def _method_coverage(project, tested_operation_ids=None, *, current_observations=None):
     """Keep registration, complete observations and evaluated tests distinct."""
     if tested_operation_ids is None:
         tested_operation_ids = set()
@@ -1334,12 +1388,15 @@ def _method_coverage(project, tested_operation_ids=None):
             except (EngineError, OSError, ValueError, KeyError):
                 pass
     observed_operation_ids = set()
-    for evidence in project.list("evidence"):
-        try:
-            verify_current_evidence(project, evidence["id"])
-            observed_operation_ids.add(evidence["operation_id"])
-        except (EngineError, OSError, ValueError, KeyError):
-            pass
+    if current_observations is not None:
+        observed_operation_ids.update(evidence["operation_id"] for evidence in current_observations)
+    else:
+        for evidence in project.list("evidence"):
+            try:
+                verify_current_evidence(project, evidence["id"])
+                observed_operation_ids.add(evidence["operation_id"])
+            except (EngineError, OSError, ValueError, KeyError):
+                pass
     matrix = {}
     for operation in project.list("operation"):
         shape = _path_shape(operation["url"])
@@ -1401,6 +1458,8 @@ def _coverage_metrics(project, obligations, status_by_id=None):
 
 
 def evaluate_coverage(project):
+    for operation in project.list("operation"):
+        _validate_operation_inputs(operation)
     gaps, totals = [], {"total":0,"evaluated":0,"open":0,"blocked":0,"not_applicable":0}
     dependent = {}
     status_by_id = {}
@@ -1464,7 +1523,6 @@ def evaluate_coverage(project):
     evaluated = {"operations":len(project.list("operation")),"inputs":sum(len(o["inputs"]) for o in project.list("operation")),
         "obligations":totals["total"],**totals,"coverage_ratio":totals["evaluated"]/count if count else None,
         **metrics,
-        "method_coverage":_method_coverage(project, _tested_surfaces(all_obligations, status_by_id)[0]),
         "gaps":gaps,"gap_dependencies":dict(sorted(dependent.items())),"findings":findings,
         "limitations":["Coverage is limited to registered operations; an empty queue does not prove absence of vulnerabilities.",
             "coverage_ratio is obligation-weighted; surface_coverage is operation/input-weighted and is usually more readable.",

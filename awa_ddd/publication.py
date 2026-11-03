@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import math
 import re
 from urllib.parse import unquote
@@ -27,9 +28,9 @@ _ERROR_CODES = frozenset((
     "evidence_changed evidence_incomplete evidence_missing exclusion family_proof finalization_policy finalization_required "
     "finalization_stale finding_decision finding_fields finding_immutable finding_lifecycle finding_mode finding_replacement "
     "frontier_categories frontier_evidence frontier_pages frontier_review frontier_review_required function_id function_missing "
-    "graphql_binding headers headers_file idempotency_conflict identity_assertion identity_mismatch identity_origin "
+    "graphql_binding headers headers_file idempotency_conflict identity_assertion identity_selector_boundary identity_mismatch identity_origin "
     "identity_response identity_stale identity_unverified immutable_record inconclusive independent_evidence input "
-    "input_adapter_blocked input_ambiguous input_binding input_budget invalid_input json_assertion mcp_budget mcp_capability "
+    "input_adapter_blocked input_ambiguous input_binding input_budget input_selector input_schema_branch invalid_input json_assertion mcp_budget mcp_capability "
     "mcp_closed mcp_error mcp_io mcp_protocol mcp_schema mcp_timeout media_binding method not_found numeric_invariant "
     "obligation_superseded operation_binding operation_changed operation_effect operation_method operation_name oracle "
     "oracle_binding oracle_family origin out_of_scope ownership page_adoption_required page_binding page_evidence_invalid "
@@ -53,15 +54,33 @@ _ERROR_CODES = frozenset((
     "wsl_cleanup wsl_deadline wsl_input_budget wsl_io wsl_platform wsl_request xss_input_binding xss_runtime_binding xss_runtime_identity "
     "xss_runtime_required engine_error publication_failed capture_failed execution_interrupted browser_timeout "
     "browser_observation_incomplete tool_probe_failed tool_process_failed mcp_start_failed tscanplus_failed tscanplus_probe_failed "
-    "artifact_unreadable completed evidence_invalid execution_failed invalid invalid_operation missing_metadata no_injection "
+    "artifact_unreadable completed evidence_invalid execution_failed invalid invalid_operation missing_metadata no_injection multipart_framing "
+    "finding_proof finding_proof_current finding_binding finding_binding_lifecycle finding_binding_channel finding_binding_source finding_binding_duplicate "
     "page_adoption_failed timeout tool_lineage_invalid wsl_runtime sql_metadata_lineage"
+).split())
+_ERROR_CODES = _ERROR_CODES | frozenset((
+    "action_catalog capability_profile capability_provider known_case_entry known_case_group known_case_source "
+    "known_case_track route_manifest v2_campaign_missing v2_migration_confirm v2_migration_exists v2_oracle "
+    "v2_report_compare v2_report_final v2_report_path v2_report_stage v2_campaign_state v2_campaign_model "
+    "v2_campaign_exists v2_campaign_not_exhausted v2_campaign_checkpoint v2_campaign_delivery v2_campaign_frozen "
+    "v2_repository_kind v2_repository_record v2_repository_immutable v2_read_only v2_migration_required "
+    "v2_hypothesis_identity v2_hypothesis_transition v2_hypothesis_applicability v2_recipe_controls v2_recipe_effect "
+    "v2_recipe_fixture v2_recipe_variable v2_recipe_override v2_recipe_stale v2_run_transition v2_run_claim "
+    "v2_run_recipe v2_run_verify v2_run_inspect v2_finding_proof v2_finding_review v2_finding_replacement "
+    "v2_review_mechanism v2_review_controls v2_review_observation v2_review_scope v2_review_material v2_review_run "
+    "v2_review_hypothesis v2_review_reviewer v2_review_cross_role v2_review_disposition v2_review_bind "
+    "v2_review_evidence v2_review_identity v2_recon_import v2_write_authorization v2_scheduler_lease v2_fixture_state v2_fixture_lease "
+    "v2_fixture_initial_state v2_oracle_missing v2_browser_marker v2_browser_visit v2_external_receipt v2_external "
+    "v2_coverage v2_campaign_not_ready v2_migration_ledger v2_delivery_reason v2_campaign_state_reason "
+    "v2_recipe_blocked v2_timestamp v2_observe_effect v2_accepted_by v2_campaign_target v2_explanation"
 ).split())
 _LOCATOR_KEYS = {"url", "finalUrl", "path", "locator", "schema_locator", "source_locator", "selector",
                  "input_selector", "location", "consumer_url", "source_url", "consumer_locator",
                  "report", "summary", "manifest", "reproduction_dir", "target", "target_origin", "base_url"}
 _HANDLE_PREFIXES = {"operation": {"O"}, "obligation": {"OB"}, "evidence": {"E"}, "decision": {"D"},
                     "finding": {"F"}, "finding_revision": {"FR"}, "candidate": {"C"}, "run": {"RUN", "SC"},
-                    "page_visit": {"PV"}, "checkpoint": {"CP"}, "closure_review": {"CR"}, "finalization": {"FN"}}
+                    "page_visit": {"PV"}, "checkpoint": {"CP"}, "closure_review": {"CR"}, "finalization": {"FN"},
+                    "recon_baseline": {"RC"}}
 _LOCAL_ID_KINDS = {"actor", "session", "resource", "page", "function"}
 _LOCAL_PREFIXES = {"actor": "ACT", "session": "SES", "resource": "RES", "page": "PG", "function": "FN"}
 
@@ -99,6 +118,10 @@ def _digest(prefix, length=24):
 
 def _fields(names, rule=_TEXT):
     return {name: rule for name in names.split()}
+
+
+def _record_timestamps(kind, names):
+    return {name: _Rule("record_timestamp", (kind, name)) for name in names.split()}
 
 
 class PublicationContext:
@@ -210,6 +233,8 @@ class PublicationContext:
             and self._record(kind, value) is not None
 
     def _typed(self, value, rule, row=None):
+        if rule.kind == "record_timestamp":
+            return self._record_timestamp(value, rule.values, row)
         if value is None:
             return rule.kind not in {"count", "bool", "hex", "digest"}
         if rule.kind == "count":
@@ -266,6 +291,31 @@ class PublicationContext:
                                 self._paths.add(path)
             return value in self._paths
         return False
+
+    def _record_timestamp(self, value, reference, row):
+        if not isinstance(value, str) or not isinstance(row, dict) or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})", value) is None:
+            return False
+        try:
+            if datetime.fromisoformat(value.replace("Z", "+00:00")).utcoffset() is None:
+                return False
+        except ValueError:
+            return False
+        kind, field = reference
+        keys = ("id", kind + "_id") + (("visit_id",) if kind == "page_visit" else ())
+        identities = [row[key] for key in keys if key in row]
+        if not identities or any(not isinstance(identity, str) or not identity for identity in identities) \
+                or len(set(identities)) != 1:
+            return False
+        if not self.bound_handle(kind, identities[0]):
+            return False
+        actual = self._record(kind, identities[0])
+        if actual is None or actual.get(field) != value:
+            return False
+        # Only the actual ledger field is control data; ISO-shaped business text is not.
+        return all(type(row[key]) is type(actual.get(key)) and row[key] == actual.get(key) for key in (
+            "kind", "actor_id", "session_id", "session_generation", "generation", "operation_id", "resource_id")
+            if key in row and key not in keys)
 
     def _restore(self, original, public, schema):
         if isinstance(schema, dict) and isinstance(original, dict) and isinstance(public, dict):
@@ -359,10 +409,10 @@ class PublicationContext:
 
 
 def _schemas():
-    from .contracts import CONTRACTS
+    from .contracts import CONTRACTS, ALL_CONTRACTS
     from .engine import TEST_FAMILIES
 
-    action = _enum(*CONTRACTS)
+    action = _enum(*ALL_CONTRACTS)
     family = _enum("access_control", *TEST_FAMILIES)
     method = _enum("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
     auth = _enum("public", "authenticated", "restricted", "unknown")
@@ -407,13 +457,43 @@ def _schemas():
     session = {**_fields("verified_at expires_at created_at verification_assertion credential_header_names"),
                "id": _handle("session"), "actor_id": _handle("actor"), "generation": _COUNT,
                "verification_evidence_id": _handle("evidence"), "actor_signature": _digest("AS")}
+    session.update(_record_timestamps("session", "created_at verified_at expires_at renewed_at"))
     input_row = {**_fields("name selector consumer schema_branch schema_type array_template source schema_locator"),
                  "location": _enum("path", "query", "header", "cookie", "body", "graphql"),
-                 "required": _BOOL, "test_families": _Many(family)}
+                 "required": _BOOL, "test_families": _Many(family), "registration_error": _enum("input_not_object")}
     operation = {**_fields("url operation_name content_type allowed_roles sources created_at ownership_sampling"),
                  "id": _handle("operation"), "method": method, "protocol": _enum("http", "graphql"), "auth": auth,
                  "ownership": _BOOL, "state_scope": _enum("actor"), "input_count": _COUNT,
                  "inputs_truncated": _BOOL, "inputs": _Many(input_row)}
+    parameter_state = _enum("consumer_review", "tested", "observed_unassessed", "observation_limited", "needs_controls", "unobserved")
+    parameter_identity = {**_fields("input_name input_selector schema_branch"), "id": _digest("PC"),
+        "operation_id": _handle("operation"), "input_location": input_row["location"], "test_family": _enum("unclassified", "access_control", *TEST_FAMILIES)}
+    parameter_summary = {**_fields("parameter_total cell_total typed_tested_total untested_total observed_total variant_observed_total "
+                                  "needs_controls_total unobserved_total consumer_review_total observations_limited_total", _COUNT),
+                         "observation_is_testing": _Rule("false")}
+    parameter_row = {**parameter_identity, **_fields("url consumer"), "method": method, "status": parameter_state,
+        **_fields("typed_tested has_input_variant observations_limited schema_branch_requires_binding", _BOOL),
+        "observation_is_testing": _Rule("false"), "next_action": action,
+        **_fields("operation_observation_count observation_count", _COUNT),
+        "control_candidate_state": _enum("no_variant", "two_values", "three_values"),
+        "control_candidate_evidence_ids": _Many(_handle("evidence")),
+        "control_candidate_required_values": _COUNT,
+        "queue_status": _enum("ready", "review", "blocked", "closed", "unplanned"),
+        "missing_prerequisites": _Many(prerequisite), "outcome": _enum("confirmed", "refuted"), "proof_mode": _enum("machine", "analyst"),
+        "obligation_ids": _Many(_handle("obligation")), "evidence_ids": _Many(_handle("evidence")), "decision_id": _handle("decision"),
+        "observation_errors": _fields("schema_branch_requires_binding input_view_unavailable", _COUNT)}
+    parameter_page = {**page, "summary": parameter_summary, "items": _Many(parameter_row), "total": _COUNT,
+        "filter": _enum("any", "untested", "observed", "needs_controls", "tested", "consumer_review"), "limitation": _TEXT}
+    renewal_template = {"session_id": _handle("session"), "renew": _Rule("true")}
+    renewal_candidate = {"session_id": _handle("session"), "actor_id": _handle("actor"), "generation": _COUNT,
+        "expires_at": session["expires_at"], "prerequisites": _Many(prerequisite), "action": _enum("identity.session"),
+        "input_template": renewal_template, "automatic_execution_allowed": _Rule("false"), "renewal_is_login": _Rule("false")}
+    preparation = {"action": action, "reason": _TEXT, "instruction": _TEXT, "prerequisite": prerequisite,
+                   "automatic_execution_allowed": _Rule("false"), "required_input_fields": _Many(_TEXT),
+                   "input_template": {"operation_id": _handle("operation"), "actor_id": _handle("actor"), **renewal_template},
+                   "help_input": {"name": action}}
+    session_continuity = {"hint_only": _Rule("true"), "automatic_cookie_forwarding": _Rule("false"),
+        "anonymous_input_field": _enum("anonymous_cookie"), "authenticated_input_field": _enum("session_id"), "instructions": _Many(_TEXT)}
     gap = {**_fields("input_selector schema_branch tenant_boundary reason operator_reason scope_family consumer_family "
                      "reason_zh required_experiment_fields missing_prerequisites note_zh"),
            "id": _handle("obligation"), "gap_id": _handle("gap"), "obligation_id": _handle("obligation"),
@@ -424,7 +504,7 @@ def _schemas():
            "status": state, "input_location": input_row["location"], "test_family": family, "scope_family": family,
            "consumer_family": family, "next_action": action, "input_signature": _digest("I"),
            "reason_code": _enum("not_started", "decision_missing", "obligation_superseded", "evidence_invalid", "exclusion_evidence_invalid",
-                                "blocked_precondition", "declared_blocker_unverified", "declared_review_blocker_unverified"), "operator_reason_invalid_type": _BOOL}
+                                "blocked_precondition", "declared_blocker_unverified", "declared_review_blocker_unverified", "input_identity_invalid"), "operator_reason_invalid_type": _BOOL}
     template = {**_fields("url body body_base64 body_file input_selector consumer schema_branch subject external_id request_binding"),
         "operation_id": _handle("operation"), "obligation_id": _handle("obligation"), "session_id": _handle("session"),
                 "resource_id": _handle("resource"), "actor_id": _handle("actor"), "page_visit_id": _handle("page_visit"),
@@ -447,6 +527,11 @@ def _schemas():
     browser_counts = _fields("required_total assisted_total call_needed_total invoke_now_total blocked_total "
                              "native_unsupported_total followup_total task_total", _COUNT)
     work = {**gap, **_fields("url help_input required_experiment_fields hypothesis_hint browser_handoff_note"), "method": method,
+            "parameter_coverage_id": _digest("PC"), "parameter_test_status": parameter_state,
+            "selected_input_observation_count": _COUNT, "selected_input_variant_observed": _BOOL,
+            "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_review_required": _BOOL,
+            "controls_are_candidates_only": _Rule("true"), "preparation_actions": _Many(preparation), "session_continuity": session_continuity,
+            "session_renewal_candidates": _Many(renewal_candidate),
             **_fields("observation_total", _COUNT), **_fields("execution_blocked hints_only blocker_reconciliation_required scope_binding_review_required", _BOOL),
             "url_requires_binding": _Rule("true"), "scope_binding_followup_action": _enum("http.preflight"),
             "scope_binding_required_input_fields": _Many(_enum("url")),
@@ -468,6 +553,7 @@ def _schemas():
     common_coverage = {**page, **_fields("operations inputs obligations total evaluated open blocked not_applicable added gap_total "
                                        "finding_total current_findings historical_findings obligation_total method_total method_offset method_next_offset", _COUNT),
         "coverage_ratio": _RATIO, "continuation": continuation, "completion": completion, "security_coverage": security,
+        "parameter_coverage_summary": parameter_summary, "parameter_coverage": parameter_page,
         "surface_coverage": surface_coverage, "gaps": _Many(gap), "gap_sample": _Many(gap), "method_coverage": _Many(methods),
         "obligation_items": _Many(gap), "coverage_by_kind": {name: bucket for name in
             ("baseline", "access", "ownership", "input_test", "auth_review", "input_review", "identity_setup", "ownership_setup")},
@@ -499,6 +585,7 @@ def _schemas():
         **_fields("tool_count returned_rows result_limit candidate_count new_candidates duplicate_candidates out_of_scope_rows unmapped_rows imported_candidates "
                   "candidate_total import_limit processed_rows omitted_candidates unsupported_rows asset_count", _COUNT)}
     run.update(_fields("traffic_requests traffic_responses total_rows reported_count reported_total reported_matched"))
+    run.update(_record_timestamps("run", "started_at finished_at completed_at"))
     run["files"] = _Many({"path": _Rule("path"), "bytes": _COUNT, "sha256": _SHA256, "complete": _BOOL})
     evidence = {**_fields("created_at artifact_path policy_snapshot credential_header_names error_code session_hint reason policy_changes"),
         "id": _handle("evidence"), "run_id": _handle("run"), "kind": _enum("http"), "operation_id": _handle("operation"),
@@ -514,13 +601,28 @@ def _schemas():
         "id": _handle("finding"), "decision_id": _handle("decision"), "evidence_ids": _Many(_handle("evidence")),
         "status": _enum("confirmed"), "mode": _enum("machine", "analyst"), "origin": _enum("independent", "hint_guided", "imported"),
         "severity": _enum("critical", "high", "medium", "low", "info"), "confirmed_scope": _enum("sql_behaviour", "database_metadata", "browser_execution"),
+        "verification_level": _enum("runtime_verified", "analyst_review", "unverified", "historical"),
         "lifecycle_status": _enum("active", "withdrawn", "superseded"), "lifecycle_revision_id": _handle("finding_revision"),
         "replacement_finding_id": _handle("finding"), "lifecycle_revision_count": _COUNT, "current": _BOOL, "evidence_current": _BOOL,
         "reason_code": _TEXT}
+    verification_assurance = {**_fields("runtime_verified analyst_review unverified historical code_hint hint_only other_unverified", _COUNT),
+        "hints_count_as_findings": _Rule("false"), "runtime_level_implies_full_coverage": _Rule("false"), "note_zh": _TEXT}
     candidate = {**_fields("kind url finalUrl method protocol name reason created_at updated_at source sources hint inputs locator path link"),
         "id": _handle("candidate"), "operation_id": _handle("operation"), "status": _enum("unverified", "linked", "dismissed"),
         "link": {**_fields("input_location input_selector linked_at"), "operation_id": _handle("operation")},
-        "candidate_closure": {"version": _COUNT, "basis": _enum("outside_scope", "duplicate_operation"), "operation_id": _handle("operation")}}
+        "candidate_closure": {"version": _COUNT, "basis": _enum("outside_scope", "duplicate_operation", "assessed_hint"),
+            "operation_id": _handle("operation"), "decision_ids": _Many(_handle("decision"))},
+        "verification_level": _enum("hint_only", "code_hint"), "suggested_test_families": _Many(family),
+        "source_kind": _enum("target_definition", "validator_export", "assessment_checklist"),
+        "validator_result": _enum("hint", "valid", "type_error", "param_error", "unregistered"),
+        "hints_only": _Rule("true"), "independent_evidence_required": _Rule("true"),
+        "usable_for_confirmation": _Rule("false"), "taint_proven": _Rule("false"), "consumer_declaration_allowed": _Rule("false"),
+        **_fields("method_requires_binding references_limited bindings_limited", _BOOL),
+        "binding_status": _enum("possible", "ambiguous", "unresolved"),
+        **_fields("sink category declared_type referenced_fields value_kind"), **_fields("source_line source_column", _COUNT),
+        "possible_input_bindings": _Many({**_fields("url protocol operation_name content_type input_name input_selector schema_branch request_locator"),
+            "method": method, "input_location": input_row["location"], "request_locator_count": _COUNT,
+            "matching_basis": _enum("same_bundle_field_name_only")})}
     browser_action = {**_fields("selector text message error reason finalUrl key value"), "index": _COUNT, "action_index": _COUNT,
         "action": _enum("click", "fill", "press", "wait", "waitForSelector"), "type": _enum("click", "fill", "press", "wait", "waitForSelector"), "ok": _BOOL}
     visit = {**_fields("url finalUrl title signals console dialogs source_meta forms inputs buttons links textLength selectorCount "
@@ -538,17 +640,23 @@ def _schemas():
         "actions": _Many(browser_action), "artifact_path": _Rule("path"), "screenshot": _Rule("path"), "html": _Rule("path"),
         "after_actions_html": _Rule("path"), "request_signature": _digest("BR"), "actor_signature": _digest("AS"),
         "page_ids": _Many(_handle("page")), "page_adoption": _enum("adopted", "incomplete")}
+    visit.update(_record_timestamps("page_visit", "created_at"))
     page_row = {**_fields("name url source trigger apis reason blocked_reason visited_at triggered_at created_at"),
         "id": _handle("page"), "page_id": _handle("page"), "function_id": _handle("function"), "page_visit_id": _handle("page_visit"),
         "visit_id": _handle("page_visit"), "visited": _BOOL, "triggered": _BOOL, "action_index": _COUNT,
         "visit_status": _enum("visited", "BLOCKED"), "trigger_status": _enum("triggered", "BLOCKED")}
     page_row["functions"] = _Many({**page_row, "id": _handle("function")})
-    frontier_row = {**_fields("reason evidence_ids page_visit_ids"), "status": _enum("reviewed", "planned", "not_applicable", "api_only", "blocked"),
+    frontier_row = {**_fields("reason evidence_ids page_visit_ids"), "status": _enum("reviewed", "planned", "completed", "not_applicable", "api_only", "blocked"),
                     "test_family": family, "evidence_ids": _Many(_handle("evidence")), "page_visit_ids": _Many(_handle("page_visit"))}
     frontier = {"complete": _BOOL, "discovery": frontier_row, "categories": _Many(frontier_row), "pages": frontier_row}
     checkpoint = {**_fields("label created_at"), "id": _handle("checkpoint"), "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64),
         "previous_checkpoint_id": _handle("checkpoint"), "progress_changed": _BOOL, "remaining": remaining,
-        "completion_status": completion["status"], "frontier_review": frontier}
+        "completion_status": completion["status"], "frontier_review": frontier,
+        "parameter_delta": {**_fields("comparison_available projection_complete items_truncated tested_comparison_available "
+                                      "variant_comparison_available tested_projection_complete variant_projection_complete", _BOOL),
+            **_fields("newly_tested_total newly_observed_variants_total reopened_total", _COUNT),
+            "newly_tested": _Many(parameter_identity), "newly_observed_variants": _Many(parameter_identity),
+            "observation_is_testing": _Rule("false")}}
     finalization = {**_fields("explanation reviewer created_at"), "id": _handle("finalization"), "checkpoint_id": _handle("checkpoint"),
         "snapshot_id": _digest("CS", 64), "reason": _enum("completed"), "reason_basis": _enum("engine_gate"),
         "stop_policy": _enum("exhaustion_only"), "stop_policy_version": _COUNT, "completion_status": completion["status"],
@@ -556,12 +664,59 @@ def _schemas():
     result = {name: {} for name in CONTRACTS}
     config = {**_fields("project_id target created_at external_tools"), "scope": _Many(_TEXT), "exclude": _Many(_TEXT),
               "allow_mutation": _BOOL, "schema_version": _COUNT}
+    from .security_hypotheses import SECURITY_PROPERTIES, MISSING_CONTEXT_CODES
+
+    recon_mode, recon_section = _enum("prepare", "aggregate"), _enum("overview", "technologies", "functions", "clues", "collection", "hypotheses")
+    recon_item = {**_fields("name category version signal reason url target_origin trigger required_input_fields"),
+        "kind": _enum("site", "api_operation", "page_function", "link", "form", "script", "http_baseline",
+                      "policy_and_input_context", "page_observation", "function_interaction", "scope_seed", "discovery_review"),
+        "method": method, "auth": operation["auth"], "confidence": _enum("hint"), "trust": _enum("unverified"),
+        "operation_id": _handle("operation"), "page_id": _handle("page"), "function_id": _handle("function"),
+        "page_visit_id": _handle("page_visit"), "evidence_id": _handle("evidence"),
+        "operation_ids": _Many(_handle("operation")), "matched_operation_ids": _Many(_handle("operation")),
+        "observation_state": _enum("observed", "not_observed", "not_checked"),
+        "interaction_state": _enum("observed", "not_observed", "not_checked"),
+        "inputs": _Many(input_row), "apis": _Many(_TEXT), "technologies": _Many(_TEXT),
+        **_fields("operation_total page_total input_total unknown_consumer_total unmapped_input_total", _COUNT),
+        **_fields("ambiguous external inputs_preview_truncated apis_preview_truncated input_review_required", _BOOL),
+        "declared_test_families": _Many(family), "action": action, "detail_action": action, "testing_action": action,
+        "automatic_execution_allowed": _Rule("false"), "profile_is_security_evidence": _Rule("false"),
+        "locator_requires_binding": _Rule("true"),
+        "input_template": {"operation_id": _handle("operation"), "obligation_id": _handle("obligation"), "page_id": _handle("page")},
+        "id": _digest("HYP"), "security_property": _enum(*sorted(SECURITY_PROPERTIES)),
+        **_fields("label_zh inference_basis controls_zh note_zh input_selector schema_branch"),
+        "input_location": input_row["location"], "suggested_test_families": _Many(family),
+        "source": {"kind": _enum("registered_operation"), "operation_id": _handle("operation"),
+                   "operation_signature": _digest("S"), "context_trust": _enum("declared")},
+        "observed_evidence_ids": _Many(_handle("evidence")), "observations_are_property_proof": _Rule("false"),
+        "missing_context": _Many(_enum(*sorted(MISSING_CONTEXT_CODES))), "hint_only": _Rule("true"),
+        "usable_for_confirmation": _Rule("false"), "next_action": action, "help_input": {"name": action}}
+    recon_summary = {**_fields("origin_total operation_total page_total function_total input_total technology_total clue_total "
+        "collection_task_total http_observation_total processed_observation_total current_observation_total "
+        "unusable_observation_total omitted_observation_total unobserved_operation_total unvisited_page_total unregistered_ui_page_total "
+        "unknown_consumer_total out_of_scope_clue_total out_of_scope_operation_total out_of_scope_api_reference_total "
+        "truncated_source_total parse_error_total hypothesis_total", _COUNT), "source_limited": _BOOL, "hypothesis_limited": _BOOL}
+    result["surface.recon"] = {**page, "mode": recon_mode, "section": recon_section, "items": _Many(recon_item), "total": _COUNT,
+        "summary": recon_summary, "stage": _enum("prepare_collection", "collect_missing_information", "ready_for_hypotheses"),
+        "baseline_id": _handle("recon_baseline"), "baseline_reused": _BOOL, "baseline_changed": _BOOL,
+        "delta": _fields("new_technology_total removed_technology_total new_function_total removed_function_total "
+                         "new_clue_total removed_clue_total", _COUNT),
+        "workflow": _Many(_enum("scope_and_identity", "pages_assets_and_api_sources", "functions_and_inputs", "information_baseline", "targeted_hypotheses")),
+        "requests_sent": _COUNT, "automatic_execution_allowed": _Rule("false"), "profile_is_security_evidence": _Rule("false"),
+        "completion_claim_allowed": _Rule("false"), "unknown_surface_exhausted": _Rule("false"), "next_action": action,
+        "collection_entry": {"action": _enum("surface.recon"), "input": {"mode": recon_mode, "section": recon_section, "limit": _COUNT}},
+        "hypothesis_entry": {"action": _enum("surface.recon"), "input": {"mode": recon_mode, "section": recon_section, "limit": _COUNT}},
+        "limitations": _Many(_TEXT)}
     result.update({"surface.register": operation, "surface.declare_consumer": {"operation_id": _handle("operation"), "input": input_row, "plan": {"added": _COUNT}},
         "identity.actor": actor, "identity.session": session,
-        "identity.resource": resource, "identity.verify": {"session": session, "evidence_id": _handle("evidence")},
+        "identity.resource": resource, "identity.verify": {"session": session, "evidence_id": _handle("evidence"),
+                                                          "identity_assertion_limitation": _TEXT},
         "surface.list": {**page, "operations": _Many(operation), "operation_total": _COUNT, "registration_is_testing": _BOOL},
         "surface.inspect": {**page, "operation": operation, "inputs": _Many(input_row), "input_total": _COUNT,
-                            "obligations": _Many(gap), "obligation_total": _COUNT, "obligations_truncated": _BOOL, "resources": _Many(resource)},
+                            "obligations": _Many(gap), "obligation_total": _COUNT, "obligations_truncated": _BOOL, "resources": _Many(resource),
+                            "inspection_limited": _BOOL, "help_input": {"name": action},
+                            "input_identity_error": {"code": _enum("input", "input_selector", "input_schema_branch"),
+                                "operation_id": _handle("operation"), "field": _TEXT}},
         "surface.batch": {**_fields("accepted rejected plan_added requests_sent", _COUNT), "next_action": action,
                           "results": _Many({"index": _COUNT, "status": _enum("accepted", "rejected"), "operation_id": _handle("operation"),
                                             "input_count": _COUNT, **_fields("error_code message"), "next_action": action, "help_input": {"name": action}})},
@@ -573,7 +728,8 @@ def _schemas():
         "plan.build": common_coverage, "plan.list": common_coverage, "report.coverage": common_coverage,
         "plan.next": {**common_coverage, **_fields("queue_total ready_total review_total blocked_total review_followup_total requests_sent", _COUNT),
             "work_items": _Many(work), "blocked_sample": _Many(work), "review_followups": _Many(checklist), "browser_testing_summary": browser_counts,
-            "queue_policy": _enum("family_round_robin"), "closure_action": action, "review_followup_action": action, "limitation": _TEXT},
+            "queue_policy": _enum("family_round_robin", "coverage_first"), "queue_fairness": _enum("family_and_operation_round_robin"),
+            "closure_action": action, "review_followup_action": action, "limitation": _TEXT},
         "plan.audit": {**common_coverage, **_fields("project_id technical_blindspots note_zh"),
             "layers": {"registered": _fields("operations inputs", _COUNT), "observed": _fields("operations http_observations browser_visits", _COUNT),
                        "assessed": _fields("operations valid_decisions current_findings", _COUNT),
@@ -591,7 +747,36 @@ def _schemas():
         "assessment.evaluate": {**_fields("oracle proof created_at reason"), "id": _handle("decision"), "obligation_id": _handle("obligation"),
             "operation_id": _handle("operation"), "operation_signature": _digest("S"), "outcome": _enum("observed", "denied", "confirmed", "refuted"),
             "mode": _enum("machine", "analyst"), "oracle_version": _COUNT, "evidence_ids": _Many(_handle("evidence"))},
+        "assessment.prepare": {**page, "continuation": continuation, "completion": completion,
+            "source": {"operation_id": _handle("operation"), "obligation_id": _handle("obligation"),
+                       "finding_id": _handle("finding"), "evidence_id": _handle("evidence")},
+            **_fields("total source_evidence_total requests_sent decisions_created", _COUNT),
+            "automatic_execution_allowed": _Rule("false"), "controls_are_candidates_only": _Rule("true"),
+            "note_zh": _TEXT, "evidence_reviews": _Many(evidence),
+            "items": _Many({"obligation_id": _handle("obligation"), "operation_id": _handle("operation"),
+                "obligation_kind": gap["obligation_kind"], "test_family": family, "status": state,
+                "actor_id": _handle("actor"), "baseline_actor_id": _handle("actor"), "resource_id": _handle("resource"),
+                **_fields("input_selector schema_branch required_experiment_fields note_zh"),
+                "input_location": input_row["location"],
+                "controls_are_candidates_only": _Rule("true"), "evidence_review_required": _Rule("true"),
+                **_fields("positive_machine_adapter runtime_binding_supported observations_limited schema_branch_requires_binding hints_only", _BOOL),
+                "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_required_values": _COUNT,
+                "control_review_blockers": _Many(_enum("roles_unverified", "actor_independence", "declared_access_policy")),
+                "decision_id": _handle("decision"), "outcome": _enum("confirmed", "refuted", "inconclusive"),
+                "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls"),
+                "suggested_action": action, "assessment_action": action, "input_template": template, "help_input": {"name": action},
+                "assessment_template": template, "suggested_test_families": _Many(family),
+                "scenario_run_ids": _Many(_handle("run")), "oracle_options": _Many({
+                    "oracle_type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"),
+                    "oracle_template": {"type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"), "test_family": family},
+                    **_fields("evidence_order required_fields conditional_fields"), "can_confirm": _BOOL,
+                    "help_input": {"name": action}})})},
         "finding.record": finding, "finding.list": {**page, "findings": _Many(finding), "finding_total": _COUNT},
+        "finding.bind": {"finding": finding, "previous_finding": finding,
+            "decision_id": _handle("decision"), "obligation_id": _handle("obligation"),
+            "requests_sent": _COUNT, "original_proof_preserved": _Rule("true"),
+            "revision": {**_fields("reviewer reason created_at"), "id": _handle("finding_revision"), "finding_id": _handle("finding"),
+                "previous_status": finding["lifecycle_status"], "status": finding["lifecycle_status"], "replacement_finding_id": _handle("finding")}},
         "finding.update": {"finding": finding, "original_proof_preserved": _BOOL,
             "revision": {**_fields("reviewer reason created_at"), "id": _handle("finding_revision"), "finding_id": _handle("finding"),
                 "previous_status": finding["lifecycle_status"], "status": finding["lifecycle_status"], "replacement_finding_id": _handle("finding")}},
@@ -609,6 +794,7 @@ def _schemas():
             "status": _enum("reviewed", "blocked", "reopen"), "evidence_ids": _Many(_handle("evidence"))}, "continuation": continuation, "requests_sent": _COUNT, "note": _TEXT},
         "plan.finalize": {"finalization": finalization, "continuation": continuation, "requests_sent": _COUNT, "note": _TEXT},
         "report.build": {**_fields("report summary manifest reproduction_dir generated_at"), "stage": _enum("draft", "final"),
+            "verification_assurance": verification_assurance,
             "completion": completion, "continuation": continuation, "finalization": finalization, "snapshot": _BOOL,
             "delivery_status": _enum("draft", "final-completed"),
             "report_sha256": _SHA256, "summary_sha256": _SHA256, "manifest_sha256": _SHA256},
@@ -618,10 +804,38 @@ def _schemas():
     for name in ("tool.probe", "tool.sqlmap", "tool.yakit_replay", "tool.tscanplus_request", "tool.tscanplus_results",
                  "tool.tscanplus_summary", "tool.tscanplus_routes", "tool.inspect"):
         result[name] = run
+    result["test.run"] = {
+        "outcome": _enum("observed", "supported", "refuted", "inconclusive", "effect_unknown"),
+        "run": {**_fields("id status mode error evaluation effect evidence_ids"), "id": _TEXT,
+                "status": _enum("prepared", "claimed", "dispatch_started", "response_saved", "effect_unknown",
+                                "evaluation_pending", "evaluated", "published", "failed", "cancelled", "interrupted"),
+                "effect": {"unknown": _BOOL, "reconciled": _BOOL, "kind": _enum("read_only", "test_resource_write", "unknown")},
+                "evidence_ids": _Many(_handle("evidence"))},
+        "finding": dict(result["finding.record"]),
+        "coverage_delta": {**_fields("tested finding_created family"), "tested": _COUNT, "finding_created": _BOOL},
+        "replayed": _BOOL, "requires_reconciliation": _BOOL, "notice": _TEXT,
+    }
+    result["test.inspect"] = {**_fields("private_capsule_available control_count"), "recipe": _TEXT, "run": _TEXT}
+    result["campaign.status"] = {
+        "campaign": _TEXT, "universe": _TEXT, "dimensions": _TEXT, "family_matrix": _TEXT,
+        "route_matrix": _TEXT, "consumer_matrix": _TEXT, "known_case_matrix": _TEXT,
+        "known_case_summary": _TEXT, "tool_yield": _TEXT, "finding_summary": _TEXT,
+        "delivery": _TEXT, "unplanned_family_count": _COUNT, "unregistered_route_count": _COUNT,
+        "open_hypothesis_count": _COUNT, "open_gap_count": _COUNT, "capabilities": _TEXT,
+        "next_action": _TEXT}
+    result["report.matrix"] = {
+        "campaign_id": _TEXT, "universe": _TEXT, "dimensions": _TEXT, "family_matrix": _TEXT,
+        "route_matrix": _TEXT, "consumer_matrix": _TEXT, "known_case_matrix": _TEXT,
+        "known_case_summary": _TEXT, "tool_yield": _TEXT, "finding_summary": _TEXT,
+        "delivery": _TEXT, "denominators": _TEXT, "computed_by": _TEXT}
     result["tool.artifact"] = {**_fields("content name trust finding_status"), "run_id": _handle("run"),
                                 **_fields("offset limit total_chars next_offset", _COUNT), "usable_for_confirmation": _BOOL}
     error = {"code": _enum(*_ERROR_CODES), "message": _TEXT, "details": {**_fields("field step_id reason missing_prerequisites"), "action": action,
         "next_action": action, "help_action": action, "help_input": {"name": action}, "continuation": continuation,
+        "test_family": family, "framing_issue": _enum("utf8_bom", "invalid_multipart"),
+        "repair": _enum("rewrite_utf8_without_bom", "rebuild_exact_multipart"),
+        "oracle_type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"),
+        "required_fields": _Many(_TEXT),
         "completion": completion, "checkpoint_action": action, "stop_policy": _enum("exhaustion_only"),
         "progress_export": {"action": action, "input": {"stage": _enum("draft")}},
         "run_id": _handle("run"), "operation_id": _handle("operation"), "obligation_id": _handle("obligation"),
@@ -658,7 +872,8 @@ def publish(project, action, result, *, minted=None):
     schema = _ACTION_SCHEMAS.get(action, {})
     if action == "run.inspect" and isinstance(result, dict) and result.get("kind") == "browser":
         schema = {**schema, **_ACTION_SCHEMAS["browser.visit"], "id": _handle("run"),
-                  "status": _enum("running", "interrupted", "succeeded", "failed")}
+                  "status": _enum("running", "interrupted", "succeeded", "failed"),
+                  **_record_timestamps("run", "started_at finished_at completed_at")}
     return PublicationContext(project, minted=minted).metadata(result, schema=schema)
 
 
@@ -704,6 +919,7 @@ def publish_report_summary(project, summary, *, extra_secrets=(), files=None):
     schema = {**_ACTION_SCHEMAS["report.build"], "format_version": _COUNT, "language": _enum("zh-CN"),
               "project_id": _TEXT, "generated_at": _TEXT, "scope": {"target": _TEXT, "scope": _Many(_TEXT), "exclude": _Many(_TEXT)},
               "coverage": coverage, "finding_groups": group, "operation_metadata": _Many(_ACTION_SCHEMAS["surface.register"]),
+              "verification_assurance": _ACTION_SCHEMAS["report.build"]["verification_assurance"],
               "unverified_candidates": _COUNT, "browser_coverage": _ACTION_SCHEMAS["page.coverage"],
               "external_tools": _Many(_ACTION_SCHEMAS["tool.inspect"]), "reproduction": reproduction,
               "reproduction_metadata_only": _BOOL, "reproduction_warnings": _TEXT,
@@ -883,7 +1099,7 @@ EXECUTION_ACTIONS = frozenset({"http.capture", "identity.verify", "scenario.run"
 OFFLINE_MUTATIONS = frozenset({"project.update", "project.import_pentest", "surface.register", "surface.batch", "surface.import",
     "surface.declare_consumer", "identity.actor", "identity.session", "identity.resource", "browser.import_mcp", "page.register",
     "page.adopt", "page.function", "page.mark", "plan.build", "plan.disposition", "plan.checkpoint", "plan.review", "plan.finalize",
-    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.update"})
+    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.bind", "finding.update"})
 
 
 def _persisted_run(project, action, args, previous, result=None, error=None, *, claimed=()):

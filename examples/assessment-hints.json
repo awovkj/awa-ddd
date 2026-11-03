@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "source_kind": "assessment_checklist",
+  "entries": [
+    {
+      "url": "/api/products",
+      "method": "GET",
+      "test_family": "sql_injection",
+      "inputs": [
+        { "name": "order", "location": "query", "selector": "order" }
+      ],
+      "result": "hint"
+    },
+    {
+      "url": "/api/merchant/register",
+      "method": "POST",
+      "test_family": "xss",
+      "inputs": [
+        { "name": "shop_name", "location": "body", "selector": "/shop_name" }
+      ],
+      "result": "hint"
+    },
+    {
+      "url": "/api/user/orders",
+      "method": "POST",
+      "test_family": "business_logic",
+      "inputs": [
+        { "name": "order_time", "location": "body", "selector": "/order_time" }
+      ],
+      "result": "hint"
+    }
+  ]
+}

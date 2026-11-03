@@ -32,6 +32,241 @@ async function shippedSourceManifest(files, installedRoot) {
   return rows;
 }
 
+async function verifyUpgradeSmoke(dispatch, installedRoot, fixtureRoot, workspace) {
+  const help = await dispatch('awa_project', 'action.help', { name: 'assessment.evaluate' }, null);
+  const oracleKinds = ['authorization', 'baseline', 'error_channel', 'extraction', 'semantic_negative',
+    'sql_metadata', 'state_invariant', 'state_transition'];
+  assert.deepEqual(Object.keys(help.oracle_contracts).sort(), oracleKinds);
+  for (const [kind, shape] of Object.entries(help.oracle_contracts)) {
+    assert.equal(shape.example.type, kind);
+    assert.ok(shape.required.includes('type'));
+    assert.ok(shape.evidence_order.length > 0 && shape.constraints.length > 0);
+  }
+  assert.deepEqual(help.oracle_contracts.extraction.required_for_typed,
+    ['test_family', 'expected_value', 'source_reference']);
+  assert.equal(help.runtime_proof_entry.action, 'finding.record');
+  assert.equal(help.oracle_contracts.analyst_runtime, undefined);
+  const preparationHelp = await dispatch('awa_project', 'action.help', { name: 'assessment.prepare' }, null);
+  assert.equal(preparationHelp.group, 'awa_assess');
+  for (const field of ['obligation_id', 'finding_id', 'evidence_id', 'operation_id', 'evidence_ids', 'offset', 'limit']) {
+    assert.equal(typeof preparationHelp.fields[field], 'string');
+  }
+  const bindingHelp = await dispatch('awa_project', 'action.help', { name: 'finding.bind' }, null);
+  assert.equal(bindingHelp.group, 'awa_assess');
+  assert.deepEqual(bindingHelp.required, ['finding_id', 'decision_id', 'reviewer', 'reason']);
+
+  // Keep new source-only hypotheses out of the existing release fixture's queue.
+  const projectId = 'package-upgrade';
+  const baseUrl = 'https://upgrade.invalid/';
+  const call = (name, action, input = {}) => dispatch(name, action, input, projectId);
+  await call('awa_project', 'project.create', { target: baseUrl, scope: [baseUrl] });
+  const definitionPath = join(fixtureRoot, 'upgrade-definition.json');
+  await writeFile(definitionPath, JSON.stringify({ version: 'fixture-v1', maxScore: 1,
+    vulns: [['/api/search', [['keyword', 'GET']], 'SQL\u6ce8\u5165', 1]] }));
+  const nativeHints = await call('awa_surface', 'surface.import', {
+    path: definitionPath, format: 'assessment_hints', base_url: baseUrl,
+  });
+  assert.deepEqual(nativeHints.operation_ids, []);
+  assert.equal(nativeHints.candidates, 1);
+  const exampleHints = await call('awa_surface', 'surface.import', {
+    path: join(installedRoot, 'examples', 'assessment-hints.json'), format: 'assessment_hints', base_url: baseUrl,
+  });
+  assert.deepEqual(exampleHints.operation_ids, []);
+  assert.equal(exampleHints.candidates, 3);
+  const hints = await call('awa_candidate', 'candidate.list', { limit: 10 });
+  assert.equal(hints.candidate_total, 4);
+  assert.equal(hints.counts.unverified, 4);
+  assert.deepEqual([...new Set(hints.candidates.map(candidate => candidate.kind))].sort(),
+    ['answer_key_hint', 'assessment_hint']);
+  for (const summary of hints.candidates) {
+    const { candidate, operation } = await call('awa_candidate', 'candidate.inspect', { candidate_id: summary.id });
+    assert.equal(operation, null);
+    assert.equal(candidate.status, 'unverified');
+    assert.equal(candidate.verification_level, 'hint_only');
+    assert.equal(candidate.hints_only, true);
+    assert.equal(candidate.independent_evidence_required, true);
+    assert.equal(candidate.usable_for_confirmation, false);
+    if (candidate.kind === 'answer_key_hint') {
+      assert.equal(candidate.method ?? null, null, 'GET parameter location must not invent an HTTP method.');
+      assert.equal(candidate.method_requires_binding, true);
+    }
+  }
+  assert.equal((await call('awa_surface', 'surface.list')).operation_total, 0);
+  await assert.rejects(call('awa_assess', 'finding.record', {
+    title: 'Unproven package answer-key claim', category: 'sql_injection', impact: 'Not established',
+    remediation: 'Obtain independent evidence', decision_id: hints.candidates[0].id,
+  }), error => error.code === 'not_found');
+  const findingsBeforeBinding = await call('awa_assess', 'finding.list');
+  assert.equal(findingsBeforeBinding.finding_total, 0);
+  await assert.rejects(call('awa_assess', 'finding.bind', {
+    finding_id: hints.candidates[0].id, decision_id: hints.candidates[0].id,
+    reviewer: 'package-offline-review', reason: 'A source-only candidate is not an existing finding or accepted typed proof.',
+  }), error => error.code === 'not_found');
+  assert.deepEqual(await call('awa_assess', 'finding.list'), findingsBeforeBinding,
+    'Rejected binding cannot promote a source-only record or create a finding.');
+
+  const javascriptPath = join(fixtureRoot, 'upgrade-client.js');
+  await writeFile(javascriptPath, [
+    "axios.post('/api/register', {shop_name: form.shop_name});",
+    'target.innerHTML = item.shop_name;',
+    "axios.get('/pay', {params: {redirect: route.query.redirect}});",
+    "const destination = route.query.redirect ?? '/orders';",
+    'window.location.href = destination;',
+    "throw new Error('SOURCE_MUST_NOT_EXECUTE');",
+    '',
+  ].join('\n'));
+  const javascript = await call('awa_surface', 'surface.import', {
+    path: javascriptPath, format: 'javascript', base_url: baseUrl,
+  });
+  assert.equal(javascript.operation_ids.length, 2);
+  const sinks = await call('awa_candidate', 'candidate.list', { kind: 'client_sink', limit: 10 });
+  assert.equal(sinks.candidate_total, 2);
+  const sinkNames = [];
+  for (const summary of sinks.candidates) {
+    const { candidate } = await call('awa_candidate', 'candidate.inspect', { candidate_id: summary.id });
+    sinkNames.push(candidate.sink);
+    assert.equal(candidate.status, 'unverified');
+    assert.equal(candidate.verification_level, 'hint_only');
+    assert.equal(candidate.hints_only, true);
+    assert.equal(candidate.independent_evidence_required, true);
+    assert.equal(candidate.taint_proven, false);
+    assert.equal(candidate.consumer_declaration_allowed, false);
+    assert.equal(candidate.usable_for_confirmation, false);
+    assert.equal(candidate.binding_status, 'possible');
+    assert.equal(candidate.possible_input_bindings.length, 1);
+    const navigation = candidate.sink === 'location.href';
+    const binding = candidate.possible_input_bindings[0];
+    assert.equal(binding.matching_basis, 'same_bundle_field_name_only');
+    assert.equal(binding.url, new URL(navigation ? 'pay' : 'api/register', baseUrl).href);
+    assert.equal(binding.method, navigation ? 'GET' : 'POST');
+    assert.equal(binding.input_location, navigation ? 'query' : 'body');
+    assert.equal(binding.input_selector, navigation ? 'redirect' : '/shop_name');
+    assert.deepEqual(candidate.referenced_fields, [navigation ? 'redirect' : 'shop_name']);
+    assert.equal(candidate.source_column, 1);
+    assert.equal(candidate.source_line, navigation ? 5 : 2);
+    assert.doesNotMatch(JSON.stringify(candidate), /SOURCE_MUST_NOT_EXECUTE/);
+  }
+  assert.deepEqual(sinkNames.sort(), ['innerHTML.assignment', 'location.href']);
+  for (const operationId of javascript.operation_ids) {
+    const inspected = await call('awa_surface', 'surface.inspect', { operation_id: operationId });
+    assert.ok(inspected.inputs.length > 0);
+    assert.ok(inspected.inputs.every(input => input.consumer === 'unknown'));
+    const prepared = await call('awa_assess', 'assessment.prepare', { operation_id: operationId, limit: 10 });
+    assert.deepEqual(Object.keys(prepared.source), ['operation_id']);
+    assert.equal(prepared.source.operation_id, operationId);
+    assert.equal(prepared.requests_sent, 0);
+    assert.equal(prepared.decisions_created, 0);
+    assert.equal(prepared.automatic_execution_allowed, false);
+    assert.equal(prepared.controls_are_candidates_only, true);
+    assert.equal(prepared.source_evidence_total, 0);
+    assert.deepEqual(prepared.evidence_reviews, []);
+    assert.ok(prepared.items.every(item => item.operation_id === operationId
+      && item.controls_are_candidates_only === true && item.control_candidate_evidence_ids.length === 0));
+    for (const input of inspected.inputs) {
+      const review = prepared.items.find(item => item.input_location === input.location
+        && item.input_selector === input.selector && (item.schema_branch ?? null) === (input.schema_branch ?? null));
+      assert.ok(review, 'The packaged preparation must retain the imported exact input selector.');
+      assert.equal(review.obligation_kind, 'input_review');
+      assert.equal(review.suggested_action, 'surface.declare_consumer');
+      assert.equal(review.positive_machine_adapter, false);
+    }
+  }
+  const openapiPath = join(fixtureRoot, 'upgrade-openapi.json');
+  await writeFile(openapiPath, JSON.stringify({ openapi: '3.0.3', info: { title: 'Offline proof-preparation fixture', version: '1' },
+    servers: [{ url: baseUrl }], paths: { '/health': { get: { security: [], responses: { 200: { description: 'ok' } } } } } }));
+  const openapi = await call('awa_surface', 'surface.import', { path: openapiPath, format: 'openapi' });
+  assert.equal(openapi.operation_ids.length, 1);
+  const policyPreparation = await call('awa_assess', 'assessment.prepare', { operation_id: openapi.operation_ids[0] });
+  assert.ok(policyPreparation.items.some(item => item.obligation_kind === 'auth_review'),
+    'An imported specification does not establish the runtime access policy.');
+  const publicOperation = await call('awa_surface', 'surface.register', {
+    url: new URL('health', baseUrl).href, method: 'GET', auth: 'public',
+  });
+  assert.equal(publicOperation.id, openapi.operation_ids[0]);
+  const publicPreparation = await call('awa_assess', 'assessment.prepare', { operation_id: openapi.operation_ids[0] });
+  assert.deepEqual(Object.keys(publicPreparation.source), ['operation_id']);
+  assert.equal(publicPreparation.source.operation_id, openapi.operation_ids[0]);
+  assert.equal(publicPreparation.requests_sent, 0);
+  assert.equal(publicPreparation.decisions_created, 0);
+  assert.equal(publicPreparation.automatic_execution_allowed, false);
+  assert.ok(publicPreparation.items.some(item => item.obligation_kind === 'baseline'
+    && item.operation_id === openapi.operation_ids[0] && item.control_candidate_evidence_ids.length === 0));
+  await call('awa_surface', 'surface.register', { url: new URL('parameters', baseUrl).href, method: 'GET', auth: 'public',
+    inputs: Array.from({ length: 3 }, (_, index) => ({ name: `q${index}`, location: 'query',
+      consumer: 'business_input', test_families: ['generic'] })),
+  });
+  const next = await call('awa_plan', 'plan.next', { offset: 999, limit: 1,
+    parameter_offset: 1, parameter_limit: 2, parameter_status: 'untested' });
+  assert.equal(next.requests_sent, 0);
+  assert.deepEqual(next.work_items, []);
+  const matrix = next.parameter_coverage;
+  assert.equal(matrix.offset, 1);
+  assert.equal(matrix.limit, 2);
+  assert.equal(matrix.filter, 'untested');
+  assert.ok(matrix.total >= 5);
+  assert.equal(matrix.items.length, 2);
+  assert.equal(matrix.next_offset, 3);
+  assert.equal(matrix.summary.typed_tested_total, 0);
+  assert.equal(matrix.summary.observed_total, 0);
+  assert.equal(matrix.summary.observation_is_testing, false);
+  assert.ok(matrix.items.every(item => item.typed_tested === false && item.observation_count === 0));
+  const following = await call('awa_plan', 'plan.next', { offset: 0, limit: 1,
+    parameter_offset: matrix.next_offset, parameter_limit: 2, parameter_status: 'untested' });
+  assert.equal(following.parameter_coverage.offset, 3);
+  assert.ok(following.parameter_coverage.items.every(item => !matrix.items.some(previous => previous.id === item.id)));
+  const tested = await call('awa_plan', 'plan.next', { limit: 1, parameter_status: 'tested' });
+  assert.equal(tested.parameter_coverage.total, 0);
+  assert.deepEqual(tested.parameter_coverage.items, []);
+  const consumerReview = await call('awa_plan', 'plan.audit', { offset: 999, limit: 1,
+    parameter_offset: 0, parameter_limit: 1, parameter_status: 'consumer_review' });
+  assert.equal(consumerReview.requests_sent, 0);
+  assert.ok(consumerReview.parameter_coverage.total >= 2);
+  assert.equal(consumerReview.parameter_coverage.items.length, 1);
+  assert.equal(consumerReview.parameter_coverage.next_offset, 1);
+  assert.equal(consumerReview.parameter_coverage.items[0].status, 'consumer_review');
+
+  const multipart = await call('awa_surface', 'surface.register', {
+    url: new URL('multipart-fixture', baseUrl).href, method: 'GET', auth: 'public',
+  });
+  const wire = Buffer.from('--PackageBoundary\r\nContent-Disposition: form-data; name="file"; filename="fixture.png"\r\n'
+    + 'Content-Type: application/octet-stream\r\n\r\nPACKAGE_PRIVATE_BODY\r\n--PackageBoundary--\r\n', 'utf8');
+  const bomWire = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), wire]);
+  const bomPath = join(fixtureRoot, 'upgrade-multipart-bom.bin');
+  await writeFile(bomPath, bomWire);
+  const preflight = { operation_id: multipart.id, effect: 'read_only',
+    headers: { 'Content-Type': 'multipart/form-data; boundary=PackageBoundary' } };
+  await assert.rejects(call('awa_execute', 'http.preflight', { ...preflight, body_file: bomPath }), error => {
+    assert.equal(error.code, 'multipart_framing');
+    assert.equal(error.details.framing_issue, 'utf8_bom');
+    assert.equal(error.details.repair, 'rewrite_utf8_without_bom');
+    assert.equal(error.details.next_action, 'http.preflight');
+    assert.doesNotMatch(JSON.stringify(error.details), /PACKAGE_PRIVATE_BODY|PackageBoundary/);
+    return true;
+  });
+  assert.deepEqual(await readFile(bomPath), bomWire, 'Preflight must not silently repair or rewrite caller bytes.');
+  const validPath = join(fixtureRoot, 'upgrade-multipart-valid.bin');
+  await writeFile(validPath, wire);
+  const valid = await call('awa_execute', 'http.preflight', { ...preflight, body_file: validPath });
+  assert.equal(valid.ready, true);
+  assert.equal(valid.requests_sent, 0);
+  assert.equal(valid.body_bytes, wire.length);
+  assert.equal((await call('awa_project', 'project.status')).run_total, 0);
+  const { stdout } = await run(pythonExecutable, ['-E', '-s', '-X', 'utf8', '-B', '-c', String.raw`
+import json, pathlib, sqlite3, sys
+database = pathlib.Path(sys.argv[1]) / "projects" / sys.argv[2] / "assessment.sqlite3"
+with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    counts = dict(connection.execute("SELECT kind, COUNT(*) FROM entities GROUP BY kind"))
+print(json.dumps({kind: counts.get(kind, 0) for kind in ("run", "evidence", "decision", "finding")}))
+`, workspace, projectId], options);
+  const counts = JSON.parse(stdout);
+  assert.deepEqual(counts, { run: 0, evidence: 0, decision: 0, finding: 0 });
+  return { oracle_discriminators: oracleKinds.length, assessment_hint_candidates: hints.candidate_total,
+    client_sink_candidates: sinks.candidate_total, parameter_cells: matrix.summary.cell_total,
+    typed_tested_parameters: matrix.summary.typed_tested_total, multipart_bom_error: 'multipart_framing',
+    multipart_bom_repair: 'rewrite_utf8_without_bom', proof_preparation_operations: javascript.operation_ids.length + openapi.operation_ids.length,
+    finding_bind_unproven_rejected: true, requests_sent: 0, decisions_created: 0, automatic_execution_allowed: false, entity_counts: counts };
+}
+
 try {
   assert.ok(process.env.npm_execpath, 'Run this check with npm run pack:check.');
   const { stdout } = await run(process.execPath, [process.env.npm_execpath, 'pack', '--ignore-scripts', '--offline',
@@ -42,12 +277,24 @@ try {
     'src/index.mjs', 'src/bridge.mjs', 'src/tools.mjs', 'src/actions.mjs', 'src/tool-guidance.mjs',
     'src/parse-js.mjs', 'src/mode.mjs', 'src/stop-policy.mjs', 'src/host-continuation.mjs', 'src/client.js',
     'scripts/invoke-request.mjs', 'scripts/Invoke-AwaDdd.ps1', 'skills/awa-ddd/SKILL.md',
-    'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/UPGRADE-20261031.md', 'docs/REPRODUCTION.md',
+    'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/UPGRADE-20261031.md', 'docs/UPGRADE-20261101.md',
+    'docs/UPGRADE-20261102.md', 'docs/UPGRADE-20261102-LEAN.md', 'docs/SESSION-20261102-ADAAE1EF.md',
+    'docs/UPGRADE-20261103.md', 'docs/SESSION-20261103-CFF22367.md',
+    'docs/V2-ARCHITECTURE.md', 'docs/V2-MIGRATION.md', 'docs/V2-ACCEPTANCE.md',
+    'docs/REPRODUCTION.md', 'examples/assessment-hints.json',
     'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md', 'docs/PLAYWRIGHT_TESTING.md',
     ...['__init__', '__main__', 'store', 'engine', 'scope', 'transport', 'assessment', 'scenario',
-      'discovery', 'importers', 'reporting', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
+      'discovery', 'importers', 'reporting_legacy', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
       'mcp_http', 'tscanplus',
-      'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction', 'publication'].map(module => `awa_ddd/${module}.py`)];
+      'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction', 'publication',
+      'parameter_coverage', 'oracle_contracts', 'assessment_hints', 'reconnaissance', 'recon_parsing',
+      'assessment_preparation', 'finding_binding', 'security_hypotheses', 'v2api'].map(module => `awa_ddd/${module}.py`),
+    ...['__init__', 'universe', 'hypothesis', 'test_recipe', 'test_run', 'finding', 'coverage_claim', 'campaign',
+      'known_case', 'gap', 'review', 'common', 'repository'].map(module => `awa_ddd/domain/${module}.py`),
+    ...['__init__', 'scheduler', 'known_cases', 'route_parser', 'hypotheses', 'coverage', 'campaign', 'migration'].map(module => `awa_ddd/planning/${module}.py`),
+    ...['__init__', 'test_runner', 'browser_provider', 'external_provider', 'capabilities', 'fixtures',
+      'oracle_profiles', 'recipe_builder', 'review_engine'].map(module => `awa_ddd/execution/${module}.py`),
+    'awa_ddd/reporting/__init__.py', 'awa_ddd/reporting/matrix.py'];
   for (const file of required) assert.ok(files.has(file), `Release is missing ${file}`);
   for (const file of files) {
     assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|node_modules|__pycache__|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|htmlcov|coverage|projects|tests|backups?)(?:\/|$)/);
@@ -144,7 +391,9 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
   assert.equal(mode.penetrationProjection.key, 'penetration');
   const stopPolicy = await import(pathToFileURL(join(installedRoot, 'src', 'stop-policy.mjs')).href);
   assert.deepEqual(stopPolicy.inject, ['systemPrompt']);
-  assert.match(stopPolicy.STOP_POLICY_TEXT, /Automatic finalization is exhaustion-only/);
+  assert.match(stopPolicy.STOP_POLICY_TEXT, /Finalization is exhaustion_only/);
+  assert.match(stopPolicy.STOP_POLICY_TEXT, /plan\.finalize accepts only reason:completed/);
+  assert.match(stopPolicy.STOP_POLICY_TEXT, /A normal host turn end is not assessment completion/);
   const hostContinuation = await import(pathToFileURL(join(installedRoot, 'src', 'host-continuation.mjs')).href);
   assert.equal(hostContinuation.TURN_STOPPING_EVENT, 'agent/turn-stopping');
   assert.equal(typeof hostContinuation.createController, 'function');
@@ -182,6 +431,29 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(inventory.operation_total, 2);
     assert.equal(inventory.operations.length, 1);
     assert.equal(inventory.registration_is_testing, false);
+    const reconHelp = await dispatch('awa_project', 'action.help', { name: 'surface.recon' }, null);
+    assert.equal(reconHelp.group, 'awa_surface');
+    assert.deepEqual(Object.keys(reconHelp.fields).sort(), ['limit', 'mode', 'offset', 'section']);
+    const reconPrepare = await dispatch('awa_surface', 'surface.recon', { mode: 'prepare', section: 'collection', limit: 1 });
+    assert.equal(reconPrepare.requests_sent, 0);
+    assert.equal(reconPrepare.baseline_id, null);
+    assert.equal(reconPrepare.profile_is_security_evidence, false);
+    const recon = await dispatch('awa_surface', 'surface.recon', { mode: 'aggregate' });
+    const reusedRecon = await dispatch('awa_surface', 'surface.recon', { mode: 'aggregate' });
+    assert.match(recon.baseline_id, /^RC-[a-f0-9]{24,32}$/);
+    assert.equal(reusedRecon.baseline_id, recon.baseline_id);
+    assert.equal(reusedRecon.baseline_reused, true);
+    assert.equal(recon.summary.current_observation_total, 0);
+    assert.equal(recon.requests_sent, 0);
+    assert.equal(recon.completion_claim_allowed, false);
+    assert.equal((await dispatch('awa_project', 'project.status')).run_total, 0);
+    const parserSmoke = await run(pythonExecutable, ['-E', '-s', '-X', 'utf8', '-B', '-c',
+      'import json; from awa_ddd.recon_parsing import parse_response; print(json.dumps(parse_response("https://example.invalid/", '
+      + '[("server","nginx/1.26.2"),("content-type","text/html")], b"<html><script src=\'/_next/app.js\'></script></html>")))'],
+    { ...options, cwd: installedRoot });
+    const passiveHints = JSON.parse(parserSmoke.stdout);
+    assert.ok(passiveHints.technologies.some(item => item.name === 'Next.js' && item.confidence === 'hint'));
+    assert.ok(passiveHints.technologies.some(item => item.name === 'nginx' && item.version === '1.26.2'));
     const planned = await dispatch('awa_plan', 'plan.build', { limit: 1 });
     assert.equal(typeof planned.obligations, 'number');
     assert.equal(planned.obligation_items.length, 1);
@@ -217,6 +489,20 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(agent.inbox.nextStep[0].source.kind, 'awa-ddd-host-continuation');
     assert.match(agent.inbox.nextStep[0].content[0].text, /OFFLINE/);
     await dispatch('awa_plan', 'plan.disposition', blocker.input_template);
+    // A new real disposition can rearm once; identical consumed handoffs cannot loop.
+    const consumeNotice = async () => hooks.get('agent/pre-step')(boundary,
+      async () => ({ kind: 'enter', messages: agent.inbox.nextStep.splice(0) }));
+    await consumeNotice();
+    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
+    assert.equal(agent.inbox.nextStep.length, 1);
+    await consumeNotice();
+    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
+    assert.equal(agent.inbox.nextStep.length, 0, 'An unchanged packaged handoff must settle unfinished, not queue duplicate notices.');
+    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
+    assert.equal(agent.inbox.nextStep.length, 0);
+    const unfinished = await dispatch('awa_project', 'project.status');
+    assert.equal(unfinished.continuation.continue_required, true);
+    assert.equal(unfinished.continuation.automatic_stop_allowed, false);
     assert.equal((await dispatch('awa_project', 'project.status')).run_total, 0);
     const closure = await dispatch('awa_plan', 'plan.audit', { limit: 1 });
     assert.equal(closure.requests_sent, 0);
@@ -318,6 +604,7 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     }
     assert.doesNotMatch(reportBytes.toString('utf8') + summaryBytes.toString('utf8'), new RegExp(credential));
     assert.equal((await readFile(join(workspace, 'projects', 'package-smoke', 'assessment.sqlite3'))).subarray(0, 15).toString(), 'SQLite format 3');
+    const upgradeSmoke = await verifyUpgradeSmoke(dispatch, installedRoot, stage, workspace);
     assert.deepEqual(await shippedSourceManifest(files, installedRoot), publishedSource,
       'Release sources changed during package validation; rerun the check.');
     const retainedArchive = join(validation, packed.filename);
@@ -330,7 +617,7 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
       archive_sha256: archiveDigest,
       source_sha256: createHash('sha256').update(JSON.stringify(publishedSource)).digest('hex'),
       source_files: publishedSource,
-      sdk_entry: 'extracted package/src/index.mjs', native_tool_groups: registered.length,
+      sdk_entry: 'extracted package/src/index.mjs', native_tool_groups: registered.length, upgrade_smoke: upgradeSmoke,
       checks: ['archive contents', 'current source byte equality before and after smoke', 'current packaged version and retained archive SHA-256', 'native SDK tool definitions', 'Python bridge', 'SQLite persistence',
         'OpenAPI import', 'JavaScript AST/acorn import', 'private session summary', 'shared plan/coverage evaluator',
         'stable gap projection', 'candidate ledger round-trip and unverified dismissal review', 'penetration mode module and client entry',
@@ -338,6 +625,17 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
         'active bound offline steering through the extracted entry with a fixture Agent',
         'caller-only blocked ready work retains an offline reconciliation template; zero target runs',
         'packaged action/help catalog equality', 'native runtime inventory', 'bounded inventory/readiness',
+        'packaged information-first prepare/aggregate and non-proof semantic baseline reuse with zero traffic',
+        'packaged passive framework/server parser emits only source hints without code or network execution',
+        'packaged consumed unchanged host handoffs settle unfinished rather than looping notices',
+        'packaged eight-discriminator oracle help and typed extraction contract',
+        'packaged native and normalized assessment hints stay unverified with no finding or guessed method',
+        'packaged JavaScript HTML/navigation sinks retain uncertain input bindings without source execution',
+        'packaged assessment.prepare help and exact imported JS/OpenAPI targets retain zero requests, zero decisions and no execution authority',
+        'packaged finding.bind help and rejected source-only binding preserve the finding ledger',
+        'packaged exact-parameter coverage has independent pagination and untested/consumer-review filters',
+        'packaged multipart BOM preflight rejects with repair; valid control remains offline and caller bytes unchanged',
+        'upgrade fixture read-only SQLite confirms zero runs, evidence, decisions and findings',
         'offline plan.build/http.preflight with no run claims', 'packaged UTF-8 BOM input and no-BOM result CLI',
         'read-only completion/category audit', 'draft is not a stop record', 'persisted round checkpoint',
         'ready/review work rejects completed finalization', 'caller-declared budget/user/authorization/blocked exits rejected',
@@ -348,7 +646,7 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
   } finally {
     dispose();
   }
-  process.stdout.write('Package smoke passed: extracted entry/public hook, caller-block and candidate reconciliation, Python/SQLite, UTF-8 file CLI and draft report.\n');
+  process.stdout.write('Package smoke passed: extracted entry/public hook, oracle/hint/parameter/sink/multipart and offline proof-preparation/binding fixtures, caller-block and candidate reconciliation, Python/SQLite, UTF-8 file CLI and draft report.\n');
 } catch (error) {
   await writeFile(recordPath, JSON.stringify({ result: 'failed', started_at: startedAt,
     finished_at: new Date().toISOString(), code: String(error.code || error.name || 'PACKAGE_CHECK_FAILED') }, null, 2) + '\n');

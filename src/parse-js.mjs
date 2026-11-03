@@ -4,7 +4,7 @@ const LIMIT = 8 * 1024 * 1024;
 const UNKNOWN = Symbol('unknown');
 const AXIOS = Object.freeze({client: 'axios', baseURL: ''});
 const FETCH = Object.freeze({client: 'fetch'});
-const result = {operations: [], candidates: [], limitations: []};
+const result = {operations: [], candidates: [], client_sinks: [], limitations: []};
 const seenLimits = new Set();
 let visited = 0;
 
@@ -20,12 +20,49 @@ function tick(depth = 0) {
   if (++visited > 300000 || depth > 100) throw new Error('ast_budget_exceeded');
 }
 class Scope {
-  constructor(parent = null) { this.parent = parent; this.bindings = new Map(); }
+  constructor(parent = null, varRoot = false) {
+    this.parent = parent; this.bindings = new Map();
+    this.varScope = varRoot ? this : parent?.varScope || this;
+  }
   lookup(name) { return this.bindings.has(name) ? this.bindings.get(name) : this.parent?.lookup(name); }
 }
 const validName = value => typeof value === 'string' && value.length > 0 && value.length <= 1024 && !/[\u0000-\u001f]/.test(value);
 const pointer = value => value.replaceAll('~', '~0').replaceAll('/', '~1');
-let mutated;
+const scopes = new WeakMap();
+
+function patternTargets(node, visit, depth = 0) {
+  if (!node) return;
+  tick(depth);
+  if (node.type === 'Identifier' || node.type === 'MemberExpression') visit(node);
+  else if (node.type === 'ObjectPattern') {
+    for (const property of node.properties) patternTargets(property.type === 'RestElement' ? property.argument : property.value, visit, depth + 1);
+  } else if (node.type === 'ArrayPattern') {
+    for (const element of node.elements) patternTargets(element, visit, depth + 1);
+  } else if (node.type === 'AssignmentPattern') patternTargets(node.left, visit, depth + 1);
+  else if (node.type === 'RestElement') patternTargets(node.argument, visit, depth + 1);
+}
+function bindPattern(node, scope) {
+  patternTargets(node, target => {
+    if (target.type === 'Identifier') scope.bindings.set(target.name, {value: UNKNOWN});
+  });
+}
+function hoistVars(root, scope) {
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || typeof node.type !== 'string') continue;
+    tick();
+    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'ClassDeclaration', 'ClassExpression'].includes(node.type)) continue;
+    if (node.type === 'VariableDeclaration' && node.kind === 'var') {
+      for (const declaration of node.declarations) bindPattern(declaration.id, scope);
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (['loc', 'start', 'end'].includes(key)) continue;
+      if (Array.isArray(value)) stack.push(...value.filter(child => child && typeof child === 'object'));
+      else if (value && typeof value === 'object') stack.push(value);
+    }
+  }
+}
 
 function declarations(body, scope) {
   for (let statement of body || []) {
@@ -37,8 +74,10 @@ function declarations(body, scope) {
       }
     } else if (statement.type === 'VariableDeclaration') {
       for (const declaration of statement.declarations) {
-        if (declaration.id.type === 'Identifier') scope.bindings.set(declaration.id.name,
-          {node: declaration.init, scope, mutable: statement.kind !== 'const' || mutated.has(declaration.id.name)});
+        const targetScope = statement.kind === 'var' ? scope.varScope : scope;
+        if (declaration.id.type === 'Identifier') targetScope.bindings.set(declaration.id.name,
+          {node: declaration.init, scope, mutable: statement.kind !== 'const', constant: statement.kind === 'const'});
+        else bindPattern(declaration.id, targetScope);
       }
     } else if (['FunctionDeclaration', 'ClassDeclaration'].includes(statement.type) && statement.id) {
       scope.bindings.set(statement.id.name, {value: UNKNOWN});
@@ -200,6 +239,158 @@ function graphqlDocument(query) {
   }
   return names.length ? names : null;
 }
+
+function syntacticProperty(node) {
+  if (!node) return null;
+  const property = node.property || node.key;
+  if (!node.computed) return property?.name ?? property?.value;
+  return property?.type === 'Literal' && typeof property.value === 'string' ? property.value : null;
+}
+function navigationTarget(node, scope, depth = 0, seen = new Set()) {
+  if (!node || depth > 24 || seen.has(node)) return null;
+  seen.add(node);
+  if (node.type === 'Identifier') {
+    const binding = scope.lookup(node.name);
+    if (binding?.browserGlobal) return {binding, root: binding.browserGlobal, path: [], uncertain: binding.reassigned === true};
+    if (binding?.constant && binding.node) {
+      const target = navigationTarget(binding.node, binding.scope, depth + 1, seen);
+      return target ? {...target, uncertain: target.uncertain || binding.reassigned === true} : null;
+    }
+  } else if (node.type === 'MemberExpression') {
+    const target = navigationTarget(node.object, scope, depth + 1, seen);
+    return target ? {...target, path: [...target.path, syntacticProperty(node)]} : null;
+  }
+  return null;
+}
+function locationObject(original, originalScope, method) {
+  const target = navigationTarget(original, originalScope);
+  if (!target || !(target.root === 'location' && target.path.length === 0 ||
+      ['window', 'globalThis', 'document', 'self'].includes(target.root) && target.path.length === 1 && target.path[0] === 'location')) return false;
+  const changed = target.binding.navigationWrites.has('location') ||
+    method && target.binding.navigationWrites.has('location.' + method);
+  if (target.uncertain || changed) {
+    limitation('client_navigation_target_requires_review', original);
+    return false;
+  }
+  return true;
+}
+function recordNavigationWrite(writes, path) {
+  if (path[0] !== 'location' && path[0] !== null) return;
+  if (path.length === 1) writes.add('location');
+  else if (path.length === 2) {
+    for (const method of ['assign', 'replace']) if (path[1] === null || path[1] === method) writes.add('location.' + method);
+  }
+}
+function markMutation(node, scope) {
+  patternTargets(node, target => {
+    if (target.type === 'Identifier') {
+      const binding = scope.lookup(target.name);
+      if (binding) { binding.mutable = true; binding.reassigned = true; }
+      if (binding?.browserGlobal === 'location') binding.navigationWrites.add('location');
+      if (binding?.globalClient) binding.clientNamespace[binding.globalClient] = UNKNOWN;
+      return;
+    }
+    const navigation = navigationTarget(target, scope);
+    if (navigation) {
+      const path = navigation.root === 'location' ? ['location', ...navigation.path] : navigation.path;
+      recordNavigationWrite(navigation.binding.navigationWrites, path);
+      if (['window', 'globalThis', 'self'].includes(navigation.root) &&
+          (navigation.path[0] === null || ['fetch', 'axios'].includes(navigation.path[0]))) {
+        for (const name of ['fetch', 'axios']) {
+          if (navigation.path[0] !== null && name !== navigation.path[0]) continue;
+          navigation.binding.clientBindings[name].mutable = true;
+          navigation.binding.clientNamespace[name] = UNKNOWN;
+        }
+      }
+    }
+    let root = target.object;
+    while (root?.type === 'MemberExpression') root = root.object;
+    let rootScope = scope;
+    const seen = new Set();
+    while (root?.type === 'Identifier') {
+      const binding = rootScope.lookup(root.name);
+      if (!binding || seen.has(binding)) break;
+      seen.add(binding);
+      binding.mutable = true;
+      if (binding.globalClient) binding.clientNamespace[binding.globalClient] = UNKNOWN;
+      if (!binding.constant || binding.node?.type !== 'Identifier') break;
+      root = binding.node;
+      rootScope = binding.scope;
+    }
+  });
+}
+function sinkReferences(original, originalScope) {
+  const fields = new Set(), seen = new Set();
+  let limited = false;
+  function add(name) {
+    // Only syntactic field/identifier names, never resolved computed-key values.
+    if (typeof name !== 'string' || !/^[A-Za-z_$][A-Za-z0-9_$]{0,127}$/.test(name)) return;
+    if (fields.size < 64) fields.add(name);
+    else limited = true;
+  }
+  function visit(node, scope, depth = 0) {
+    if (!node || typeof node.type !== 'string') return;
+    tick(depth);
+    if (depth > 24 || seen.has(node)) { limited = true; return; }
+    seen.add(node);
+    if (node.type === 'Literal' || node.type === 'TemplateElement') return;
+    if (node.type === 'Identifier') {
+      const binding = scope.lookup(node.name);
+      if (binding?.node && !binding.mutable) visit(binding.node, binding.scope, depth + 1);
+      else add(node.name);
+      return;
+    }
+    if (node.type === 'MemberExpression') {
+      const name = syntacticProperty(node);
+      if (name === null) limited = true;
+      else add(name);
+      // The terminal field is the reference. Intermediate property names are
+      // not independently treated as submitted inputs or proven data sources.
+      if (!['Identifier', 'MemberExpression'].includes(node.object.type)) visit(node.object, scope, depth + 1);
+      if (node.computed && name === null) visit(node.property, scope, depth + 1);
+      return;
+    }
+    if (node.type === 'CallExpression' || node.type === 'NewExpression') {
+      if (node.callee?.type === 'MemberExpression') visit(node.callee.object, scope, depth + 1);
+      for (const argument of node.arguments || []) visit(argument, scope, depth + 1);
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (['loc', 'start', 'end', 'key'].includes(key)) continue;
+      if (Array.isArray(value)) for (const child of value) visit(child, scope, depth + 1);
+      else if (value && typeof value === 'object') visit(value, scope, depth + 1);
+    }
+  }
+  visit(original, originalScope);
+  return {referenced_fields: [...fields].sort(), references_limited: limited};
+}
+function analyzeSink(node, scope, parent) {
+  let sink, category, value;
+  if (node.type === 'AssignmentExpression' && node.left.type === 'MemberExpression') {
+    const property = syntacticProperty(node.left);
+    if (property === 'innerHTML') { sink = 'innerHTML.assignment'; category = 'html_execution'; value = node.right; }
+    else if (property === 'href' && locationObject(node.left.object, scope)) {
+      sink = 'location.href'; category = 'client_navigation'; value = node.right;
+    }
+  } else if (node.type === 'Property' && parent?.type === 'ObjectExpression' && node.kind === 'init' && syntacticProperty(node) === 'innerHTML') {
+    sink = 'innerHTML.object_property'; category = 'html_execution'; value = node.value;
+  } else if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression') {
+    const method = syntacticProperty(node.callee);
+    if (method === 'insertAdjacentHTML') { sink = 'insertAdjacentHTML'; category = 'html_execution'; value = node.arguments[1]; }
+    else if (['assign', 'replace'].includes(method) && locationObject(node.callee.object, scope, method)) {
+      sink = 'location.' + method; category = 'client_navigation'; value = node.arguments[0];
+    }
+  }
+  if (!sink) return;
+  if (result.client_sinks.length >= 2000) { limitation('client_sink_rows_truncated', node); return; }
+  const references = sinkReferences(value, scope);
+  const valueKind = !value ? 'dynamic' : value.type === 'Literal' ||
+    value.type === 'TemplateLiteral' && !value.expressions.length ? 'static' : 'reference';
+  result.client_sinks.push({sink, category, ...references, value_kind: valueKind,
+    locator: `line:${node.loc.start.line}:column:${node.loc.start.column + 1}`,
+    source_line: node.loc.start.line, source_column: node.loc.start.column + 1});
+  if (references.references_limited) limitation('client_sink_reference_requires_review', node);
+}
 function analyzeCall(node, scope) {
   let client, action, configNode, bodyNode, urlNode;
   if (node.callee.type === 'Identifier') {
@@ -277,61 +468,68 @@ function analyzeCall(node, scope) {
   if (!options) limitation('dynamic_request_options', node);
   if (result.operations.length + result.candidates.length > 10000) throw new Error('ast_row_budget_exceeded');
 }
-function walk(node, scope, depth = 0) {
+function walk(node, scope, depth = 0, prepare = false, parent = null) {
   if (!node || typeof node.type !== 'string') return;
   tick(depth);
-  if (node.type === 'Program' || node.type === 'BlockStatement') {
-    const inner = new Scope(scope);
-    declarations(node.body, inner);
-    for (const child of node.body) walk(child, inner, depth + 1);
-    return;
-  }
-  if (['FunctionDeclaration','FunctionExpression','ArrowFunctionExpression'].includes(node.type)) {
-    const inner = new Scope(scope);
-    for (const param of node.params) {
-      if (param.type === 'Identifier') inner.bindings.set(param.name, {value:UNKNOWN});
-      else {
-        const stack = [param];
-        while (stack.length) {
-          const item = stack.pop();
-          if (item.type === 'Identifier') inner.bindings.set(item.name, {value:UNKNOWN});
-          else if (item.type === 'ObjectPattern') stack.push(...item.properties.map(p => p.value || p.argument));
-          else if (item.type === 'ArrayPattern') stack.push(...item.elements.filter(Boolean));
-          else if (item.type === 'RestElement') stack.push(item.argument);
-          else if (item.type === 'AssignmentPattern') stack.push(item.left);
-        }
-        limitation('destructured_parameter_requires_review', param);
+  const outer = scope;
+  const block = ['Program', 'BlockStatement', 'StaticBlock'].includes(node.type);
+  const fn = ['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type);
+  if (prepare) {
+    if (block) {
+      scope = new Scope(scope, node.type !== 'BlockStatement');
+      if (node.type !== 'BlockStatement') hoistVars(node, scope);
+      declarations(node.body, scope);
+    } else if (fn) {
+      scope = new Scope(scope, true);
+      for (const param of node.params) {
+        bindPattern(param, scope);
+        if (param.type !== 'Identifier') limitation('destructured_parameter_requires_review', param);
       }
+      if (node.id) scope.bindings.set(node.id.name, {value: UNKNOWN});
+      hoistVars(node.body, scope);
+    } else if (node.type === 'CatchClause') {
+      scope = new Scope(scope);
+      bindPattern(node.param, scope);
+    } else if (['ForStatement', 'ForInStatement', 'ForOfStatement'].includes(node.type)) {
+      scope = new Scope(scope);
+      const declaration = node.init || node.left;
+      if (declaration?.type === 'VariableDeclaration') declarations([declaration], scope);
+    } else if (node.type === 'SwitchStatement') {
+      scope = new Scope(scope);
+      declarations(node.cases.flatMap(branch => branch.consequent), scope);
+    } else if (['ClassDeclaration', 'ClassExpression'].includes(node.type)) {
+      scope = new Scope(scope);
+      if (node.id) scope.bindings.set(node.id.name, {value: UNKNOWN});
     }
-    if (node.id) inner.bindings.set(node.id.name, {value:UNKNOWN});
-    walk(node.body, inner, depth + 1);
+    if (scope !== outer) scopes.set(node, scope);
+    if (node.type === 'AssignmentExpression') markMutation(node.left, scope);
+    else if (node.type === 'UpdateExpression' || node.type === 'UnaryExpression' && node.operator === 'delete') markMutation(node.argument, scope);
+    else if (['ForInStatement', 'ForOfStatement'].includes(node.type) && node.left.type !== 'VariableDeclaration') markMutation(node.left, scope);
+  } else scope = scopes.get(node) || scope;
+  if (block) {
+    for (const child of node.body) walk(child, scope, depth + 1, prepare, node);
     return;
   }
-  if (node.type === 'CallExpression') analyzeCall(node, scope);
-  if (node.type === 'ImportExpression') limitation('dynamic_import_not_loaded', node);
+  if (fn) {
+    for (const param of node.params) walk(param, scope, depth + 1, prepare, node);
+    walk(node.body, scope, depth + 1, prepare, node);
+    return;
+  }
+  if (node.type === 'SwitchStatement') {
+    walk(node.discriminant, outer, depth + 1, prepare, node);
+    for (const branch of node.cases) walk(branch, scope, depth + 1, prepare, node);
+    return;
+  }
+  if (!prepare) {
+    analyzeSink(node, scope, parent);
+    if (node.type === 'CallExpression') analyzeCall(node, scope);
+    if (node.type === 'ImportExpression') limitation('dynamic_import_not_loaded', node);
+  }
   for (const [key, value] of Object.entries(node)) {
     if (['loc','start','end'].includes(key)) continue;
-    if (Array.isArray(value)) for (const child of value) { if (child && typeof child === 'object') walk(child, scope, depth + 1); }
-    else if (value && typeof value === 'object') walk(value, scope, depth + 1);
+    if (Array.isArray(value)) for (const child of value) { if (child && typeof child === 'object') walk(child, scope, depth + 1, prepare, node); }
+    else if (value && typeof value === 'object') walk(value, scope, depth + 1, prepare, node);
   }
-}
-function collectMutations(ast) {
-  const names = new Set(), stack = [ast];
-  let total = 0;
-  while (stack.length) {
-    const node = stack.pop();
-    if (++total > 300000) throw new Error('ast_budget_exceeded');
-    if (!node || typeof node.type !== 'string') continue;
-    let target = node.type === 'AssignmentExpression' ? node.left : node.type === 'UpdateExpression' ? node.argument : null;
-    while (target?.type === 'MemberExpression') target = target.object;
-    if (target?.type === 'Identifier') names.add(target.name);
-    for (const [key, value] of Object.entries(node)) {
-      if (['loc','start','end'].includes(key)) continue;
-      if (Array.isArray(value)) stack.push(...value.filter(x => x && typeof x === 'object'));
-      else if (value && typeof value === 'object') stack.push(value);
-    }
-  }
-  return names;
 }
 
 try {
@@ -355,17 +553,26 @@ try {
       catch { limitation('javascript_syntax_not_supported'); }
     }
     if (ast) {
-      mutated = collectMutations(ast);
-      const scope = new Scope();
-      scope.bindings.set('fetch', {value:mutated.has('fetch') ? UNKNOWN : FETCH});
-      scope.bindings.set('axios', {value:mutated.has('axios') ? UNKNOWN : AXIOS});
+      const scope = new Scope(null, true);
+      const clientNamespace = {fetch: FETCH, axios: AXIOS};
+      const clientBindings = {fetch: {value: FETCH, globalClient: 'fetch', clientNamespace},
+        axios: {value: AXIOS, globalClient: 'axios', clientNamespace}};
+      const navigationWrites = new Set();
+      scope.bindings.set('fetch', clientBindings.fetch);
+      scope.bindings.set('axios', clientBindings.axios);
       for (const name of ['window', 'globalThis']) scope.bindings.set(name,
-        {value:mutated.has(name) ? UNKNOWN : {fetch:FETCH, axios:AXIOS}});
+        {value: clientNamespace, browserGlobal: name, navigationWrites, clientBindings, clientNamespace});
+      for (const name of ['location', 'document', 'self']) scope.bindings.set(name,
+        {value: UNKNOWN, browserGlobal: name, navigationWrites, clientBindings, clientNamespace});
+      // Bind scopes and writes before inference; later assignments cannot lend
+      // stale aliases or shadowed browser globals to an earlier request/sink.
+      walk(ast, scope, 0, true);
+      visited = 0;
       walk(ast, scope);
     }
   }
 } catch {
-  result.operations = []; result.candidates = [];
+  result.operations = []; result.candidates = []; result.client_sinks = [];
   limitation('javascript_analysis_budget_or_input_error');
 }
 process.stdout.write(JSON.stringify(result) + '\n');

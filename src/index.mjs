@@ -25,6 +25,7 @@ export const Config = z.object({
   wslDistribution: z.string().default('kali-linux').description('WSL distribution name. Use a separate assessment workspace for each execution environment.'),
   wslPythonExecutable: z.string().default('python3').description('Linux Python executable name or path for WSL, without shell arguments.'),
   timeoutMs: z.number().min(1000).max(600000).default(120000).description('Per-call engine timeout in milliseconds; cancellation is enforced by the bridge.'),
+  assessmentModel: z.union(['v1', 'v2']).default('v1').description('Tool surface model: v1 legacy groups or v2 campaign/recon/test/review/report groups. Existing projects remain readable either way; v2 execution requires a campaign.'),
   continuationGuard: z.boolean().default(true).description('Use the supported host turn-stopping hook for this agent\'s active assessment work. This never grants target authorization or overrides actual cancellation; engine finalization stays strict when disabled.'),
 });
 

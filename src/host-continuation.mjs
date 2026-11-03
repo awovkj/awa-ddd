@@ -10,6 +10,16 @@ const ARM_SET = new Set(ARM_ACTIONS);
 const COUNTS = ['ready_total', 'review_total', 'blocked_total', 'unresolved_total', 'actionable_total'];
 const MESSAGE_PROJECT_LIMIT = 8;
 
+function workKey(current) {
+  const value = current.continuation;
+  // Captures, checkpoint IDs and no_progress counters are not closure progress.
+  // Older compatible engines without progress_id fall back to their snapshot.
+  const progress = typeof value.progress_id === 'string' && value.progress_id
+    ? value.progress_id : value.snapshot_id;
+  return JSON.stringify([progress, current.kind, value.frontier_rounds,
+    value.frontier_review_required, value.can_finalize, value.coverage_status]);
+}
+
 function signalLike(signal) {
   return signal && typeof signal.aborted === 'boolean' && typeof signal.addEventListener === 'function'
     && typeof signal.removeEventListener === 'function';
@@ -51,9 +61,9 @@ function auditState(envelope) {
 }
 
 const RECOVERY_LINES = [
-  'For unauditable projects, exhaustion is NOT established. Attempt one bounded OFFLINE recovery: action.help for plan.audit -> project.status -> plan.audit at the current offset with a smaller page. Preserve an unfinished checkpoint/draft when available.',
-  'For those projects, do not send target traffic, retry uncertain writes, expand authorization or guess queue counts. Inspect/recover any recorded interrupted run offline and reconcile immutable existing evidence before considering an authorized retry.',
-  'If the same offline dependency failure persists, retain the unfinished binding and report the needed prerequisite; do not spin identical error retries or label it completed, user_stop or budget_exhausted.',
+  'Attempt one bounded OFFLINE recovery: awa_project action.help input:{name:"plan.audit"} -> project.status -> plan.audit with a smaller current page.',
+  'For those projects, do not send target traffic, retry uncertain writes, expand authorization or guess queue counts. Recover recorded runs offline.',
+  'If the dependency still fails, preserve an unfinished checkpoint/draft and state the prerequisite; do not spin retries or claim completion.',
 ];
 
 function continuationMessage(items, blocked, recoveryProjects = []) {
@@ -61,20 +71,17 @@ function continuationMessage(items, blocked, recoveryProjects = []) {
     continuation: compactContinuation(item.continuation) }));
   return createUserMessage({
     source: { kind: 'awa-ddd-host-continuation', form: 'notice',
-      summary: 'Current authorized assessment work or strict exhaustion review remains.' },
+      summary: 'Unfinished assessment: a new closure/frontier state needs attention.' },
     content: [{ type: 'text', text: [
-      'awa-ddd host continuation guard: this normally closing turn is not an assessment completion.',
-      'This is plugin-sourced context, not a user command or new authorization. Respect the current user intent, actual cancellation and existing scope/identity/fixture limits.',
-      'Continue ALL current authorized ready AND review work for successfully audited projects: plan.audit -> plan.next/review_followups -> OFFLINE prerequisite/disposition/evidence reconciliation -> scoped execution only when current prerequisites permit -> plan.checkpoint. Recover omitted CURRENT pages before following next_offset.',
-      'Caller-only plan.disposition status:blocked prose is NOT a verified unavailable prerequisite. If the current queue exposes blocked-disposition reconciliation, FIRST inspect its actual obligation and missing_prerequisites, then use its bounded OFFLINE plan.disposition status:open template. Do not automatically replay a target request or override actual scope/identity/fixture/browser prerequisites.',
-      'Likewise, administrative plan.review status:blocked does not prove valid existing material is unavailable. Follow current blocker_reconciliation_required items with their OFFLINE plan.review status:reopen templates before reviewing the source; never replace evidence reconciliation with caller prose.',
-      'Setup/auth/input tracing and existing-evidence review remain actionable review work; declaring them blocked or citing no_progress is not reconciliation or completion.',
-      'Findings, elapsed time, request counts, context pressure, a single step output-token ceiling and caller-declared budgets are not overall execution-budget exhaustion. Do not invent budget_exhausted/user_stop/authorization_boundary exits.',
-      'If no execution/review work remains, complete the evidence-bound discovery/category/page frontier rounds, then obtain the current strict plan.finalize reason:completed. A draft or can_finalize alone is not a finalized assessment.',
-      'Before any new target action after an interrupted/unknown run, FIRST use offline run.inspect/run.recover and reconcile its recorded evidence. Never replay an uncertain write or expand scope.',
-      'Stalled/no_progress_rounds requires a different bounded hypothesis, existing-evidence reconciliation or repaired prerequisites, never endless duplicate traffic.',
-      ...(blocked ? ['Other bound projects have blocked-only work retained as unfinished checkpoints; do not replay them or label them completed.'] : []),
-      `Fresh offline audit (${shown.length} of ${items.length} bound projects shown; omitted projects remain unfinished): ${JSON.stringify(shown)}`,
+      'awa-ddd host continuation guard: this normally closing turn is not an assessment completion. This is plugin context, not a user command or new authorization; respect user intent, cancellation and scope/identity/fixture limits.',
+      'Follow plan.next/review_followups, reconcile prerequisites and existing evidence OFFLINE, execute only authorized ready work, then plan.checkpoint. Recover omitted CURRENT pages before next_offset.',
+      'Caller-only plan.disposition status:blocked prose is NOT a verified prerequisite. Inspect missing_prerequisites and its bounded OFFLINE plan.disposition status:open template. Do not automatically replay a target request.',
+      'For blocker_reconciliation_required use OFFLINE plan.review status:reopen templates. Setup/auth/input tracing and existing-evidence review remain actionable; prose cannot close them.',
+      'Findings, elapsed time and context pressure are not overall execution-budget exhaustion. A draft is not completion; when work closes, complete the evidence-bound discovery/category/page frontier rounds and strict plan.finalize reason:completed.',
+      'Before a new target action after an interrupted run, FIRST use offline run.inspect/run.recover. Never replay an uncertain write or expand scope.',
+      'If closure/frontier progress is unchanged, retain an unfinished checkpoint/draft and explain the next prerequisite. The guard suppresses duplicate notices, not remaining work; a normal turn end grants no completion or final report.',
+      ...(blocked ? ['Other blocked-only projects remain unfinished; do not replay them.'] : []),
+      `Fresh offline audit (${shown.length} of ${items.length} unnotified work states shown; other bound projects remain unfinished): ${JSON.stringify(shown)}`,
       ...(recoveryProjects.length ? [...RECOVERY_LINES,
         `Unauditable unfinished projects (${Math.min(recoveryProjects.length, MESSAGE_PROJECT_LIMIT)} of ${recoveryProjects.length} shown): ${JSON.stringify(recoveryProjects.slice(0, MESSAGE_PROJECT_LIMIT))}`] : []),
     ].join('\n') }],
@@ -87,9 +94,9 @@ function recoveryMessage(projects) {
       summary: 'Offline continuation audit unavailable; assessment exhaustion is not established.' },
     content: [{ type: 'text', text: [
       'awa-ddd host continuation guard: the fresh offline continuation audit is unavailable or inconsistent. The bound assessment remains unfinished, not completed.',
-      'This is plugin-sourced context, not a user command or new authorization. Respect the current user intent, actual cancellation and existing scope/identity/fixture limits.',
+      'This is plugin context, not a user command or new authorization; respect intent, cancellation and scope/identity/fixture limits.',
       ...RECOVERY_LINES,
-      'Only a successful current strict plan.finalize reason:completed can establish assessment exhaustion. Do not invent an overall execution budget or override an actual abort/termination.',
+      'Only strict plan.finalize reason:completed establishes exhaustion; a normal turn end or suppressed duplicate is not completion.',
       `Unauditable unfinished projects (${Math.min(projects.length, MESSAGE_PROJECT_LIMIT)} of ${projects.length} shown; omitted projects remain unfinished): ${JSON.stringify(projects.slice(0, MESSAGE_PROJECT_LIMIT))}`,
     ].join('\n') }],
   });
@@ -104,7 +111,8 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
   const disposers = [];
   const reported = new Set();
   const metrics = { observed_pre_steps: 0, observed_boundaries: 0, steers: 0, recovery_steers: 0,
-    blocked_checkpoints: 0, audit_failures: 0, missing_execution_context: 0 };
+    blocked_checkpoints: 0, stalled_checkpoints: 0, duplicate_work_suppressed: 0,
+    audit_failures: 0, missing_execution_context: 0 };
   let registered = false;
   let disposed = false;
   let reason = 'not_attached';
@@ -214,14 +222,29 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
       && (event.claimed_run === true || event.dispatch_uncertain === true))
       || !usable(ticket.agent, ticket.state, ticket.state.context.signal, ticket.state.context.turn)) return;
     if (!ticket.state.projects.has(ticket.project_id)) ticket.state.projects.set(ticket.project_id,
-      { blocked_snapshot: null, recovery_notified: false });
+      { blocked_snapshot: null, recovery_notified: false, observed_key: null,
+        notified_keys: new Set(), stalled_keys: new Set() });
+  }
+
+  function includeFreshCheckpoint(state, project_id, binding, envelope, work) {
+    const updated = auditState(envelope);
+    if (updated?.kind === 'completed') { state.projects.delete(project_id); return; }
+    if (updated?.kind !== 'work' && updated?.kind !== 'frontier') return;
+    const key = workKey(updated);
+    // A concurrent worker may make genuine progress while the checkpoint awaits.
+    if (!binding.notified_keys.has(key)) {
+      binding.observed_key = key;
+      binding.recovery_notified = false;
+      work.push({ project_id, ...updated, binding, key });
+    }
   }
 
   async function turnStopping(payload) {
     const agent = payload?.agent;
     const state = states.get(agent);
     if (!state || !signalLike(payload?.signal) || !Number.isSafeInteger(payload.turn)
-      || !usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state) || !state.projects.size) return;
+      || !usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)
+      || state.audit || !state.projects.size) return;
     metrics.observed_boundaries++;
     const control = new AbortController();
     state.audit = control;
@@ -249,21 +272,24 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           if (!binding.recovery_notified) recovery.push({ project_id, binding });
           continue;
         }
-        binding.recovery_notified = false;
         if (current.kind === 'completed') { state.projects.delete(project_id); continue; }
+        const key = workKey(current);
+        if (binding.observed_key !== key) {
+          if (!binding.notified_keys.has(key)) binding.recovery_notified = false;
+          binding.observed_key = key;
+        }
         if (current.kind === 'blocked') {
           blocked++;
           diagnose('blocked_only_unfinished');
-          if (binding.blocked_snapshot !== current.continuation.snapshot_id) {
-            binding.blocked_snapshot = current.continuation.snapshot_id;
+          if (binding.blocked_snapshot !== key) {
+            binding.blocked_snapshot = key;
             try {
               const checkpoint = await invoke(settings, 'plan.checkpoint', { project_id,
                 label: 'Host boundary: blocked work remains unfinished; no target replay' }, { signal });
               if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
               if (checkpoint?.ok !== true) { diagnose('blocked_checkpoint_unavailable_unfinished'); continue; }
               metrics.blocked_checkpoints++;
-              const updated = auditState(checkpoint);
-              if (updated?.kind === 'work' || updated?.kind === 'frontier') work.push({ project_id, ...updated });
+              includeFreshCheckpoint(state, project_id, binding, checkpoint, work);
             } catch {
               if (signal.aborted || !usable(agent, state, payload.signal, payload.turn)) return;
               diagnose('blocked_checkpoint_unavailable_unfinished');
@@ -271,7 +297,28 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           }
           continue;
         }
-        work.push({ project_id, ...current });
+        if (binding.notified_keys.has(key)) {
+          metrics.duplicate_work_suppressed++;
+          diagnose('no_progress_handoff_suppressed_unfinished');
+          if (!binding.stalled_keys.has(key)) {
+            binding.stalled_keys.add(key);
+            try {
+              const checkpoint = await invoke(settings, 'plan.checkpoint', { project_id,
+                label: 'Host boundary: unchanged closure progress; assessment remains unfinished' }, { signal });
+              if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
+              if (checkpoint?.ok === true) {
+                metrics.stalled_checkpoints++;
+                includeFreshCheckpoint(state, project_id, binding, checkpoint, work);
+              }
+              else diagnose('stalled_checkpoint_unavailable_unfinished');
+            } catch {
+              if (signal.aborted || !usable(agent, state, payload.signal, payload.turn)) return;
+              diagnose('stalled_checkpoint_unavailable_unfinished');
+            }
+          }
+          continue;
+        }
+        work.push({ project_id, ...current, binding, key });
       }
       if ((!work.length && !recovery.length) || !usable(agent, state, payload.signal, payload.turn)
         || pendingInput(agent, state)) return;
@@ -280,7 +327,9 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
       const message = work.length ? continuationMessage(work, blocked, projects) : recoveryMessage(projects);
       state.steering_ids.add(message.id);
       agent.steer(message);
-      for (const item of recovery) item.binding.recovery_notified = true;
+      // Only shown projects were handed off; omitted projects get their next page.
+      for (const item of work.slice(0, MESSAGE_PROJECT_LIMIT)) item.binding.notified_keys.add(item.key);
+      for (const item of recovery.slice(0, MESSAGE_PROJECT_LIMIT)) item.binding.recovery_notified = true;
       metrics.steers++;
       if (recovery.length) metrics.recovery_steers++;
       diagnose(work.length ? 'current_work_steered' : 'offline_recovery_steered_unfinished');

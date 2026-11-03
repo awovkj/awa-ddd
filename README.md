@@ -1,10 +1,18 @@
 # awa-ddd
 
-awa-ddd 0.9.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将操作、输入、主体/会话、测试资源、执行证据、候选与结论存入本地 SQLite，提供 10 组工具、60 个动作。模型沿用 dsh 运行时，不另接模型供应商。
+awa-ddd 2.0.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将攻击面宇宙、假设、冻结测试配方、durable 执行、证据与多维覆盖存入本地 SQLite。默认 `assessmentModel:v1` 保留原 10 组、63 个动作；`assessmentModel:v2` 注册 6 组 Campaign 工具（`awa_campaign/awa_recon/awa_test/awa_review/awa_report/awa_admin`），以“Universe → Hypothesis → TestRecipe → TestRun → Finding/CoverageClaim”驱动下一轮测试。模型沿用 dsh 运行时，不另接模型供应商。
 
-本版依据指定的 `session-9b82695d-b0b9-4ada-81a5-02adc770121d` 对话升级：仍有 98 项就绪任务、134 项复核任务时，旧插件两次接受模型自报 `budget_exhausted`；模型之后承认没有用户或宿主给定的预算。0.9.0 将停止策略改为 **exhaustion_only 硬门禁：除严格核验的测无可测外，禁止以任何理由自动终止**。`plan.finalize` 只接受 `reason:completed`；旧部分退出仅留历史，不能使 `continue_required` 变成 false 或生成新的最终报告。详见 [本轮取证、实现与验证](docs/UPGRADE-20261031.md)。
+2.0 的设计与评审对应见 [V2 架构](docs/V2-ARCHITECTURE.md)、[迁移与兼容](docs/V2-MIGRATION.md)、[验收与 R01–R21 映射](docs/V2-ACCEPTANCE.md)。核心约束：Universe 只声明有来源的已知范围；Hypothesis 身份不是 statement；Recipe 冻结且在 override 上只允许声明过的数据变量；durable run 的未知写进入 `effect_unknown` 而不自动重放；reviewed detection 与 machine proof 分栏；coverage 分为五维且所有百分比带分母；`partial_accepted` 交付不获得 exhausted authority。旧的 `reporting.py` 通过 `reporting/__init__.py` 兼容 shim 保留全部导出。
 
-保留 0.8.0 的持久化 checkpoint、来源绑定的行政 review 和截断恢复，以及 0.7.0 的公平短队列、独立漏洞族义务、多租户样本、复杂正文、状态链与中文复现交付。历史对话的统计不混作本次验收。旧外部退出契约被本版取代，见 [0.8.0 历史记录](docs/UPGRADE-20261030-CONTINUATION.md)、[0.7.0 历史记录](docs/UPGRADE-20261030-ASSESSMENT.md) 与 [人工复现指南](docs/REPRODUCTION.md)。
+此前 0.12.0 的取证、`assessment.prepare`、`finding.bind` 与独立安全属性复核仍保留，详见 [0.12.0 升级说明](docs/UPGRADE-20261103.md) 和 [会话取证](docs/SESSION-20261103-CFF22367.md)。
+
+保留 0.11.0 的真实进展幂等交接、停滞检查点、精简常驻提示、`surface.recon` 信息画像、会话续期、页内恢复及单次调用复用。此前 729 条重复续接通知的修复依据见 [20261102 升级](docs/UPGRADE-20261102-LEAN.md) 和 [该会话取证](docs/SESSION-20261102-ADAAE1EF.md)。
+
+保留 0.10.0 的精确参数矩阵、公平调度、判据帮助、检查点增量、前端消费点反查及离线评估提示导入；multipart/BOM、独立文件名对照和短字段脱敏等已有修复不混作本次新增。详见 [0.10.0 取证与实现](docs/UPGRADE-20261101.md)。
+
+续接验收进一步补齐已有对照的离线复核、检查点受限投影、评估提示的显式证据绑定、JS 词法作用域及提取安装包 smoke；不把恢复解析预算当成新实验，不让同名局部 `fetch/location` 伪造网络或导航。详见 [20261102 续接闭环](docs/UPGRADE-20261102.md)。
+
+保留 **exhaustion_only 评估完成/最终报告硬门禁**：`plan.finalize` 只接受严格 `reason:completed`。正常对话轮次结束或抑制重复提示不等于评估完成，未完成工作保留为 checkpoint/draft，不能伪造正式结项。保留持久化 checkpoint、来源绑定的 review、独立漏洞族义务、身份/资源和真实证据规则；历史统计不混作本次验收，见 [0.9.0](docs/UPGRADE-20261031.md) 与 [人工复现指南](docs/REPRODUCTION.md)。
 
 保留先前的范围/身份/资源血缘、SQL 元数据与真实 XSS 运行时门禁、不可变 finding 修订、UTF-8 文件调用和 WSL 边界；不将更多请求或人工文字冒充完整覆盖。0.6.x 历史修复见 [20261029](docs/UPGRADE-20261029.md) 与 [模式 RPC 修复](docs/UPGRADE-20261030.md)。
 
@@ -12,10 +20,14 @@ awa-ddd 0.9.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 | 能力 | 当前行为 |
 |---|---|
-| 原生接入 | 60 个动作与 Python help catalog 一致；UTF-8 JSON stdin、固定 argv、宿主取消和独立截止时间；放错顶层的 action 字段明确拒绝 |
-| 开局与续接 | `continuation` v2 固定保留 exhaustion_only、剩余任务和严格布尔停测权限；渲染截断先重读当前页；checkpoint 保存闭环进展，重复发包/受阻声明不算耗尽 |
-| 项目与发现 | 多源离线 OpenAPI/JS AST/HAR/ARTEX/SARIF 导入、精确输入、来源与 candidate 生命周期；仅驳回文字不再隐藏未验证线索 |
-| 身份与资源 | 服务端主体/角色核验、严格 JSON、同 origin 会话、凭据头分类与 actor/fixture 快照；未知访问策略不会毒化整个项目，也不会被历史 200 响应推断为允许 |
+| 2.0 战役 | `assessmentModel:v2` 六组工具；Campaign 持久目标、Universe 快照、KnownCase 三轨、Hypothesis 稳定键、公平调度、五维覆盖矩阵；`partial_accepted` 与 exhausted authority 分离 |
+| 原生接入 | 63 个动作与 Python help catalog 一致；精简常驻说明，统一 awa_project action.help 按需查完整契约；UTF-8 stdin、固定 argv、取消与独立截止时间 |
+| 信息先行 | surface.recon 统筹当前授权站点、技术/框架提示、页面/API/功能/输入、歧义线索与收集缺口；零目标流量，复用信息基线、只补实际变化，不冒充全站发现或漏洞证明 |
+| 开局与续接 | 真实 progress/frontier 状态幂等交接；raw/CP/计数变化不重启提醒，同状态仅一次停滞 CP，保留未完成与严格 final 门禁；页内截断同样要求恢复 |
+| 项目与发现 | 多源离线 OpenAPI/JS AST/HAR/ARTEX/SARIF/assessment_hints 导入；JS 消费点反查仅为可能绑定，定义/评分只作选题，不成为漏洞证据 |
+| 参数与调度 | 精确操作/位置/selector/分支/族矩阵；优先保留任务动作、前提与完整控制 ID；主任务和参数页独立恢复，参数页默认随主页最多 3 条；typed/variant 分开，coverage_first 保留公平性 |
+| 证明准备与绑定 | assessment.prepare 按义务、发现或已有证据复核当前控制与缺字段，零请求、零新判定；finding.bind 校验真实当前证明后创建替代发现并保留原始证明与生命周期历史 |
+| 身份与资源 | 服务端主体/角色核验、同 origin 和快照；禁止 subject/tenant/roles 同 Pointer 伪角色，过期有效同代会话只给显式续期候选，live 执行门禁不放宽 |
 | 执行与恢复 | 共用 preflight 门禁；JSON 字段名/Pointer/数组、唯一 form/multipart/Cookie 输入对照；原字节 `body_file`、持久 checkpoint 和失败 run_id；真实 scenario 的读/写/读 `state_transition`；不自动重放 |
 | 浏览器 | 必需 / 明显有益的测试必须调用 Playwright；优先实际宿主 MCP、保留 native 回退；公共运行时材料按凭据上下文脱敏，原证据保留私有；超时保留 run 续接，不重放未知写 |
 | Yakit MCP | 真实 stdio MCP 握手、tools/list 与受控 HTTP 单包重放；保存目录、交换、执行结果、传输告警及摘要 |
@@ -23,7 +35,8 @@ awa-ddd 0.9.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 | sqlmap | GET query 与受控 POST JSON/form 单参数，POST 必须写授权与精确可回退 fixture；方法/头/原字节/身份/资源 V2 血缘；元信息-only，partial/signal 留为未验证候选 |
 | SQL 确认 | 元数据直接回显/真实 sqlmap transcript/DBMS error channel；写侧行为证明必须是受控 SQL 输入及真实有限业务计数差异，普通响应差异不算 SQLi |
 | 人工复核 | SQL proof 不放宽；XSS 可把精确正常/攻击输入、同身份真实消费页及运行时证明绑定具体义务，仍标为 analyst；无弹窗访问不否定整类 XSS |
-| 判据与交付 | 畸形/歧义 JSON 与 bool/number 混淆不能冒充阴性对照，fresh/legacy 同判据；元数据包装/ACK 数组不是业务 readback；review 不关闭安全义务，最终交付仅 strict completed |
+| 线索复核 | candidate.link 可显式绑定已有 proof_decision_ids 复核精确评估提示；普通 link、评分、方法猜测、同名代码 sink 不能收口；工件变化重新打开 |
+| 判据与交付 | 8 种精确 oracle 帮助与控制顺序；multipart/BOM 在 preflight 拒绝，文件名/内容独立绑定；completed 族仍需当前有效证据；review 不关闭安全义务，最终交付仅 strict completed |
 | 公共输出 | 所有项目动作与错误共用私有凭据上下文脱敏；已知秘密不经 surface/preflight/步骤标签回流，真实控制字段按动作 schema 保留；已分派执行不因输出失败被回滚或自动重放 |
 | Windows / Kali | 文件式 UTF-8 调用避免 PowerShell 多层插值；可选 WSL 运行引擎及已适配工具，取消/超时终止本次 Linux 进程组 |
 
@@ -45,15 +58,41 @@ awa-ddd 0.9.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
     timeoutMs: 120000
 ```
 
-默认评估目录为 `~/.dsh/awa-ddd-data`，位于插件包之外。工具统一接收 action、project_id、input；其余 action 字段（包括 limit/offset）必须放 input，不能放顶层。`action.help` 与 `runtime.probe` 无需 project_id。先看 `project.status`、`surface.list`、`plan.next`，每轮与交付前用 `plan.audit`，不要积累大量请求后才登记输入。
+默认评估目录为 `~/.dsh/awa-ddd-data`，位于插件包之外。工具统一接收 action、project_id、input；其余 action 字段（包括 limit/offset）必须放 input。帮助只在 **awa_project** 调用 `action.help`，不要发到其它组；它与 `runtime.probe` 无需 project_id。已有授权评估先看 `project.status` 和信息基线，收集后再 `plan.next`；源码/报告维护不进入目标评估流程。
+
+## 先统一收集信息
+
+不要边猜接口边反复发包。先用 **awa_surface** 检查当前范围内的收集入口：
+
+```json
+{"action":"surface.recon","project_id":"assessment","input":{"mode":"prepare","section":"collection","limit":10}}
+```
+
+统筹实际获准的正常页面、静态资源、API/功能流程、账号与资源前提，用现有 HTTP/真实 Playwright 和 OpenAPI/JS/HAR 导入保存材料，优先批量登记，再统一生成画像：
+
+```json
+{"action":"surface.recon","project_id":"assessment","input":{"mode":"aggregate","section":"overview","limit":10}}
+```
+
+按需分页读取 `technologies/functions/clues/collection`。指纹/框架/版本都标为带来源的 `hint`；功能区分登记、实际观察和未观察，歧义表单与未映射输入仍需复核。`baseline_reused:true` 时复用已有信息，真实新事实才补收集。两个模式都不发目标请求，aggregate 只保存非证明性的基线元数据；不自动采集外链、改范围、登记或执行线索，也不把基线变成安全/完成回执。
+
+“一次做好”是一次统筹已授权、可获得的材料，不是未经范围/身份检查的一键全扫。缺失/截断/未知信息显式保留；DNS/TLS 等未采到的部署信息不编造，注册范围外未知攻击面不宣称已经耗尽。画像建立后，再用 `plan.next` 根据实际功能、输入消费点与身份/资源边界选择具体假设。
+
+先查看明确未测的参数，而不是重复接口基线：
+
+```json
+{"action":"plan.next","project_id":"assessment","input":{"limit":3,"parameter_status":"untested","parameter_offset":0,"parameter_limit":3}}
+```
+
+`parameter_coverage` 独立分页；`observed_unassessed` 和 `needs_controls` 不是已测。检查点 `parameter_delta` 区分新增 typed 闭环和仅观察到变体，首个/旧投影不伪造新增进展。验证码/SMS 参考 `session_continuity` 维护私有同源会话，不自动复用 Cookie 或猜测支付前提。JSONL/报告中的命令不会被源码升级自动重放。
 
 ```json
 {"action":"action.help","input":{"name":"http.capture"}}
 ```
 
-`project.status` 默认最多 10 条各类实体与 5 个 gap 示例；`plan.list/report.coverage/finding.list` 默认 25 条、最多 100 条。模型展示限制为 24 KiB；出现 `render_recovery` 时先用更小 limit 重读当前 offset，并保留原过滤条件，再跟随正式 `next_offset`，不能跳过省略的条目。`plan.build.obligations` 是整数，`obligation_items` 才是分页明细。
+`project.status` 默认最多 10 条各类实体与 5 个 gap 示例；`plan.list/report.coverage/finding.list` 默认 25 条、最多 100 条。展示限制为 24 KiB；条目内部字段截断也会给 `render_recovery`，保留原过滤条件先读当前页，不能跳到正式 `next_offset`。单条仍超限则标 `retry_same_page:false/projection_limit:single_record`，按 detail_action 找精确查询或用文件式 CLI 读取完整已脱敏结果，不循环相同页。`plan.build.obligations` 是整数，`obligation_items` 才是分页明细。
 
-闭环为 `plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint → 再读 continuation`。`continue_required:true` 必须继续现有授权内的 ready **及** review；空页、已有漏洞、请求数、耗时、上下文压力、低收益或草稿成功均不能授权自动停止，不得自行设定执行/轮次/时间/token/操作预算。无进展应换具体假设、补消费链/身份/资源或复核已有材料，不能重复写请求凑轮次。
+闭环为 `plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint`。`continue_required:true` 表示评估未完成，推进现有授权内可做的 ready/review；空页、已有漏洞、请求数、低收益或草稿成功不能证明耗尽，也不能编造预算/取消记录来收尾。无真实进展时换假设或补前提，保留未完成交接，不无限重复请求、答复或宿主继续提示；正常轮次结束不授予完成声明或最终报告。
 
 `can_finalize:true` 只在非空登记范围、`completion.status:complete`、零 ready/review/blocked/unresolved、最新同快照 checkpoint 及两轮**完整、有效、证据绑定**的发现/12 族适用性/页面复核同时成立时出现。blocked frontier 不计完整轮次，全部任务标受阻也不等于测无可测。成功 `plan.finalize reason:completed` 后才有 `automatic_stop_allowed:true` 和 `can_claim_complete:true`；二者只针对有证据的登记范围，不证明未知攻击面不存在。
 
@@ -67,7 +106,7 @@ awa-ddd 0.9.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 `blocked/budget_exhausted/user_stop/authorization_boundary` 均被最终收尾 API 拒绝；调用方文字、force/override 或自称宿主事件不能建立停止权。真实用户明确暂停/停止或宿主真实中断时遵守该事件，保存 checkpoint、必要的 draft 和真实恢复前提，不制造最终停止记录。旧部分 FN 原样保留，只读重开也不会恢复停止权。systemPrompt 的停止指引不受渗透模式开关影响；没有该服务仍保留引擎硬门禁。
 
-已核验 rc.3 SDK 的 **`agent/turn-stopping` awaited serial 钩子**：正常准备结束轮次时，先离线审计真实 agent 已绑定的当前评估，再以插件自身来源的 `agent.steer` 继续尚可推进的工作、完整复核或正式收尾。新用户意图重置绑定，报告/历史检查不自动变成目标测试；真实取消前后不追加 steering，不使用另开轮次的 followup 冒充阻止结束。仅受阻且当前无可推进项时保留未完成 checkpoint，不重复发包。缺少公开宿主接口有可见降级；不能撤回已经输出的文字、强过实际取消/平台终止或保证无限运行。`continuationGuard:false` 仅供用户静态配置关闭宿主钩子，不关闭最终报告硬门禁。
+已核验 rc.3 SDK 的 **`agent/turn-stopping` awaited serial 钩子**：离线审计真实 agent 当前绑定，以插件来源 `agent.steer` 交接新的真实 progress/frontier 状态。同状态仅提醒一次，重复边界保留一次停滞 CP，不把 raw capture、CP ID 或 no_progress 计数当进展；CP 等待期间的并行真实进展会重检后交接。新意图/实际取消优先，纯报告检查不变成测试；未完成绑定、义务和 final 门禁不因抑制提醒而删除。缺接口有降级，不承诺无限运行。`continuationGuard:false` 只关闭可选宿主钩子，不关闭最终报告门禁。
 
 ## Playwright 测试策略
 
@@ -177,7 +216,7 @@ npm run pack:check
 
 Windows PowerShell 可将 `npm` 换为 `npm.cmd`。`pack:check` 会自动创建已忽略的 `.validation` 临时目录，解包并检查当前源码生成的发行包；完成后生成 `.validation/package-check.json`。确认该记录的 `result` 为 `passed`，再从 `archive_path` 取得实际安装包路径，并核对 `archive_sha256`。不要猜时间戳目录或仅凭版本号选择旧包。
 
-安装时使用本次生成的包，在用户选择的 dsh profile 中安装并重载；不自动改写桌面配置或存量评估库。Playwright/TscanPlus 功能和当前 60 个动作不变。旧本地备份、验收 fixture、日志和 tarball 已清理；它们不属于 fresh clone 的运行/验证依赖，历史验收说明也不等于当前检查通过。
+安装时使用本次生成的包，在用户选择的 dsh profile 中安装并重载；不自动改写桌面配置或存量评估库。当前提供 63 个动作，Playwright/TscanPlus 保留既有授权与证明边界。本机历史备份、验收 fixture、日志和 tarball 不属于源码发行或 fresh clone 的运行/验证依赖；历史验收说明也不等于当前检查通过。
 
 需要手工 `npm pack` 时先完成上述验证，再把输出放入已忽略的 `dist` 新目录：
 

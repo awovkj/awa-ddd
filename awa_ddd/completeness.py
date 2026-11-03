@@ -3,10 +3,14 @@ from __future__ import annotations
 
 from collections import deque
 from bisect import bisect_left
+from contextvars import ContextVar
 import hashlib
 import re
 
 from .store import EngineError, canonical
+
+
+_INVENTORY_RECEIVER = ContextVar("awa_ddd_inventory_receiver", default=None)
 
 
 FAMILY_LABELS = {
@@ -30,11 +34,11 @@ def suggested_families(entry, operation):
     name = str(entry.get("name") or entry.get("selector") or "").lower()
     media = str(operation.get("content_type") or "").lower()
     hints = set()
-    if re.search(r"sort|order_by|keyword|search|query|^q$|^id$", name):
+    if re.search(r"sort|order_by|keyword|search|query|^q$|^id$|^order$", name):
         hints.add("sql_injection")
     if re.search(r"url|webhook|callback|endpoint|target|remote", name):
         hints.add("ssrf")
-    if re.search(r"html|description|comment|content|message|nickname", name):
+    if re.search(r"html|description|comment|content|message|nickname|shop_name|^label$", name):
         hints.add("xss")
     if "xml" in media or "xml" in name:
         hints.add("xxe")
@@ -51,8 +55,12 @@ def suggested_families(entry, operation):
     if re.search(r"serialized|deserialize|pickle|object_data", name):
         hints.add("deserialization")
     route = str(operation.get("url") or "").lower()
-    if "promo-rule" in route and re.search(r"rules?|expression|formula", name):
+    if "promo-rule" in route and re.search(r"rules?|expression|formula|^label$", name):
         hints.update({"template_injection", "business_logic"})
+    if re.search(r"username|password|captcha|sms.?code|otp|verify.?code|verification.?code|auth.?token", name) or re.search(r"/login(?:[/?.#]|$)", route):
+        hints.update({"business_logic", "generic"})
+    if re.search(r"redirect|return_?url|next_?url|redirect_?uri", name):
+        hints.update({"business_logic", "generic"})
     if "import-json" in route and entry.get("location") in {"body", "graphql"}:
         hints.update({"deserialization", "generic"})
     return sorted(hints)
@@ -251,6 +259,7 @@ def _scope_reductions(project, obligations, operations, decisions, consumer_requ
 
 def _inventory(project, evaluated):
     from . import browser, engine
+    from .parameter_coverage import ObservationProfiles, annotate_queue, snapshot as parameter_snapshot
 
     operations = {operation["id"]: operation for operation in project.list("operation")}
     gaps = {gap["id"]: gap for gap in evaluated["gaps"]}
@@ -282,12 +291,15 @@ def _inventory(project, evaluated):
     used_evidence = {identity for decision in valid_decisions for identity in decision.get("evidence_ids", [])}
     identity_evidence = {session.get("verification_evidence_id") for session in project.list("session")}
     current_observations = []
+    method_observations = []
+    parameter_profiles = ObservationProfiles(operations)
     for evidence in project.list("evidence"):
-        if evidence.get("kind") != "http":
-            continue
         try:
-            engine.verify_current_evidence(project, evidence["id"])
-            current_observations.append(evidence)
+            current, artifact = engine.verify_current_evidence(project, evidence["id"])
+            method_observations.append(current)
+            if evidence.get("kind") == "http":
+                current_observations.append(current)
+                parameter_profiles.observe(current, artifact["request"])
         except (EngineError, OSError, ValueError, TypeError, KeyError):
             continue
     unassessed = [evidence for evidence in current_observations
@@ -305,7 +317,7 @@ def _inventory(project, evaluated):
                   and decision["id"] not in finding_decision_ids]
     unresolved_candidates = []
     proof_resolved_candidates = []
-    from .candidates import dismissal_valid
+    from .candidates import dismissal_valid, hint_proof_valid
     candidate_coverage = {**evaluated, "completion": {
         "applicability_review_total": len(applicability_reviews),
         "scope_reduction_review_total": len(scope_reductions) + len(consumer_requirements)}}
@@ -316,7 +328,7 @@ def _inventory(project, evaluated):
             candidate = {**candidate, "disposition_review_required": True}
         # A precisely bound accepted metadata proof can account for its original
         # tool clue. Merely linking a clue to an operation never resolves it.
-        resolved = candidate.get("kind") == "tool_metadata" and any(
+        resolved = hint_proof_valid(project, candidate, candidate_coverage) or candidate.get("kind") == "tool_metadata" and any(
             decision.get("outcome") == "confirmed"
             and decision.get("operation_id") == candidate.get("operation_id")
             and (decision.get("oracle") or {}).get("tool_run_id") == candidate.get("tool_run_id")
@@ -361,18 +373,21 @@ def _inventory(project, evaluated):
     config = project.config
     inventory = {"operations": operations, "obligations": obligations, "gaps": gaps, "decisions": decisions,
             "valid_decisions": valid_decisions, "current_findings": current_findings,
-            "observations": current_observations, "unassessed": unassessed,
+            "observations": current_observations, "method_observations": method_observations, "unassessed": unassessed,
             "unlinked_analyst": unlinked_analyst, "unrecorded": unrecorded,
             "candidates": unresolved_candidates, "proof_resolved_candidates": proof_resolved_candidates,
             "page_coverage": page_coverage, "orphan_visits": orphan_visits, "pending_runs": pending_runs,
             "partial_tools": partial_tools, "applicability_reviews": applicability_reviews,
             "scope_reductions": scope_reductions,
             "consumer_requirements": consumer_requirements,
+            "parameter_profiles": parameter_profiles,
             "browser_scope_config": {"scope": config.get("scope", []), "exclude": config.get("exclude", [])}}
     from .continuation import apply_reviews
     from .workflow import queue_inventory
     inventory = apply_reviews(project, inventory)
+    inventory["parameter_coverage_snapshot"] = parameter_snapshot(project, evaluated, inventory=inventory)
     inventory["queue"] = queue_inventory(project, evaluated, inventory)
+    annotate_queue(inventory["parameter_coverage_snapshot"], inventory["queue"])
     return inventory
 
 
@@ -464,14 +479,39 @@ def _completion(inventory, security, evaluated):
                                "代表资源及同角色样本有明确边界，不代表全部租户、资源和业务状态。"]}
 
 
+def evaluate_with_inventory(project):
+    """Reuse the evaluator's own inventory for this call, never across snapshots."""
+    from . import engine
+
+    captured = []
+    token = _INVENTORY_RECEIVER.set((project, captured))
+    try:
+        evaluated = engine.evaluate_coverage(project)
+    finally:
+        _INVENTORY_RECEIVER.reset(token)
+    inventory = captured[-1] if captured else _inventory(project, evaluated)
+    return evaluated, inventory
+
+
 def summarize(project, evaluated):
     """Consume an existing evaluator result; do not recurse into evaluate_coverage."""
+    from . import engine
+
     inventory = _inventory(project, evaluated)
     security, _ = _security(inventory)
     completion = _completion(inventory, security, evaluated)
+    tested_operations = {item["operation_id"] for item in inventory["obligations"]
+                         if item.get("status") == "evaluated" and item["id"] not in inventory["gaps"]}
     from .continuation import control
-    return {"security_coverage": security, "completion": completion,
+    result = {"security_coverage": security, "completion": completion,
+            "parameter_coverage_summary": inventory["parameter_coverage_snapshot"]["summary"],
+            "method_coverage": engine._method_coverage(project, tested_operations,
+                                                     current_observations=inventory["method_observations"]),
             "continuation": control(project, evaluated, inventory=inventory, security=security, completion=completion)}
+    receiver = _INVENTORY_RECEIVER.get()
+    if receiver is not None and receiver[0] is project:
+        receiver[1].append(inventory)
+    return result
 
 
 def _review_id(kind, identity):
@@ -504,6 +544,11 @@ def _checklist(inventory):
         work = queue.get(item["id"], {})
         if work:
             row.update(queue_status=work["queue_status"], missing_prerequisites=work["missing_prerequisites"])
+            for key in ("preparation_actions", "session_continuity", "parameter_coverage_id", "parameter_test_status",
+                        "selected_input_observation_count", "selected_input_variant_observed", "controls_are_candidates_only",
+                        "control_candidate_evidence_ids", "control_candidate_review_required"):
+                if key in work:
+                    row[key] = work[key]
         if work.get("scope_binding_review_required") is True and work.get("queue_status") != "blocked":
             # The audit handoff only inspects local metadata; it never supplies a request URL.
             for key in ("scope_binding_review_required", "url_requires_binding", "native_input_requires_binding",
@@ -571,7 +616,7 @@ def _checklist(inventory):
     extras = (
         ("candidate", inventory["candidates"], "候选线索待复核", "候选登记或关联不能替代真实验证。", "candidate.inspect", "candidate_id"),
         ("unassessed_observation", inventory["unassessed"], "有效观察尚未形成判据", "先检查已有响应和绑定，不要仅为归档重复发送请求。", "evidence.inspect", "evidence_id"),
-        ("unlinked_analyst_finding", inventory["unlinked_analyst"], "人工发现尚未进入义务闭环", "人工结论保留，但未关闭具体输入、权限或状态链测试义务。", "finding.list", "finding_id"),
+        ("unlinked_analyst_finding", inventory["unlinked_analyst"], "人工发现尚未进入义务闭环", "先离线检查原有控制与当前义务，补齐真实判据；已有有效机器证明可显式绑定，人工文字不关闭测试。", "assessment.prepare", "finding_id"),
         ("unrecorded_confirmation", inventory["unrecorded"], "确认判据尚未登记发现", "复核真实影响后使用 finding.record；此检查不会自动确认或创建发现。", "finding.record", "decision_id"),
         ("orphan_browser_visit", inventory["orphan_visits"], "浏览器观察未归档", "将已有真实观察绑定到页面、功能或具体运行时证明；访问记录不是 HTTP 测试。", "page.adopt", "page_visit_id"),
         ("unreconciled_run", inventory["pending_runs"], "执行状态仍需恢复检查", "检查已有 checkpoint 和证据，不自动重放可能已生效的请求。", "run.inspect", "run_id"),
@@ -587,6 +632,9 @@ def _checklist(inventory):
                            reason_code="review_prerequisite_missing")
             if item.get("operation_id"):
                 row["operation_id"] = item["operation_id"]
+            if kind == "unlinked_analyst_finding":
+                row.update(suggested_action="assessment.prepare", input_template={"finding_id": item["id"]},
+                           help_input={"name": "assessment.prepare"})
             if kind == "candidate" and item.get("disposition_review_required"):
                 row.update(declared_status="dismissed", disposition_review_required=True,
                            reason_code="candidate_dismissal_unverified", administrative_review_allowed=False,
@@ -718,12 +766,12 @@ def _blindspots(inventory, matrix):
 def audit(project, args):
     from . import engine
     from .reporting import safe_metadata
+    from .parameter_coverage import public_page as parameter_page
 
     offset, limit = args.get("offset", 0), args.get("limit", 25)
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
         raise EngineError("pagination", "offset must be a nonnegative integer; limit must be 1..100")
-    evaluated = engine.evaluate_coverage(project)
-    inventory = _inventory(project, evaluated)
+    evaluated, inventory = evaluate_with_inventory(project)
     security, matrix = _security(inventory)
     checklist = _checklist(inventory)
     observed_operations = {item["operation_id"] for item in inventory["observations"]}
@@ -741,6 +789,8 @@ def audit(project, args):
                                 "current_findings": len(inventory["current_findings"])},
                    "security": {"operations_complete": security["operations_complete"], "evaluated_obligations": security["evaluated"]}},
         "category_matrix": matrix, "technical_blindspots": _blindspots(inventory, matrix),
+        "parameter_coverage": parameter_page(inventory["parameter_coverage_snapshot"],
+            {"parameter_limit": min(limit, 3), **args}),
         "checklist": checklist[offset:offset + limit], "checklist_total": len(checklist), "offset": offset, "limit": limit,
         "next_offset": offset + limit if offset + limit < len(checklist) else None,
         "candidate_proof_accounted": len(inventory["proof_resolved_candidates"]),
@@ -748,11 +798,11 @@ def audit(project, args):
         "next_action": "plan.next", "note_zh": "本检查仅读取现有材料，不发请求、不补造证据、不自动关闭义务，也不把启发式线索确认成漏洞。"})
 
 
-def followups(project, evaluated, limit=5):
+def followups(project, evaluated, limit=5, *, inventory=None):
     from .reporting import safe_metadata
     from .browser_policy import summarize
 
-    rows = [row for row in _checklist(_inventory(project, evaluated)) if row["kind"] != "obligation"]
+    rows = [row for row in _checklist(inventory if inventory is not None else _inventory(project, evaluated)) if row["kind"] != "obligation"]
     lanes = {}
     for row in rows:
         lanes.setdefault(row["kind"], deque()).append(row)

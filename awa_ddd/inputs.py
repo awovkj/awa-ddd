@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
-from email.parser import BytesHeaderParser
-from email import policy
 import json
 import math
 import re
@@ -90,50 +88,206 @@ def parse_form(raw):
         raise EngineError("input_binding", "Encoded fields must be unambiguous UTF-8") from exc
 
 
-def _multipart(raw, content_type):
+_MIME_TOKEN = rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_MIME_WHITESPACE = rb"(?:[ \t]|\r\n[ \t]+)*"
+
+
+def _multipart_framing(issue="invalid_multipart"):
+    bom = issue == "utf8_bom"
+    raise EngineError("multipart_framing",
+                      "Multipart starts with a UTF-8 BOM; rewrite the source without BOM and preflight the exact bytes"
+                      if bom else "Multipart needs exact CRLF framing, one declared boundary and a closing delimiter",
+                      {"blocked": True, "validation_stage": "multipart_framing", "next_action": "http.preflight",
+                       "help_input": {"name": "http.capture"}, "framing_issue": issue,
+                       "repair": "rewrite_utf8_without_bom" if bom else "rebuild_exact_multipart"})
+
+
+def _mime_parameters(raw, expected):
+    """Parse unique MIME parameters while retaining the original value spans."""
+    first = raw.find(b";")
+    prefix = raw if first < 0 else raw[:first]
+    if prefix.strip().lower() != expected:
+        _ambiguous("Multipart header has an unexpected media type or disposition")
+    params, position = {}, len(raw) if first < 0 else first
+    whitespace = re.compile(_MIME_WHITESPACE)
+    while position < len(raw):
+        position = whitespace.match(raw, position).end()
+        if position == len(raw):
+            break
+        if raw[position:position + 1] != b";":
+            _ambiguous("Multipart parameters must use an unambiguous MIME grammar")
+        position = whitespace.match(raw, position + 1).end()
+        key_match = re.compile(_MIME_TOKEN).match(raw, position)
+        if not key_match:
+            _ambiguous("Multipart parameters need exact names")
+        key = key_match.group().decode("ascii").lower()
+        if key in params or key.startswith(("name*", "filename*", "boundary*")):
+            _ambiguous("Repeated or encoded multipart disposition parameters are not exact inputs")
+        position = whitespace.match(raw, key_match.end()).end()
+        if raw[position:position + 1] != b"=":
+            _ambiguous("Multipart parameters need one explicit value")
+        position = whitespace.match(raw, position + 1).end()
+        start = position
+        if raw[position:position + 1] == b'"':
+            position += 1
+            value = bytearray()
+            while position < len(raw) and raw[position:position + 1] != b'"':
+                byte = raw[position]
+                if byte == 92:
+                    position += 1
+                    if position == len(raw):
+                        _ambiguous("Multipart quoted parameters must be complete")
+                    byte = raw[position]
+                if byte < 32 and byte != 9 or byte == 127:
+                    _ambiguous("Multipart parameter values cannot contain control characters")
+                value.append(byte)
+                position += 1
+            if raw[position:position + 1] != b'"':
+                _ambiguous("Multipart quoted parameters must be complete")
+            position += 1
+            value = bytes(value)
+        else:
+            value_match = re.compile(_MIME_TOKEN).match(raw, position)
+            if not value_match:
+                _ambiguous("Multipart parameter values must be tokens or quoted strings")
+            value, position = value_match.group(), value_match.end()
+        params[key] = {"value": value, "span": (start, position)}
+    return params
+
+
+def _multipart_headers(raw):
+    if re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", raw):
+        _ambiguous("Multipart headers cannot contain control characters")
+    entries, offset, current = {}, 0, None
+    for line in raw.split(b"\r\n"):
+        if b"\r" in line or b"\n" in line:
+            _ambiguous("Multipart headers must use CRLF line endings")
+        if line[:1] in {b" ", b"\t"}:
+            if current is None:
+                _ambiguous("Multipart header continuation has no header")
+            entries[current][1] = offset + len(line)
+        else:
+            name, colon, value = line.partition(b":")
+            if not colon or not re.fullmatch(_MIME_TOKEN, name):
+                _ambiguous("Multipart part headers must use exact field names")
+            current = name.decode("ascii").lower()
+            if current in entries:
+                _ambiguous("Repeated multipart part headers cannot identify an exact input")
+            entries[current] = [offset + len(name) + 1, offset + len(line)]
+        offset += len(line) + 2
+    return entries
+
+
+def parse_multipart(raw, content_type):
+    """Strict, lossless multipart parsing shared by execution and experiment gates."""
+    if not isinstance(raw, bytes) or not isinstance(content_type, str) or "\r" in content_type or "\n" in content_type:
+        _multipart_framing()
+    # A BOM before the first delimiter is not a MIME line-start preamble. Never
+    # strip it silently: execution and later assessment must see identical bytes.
+    if raw.startswith(b"\xef\xbb\xbf--"):
+        _multipart_framing("utf8_bom")
     try:
-        message = BytesHeaderParser(policy=policy.compat32).parsebytes(
-            ("Content-Type: " + content_type + "\r\n\r\n").encode("ascii"))
-        params = message.get_params([], header="content-type", unquote=True)[1:]
-        boundaries = [value for key, value in params if key.lower() == "boundary"]
-        if len(boundaries) != 1 or not isinstance(boundaries[0], str):
-            _ambiguous("Multipart needs exactly one boundary parameter")
-        boundary = boundaries[0].encode("ascii")
-        if not 1 <= len(boundary) <= 70 or any(byte < 33 or byte > 126 for byte in boundary):
-            raise ValueError()
-        delimiters = list(re.finditer(rb"(?:\A|\r\n)--" + re.escape(boundary)
-                                     + rb"(?:(--)(?:\r\n|$)|\r\n)", raw))
-        if len(delimiters) < 2 or delimiters[0].start() != 0 or delimiters[0].group(1) \
-                or not delimiters[-1].group(1) or delimiters[-1].end() != len(raw) \
-                or any(part.group(1) for part in delimiters[:-1]):
-            raise ValueError()
-        parts = {}
-        for left, right in zip(delimiters, delimiters[1:]):
-            start, end = left.end(), right.start()
-            separator = raw.find(b"\r\n\r\n", start, end)
-            if separator < 0:
-                raise ValueError()
-            header = BytesHeaderParser(policy=policy.compat32).parsebytes(raw[start:separator] + b"\r\n\r\n")
-            names = [name.lower() for name in header.keys()]
-            if header.defects or len(set(names)) != len(names):
-                _ambiguous("Multipart part headers are malformed or repeated")
-            dispositions = header.get_all("content-disposition", [])
-            if len(dispositions) != 1 or header.get_content_disposition() != "form-data":
-                _ambiguous("Multipart parts need one form-data disposition")
-            parameters = header.get_params([], header="content-disposition", unquote=True)[1:]
-            field_names = [value for key, value in parameters if key.lower() == "name"]
-            filenames = [value for key, value in parameters if key.lower() == "filename"]
-            if len(field_names) != 1 or len(filenames) > 1 or not isinstance(field_names[0], str):
-                _ambiguous("Multipart disposition parameters do not identify one exact field")
-            name = field_names[0]
-            if not name or name in parts:
-                _ambiguous("Repeated multipart fields cannot be used as input controls")
-            parts[name] = (separator + 4, end)
-        return parts
-    except (ValueError, UnicodeError, TypeError, IndexError) as exc:
-        if isinstance(exc, EngineError):
-            raise
-        raise EngineError("input_binding", "Multipart framing is not unambiguous") from exc
+        media_raw = content_type.encode("ascii")
+    except UnicodeError:
+        _multipart_framing()
+    parameters = _mime_parameters(media_raw, b"multipart/form-data")
+    if "boundary" not in parameters:
+        _multipart_framing()
+    boundary = parameters["boundary"]["value"]
+    if not 1 <= len(boundary) <= 70 or boundary.endswith(b" ") \
+            or re.search(rb"[^0-9A-Za-z'()+_,\-./:=? ]", boundary):
+        _multipart_framing()
+    delimiter_pattern = (rb"(?P<lead>\A|\r\n)--" + re.escape(boundary)
+                         + rb"(?P<close>--)?(?P<padding>[ \t]*)(?P<ending>\r\n|\Z)")
+    delimiters = list(re.finditer(delimiter_pattern, raw))
+    if len(delimiters) < 2 or delimiters[0].group("close") or not delimiters[-1].group("close") \
+            or any(entry.group("close") or entry.group("ending") != b"\r\n" for entry in delimiters[:-1]):
+        _multipart_framing()
+    parts = {}
+    for left, right in zip(delimiters, delimiters[1:]):
+        start, end = left.end(), right.start()
+        separator = raw.find(b"\r\n\r\n", start, end)
+        if separator < 0:
+            _multipart_framing()
+        header_raw = raw[start:separator]
+        headers = _multipart_headers(header_raw)
+        if "content-disposition" not in headers:
+            _ambiguous("Multipart parts need one form-data disposition")
+        disposition_start, disposition_end = headers["content-disposition"]
+        disposition = _mime_parameters(header_raw[disposition_start:disposition_end], b"form-data")
+        if "name" not in disposition:
+            _ambiguous("Multipart disposition must identify one exact field")
+        try:
+            name = disposition["name"]["value"].decode("utf-8", errors="strict")
+            filename = disposition["filename"]["value"].decode("utf-8", errors="strict") if "filename" in disposition else None
+        except UnicodeError as exc:
+            raise EngineError("input_binding", "Multipart field names and filenames require intact UTF-8; binary content stays raw") from exc
+        if not name or name in parts:
+            _ambiguous("Repeated multipart fields cannot be used as input controls")
+        filename_span = disposition.get("filename", {}).get("span")
+        parts[name] = {"name": name, "filename": filename, "content_span": (separator + 4, end),
+                       "headers_span": (start, separator), "headers_raw": header_raw,
+                       "filename_span": tuple(start + disposition_start + position for position in filename_span)
+                       if filename_span else None}
+    first_marker = delimiters[0].start() + len(delimiters[0].group("lead"))
+    normalized_delimiters = [entry.group("lead") + b"--<multipart-boundary>" + (entry.group("close") or b"")
+                             + entry.group("padding") + entry.group("ending") for entry in delimiters]
+    boundary_start, boundary_end = parameters["boundary"]["span"]
+    return {"parts": parts, "preamble": raw[:first_marker], "epilogue": raw[delimiters[-1].end():],
+            "normalized_delimiters": normalized_delimiters,
+            "content_type_context": (media_raw[:boundary_start] + b"<multipart-boundary>" + media_raw[boundary_end:]).decode("ascii")}
+
+
+def multipart_selection(parsed, raw, selector):
+    """Select an exact part body or filename; aliases must have one interpretation."""
+    parts, choices = parsed["parts"], []
+    if selector in parts:
+        choices.append((parts[selector], "content"))
+    if selector.endswith((".filename", ".content")):
+        field, component = selector.rsplit(".", 1)
+        if field in parts and (component == "content" or parts[field]["filename"] is not None):
+            choices.append((parts[field], component))
+    if selector == "filename" or selector == "file.filename" and not any(
+            part["name"] == "file" and component == "filename" for part, component in choices):
+        choices.extend((part, "filename") for part in parts.values() if part["filename"] is not None)
+    if selector == "content" or selector == "file.content" and not any(
+            part["name"] == "file" and component == "content" for part, component in choices):
+        choices.extend((part, "content") for part in parts.values())
+    choices = list({(part["name"], component): (part, component) for part, component in choices}.values())
+    if len(choices) > 1:
+        _ambiguous("Multipart selector has multiple part or attribute interpretations; use an exact part selector")
+    if not choices:
+        raise EngineError("input_binding", "The declared multipart input identifies no exact part or filename")
+    part, component = choices[0]
+    span = part["filename_span"] if component == "filename" else part["content_span"]
+    value = part["filename"] if component == "filename" else raw[span[0]:span[1]]
+    return part, component, span, value
+
+
+def _multipart(raw, content_type):
+    return {name: part["content_span"] for name, part in parse_multipart(raw, content_type)["parts"].items()}
+
+
+class _MultipartInputContext(dict):
+    def __init__(self, context, media_type):
+        super().__init__(context)
+        self._adapter = "multipart"
+        self._media_type = media_type
+
+
+def control_context(context):
+    """Compare parsed parts, not their changing wire boundary or saved byte slices."""
+    # Adapter provenance is created locally, not inferred from target JSON keys.
+    if type(context) is not _MultipartInputContext or context._adapter != "multipart" \
+            or context._media_type != "multipart/form-data":
+        return context
+    media = (context.get("headers", {}).get("content-type") or "").split(";", 1)[0].lower().strip()
+    body = context.get("body") if isinstance(context, dict) else None
+    if media != "multipart/form-data" or not isinstance(body, dict) \
+            or body.get("format") != "multipart" or "control_parts" not in body:
+        return context
+    return {**context, "body": {key: value for key, value in body.items()
+                               if key not in {"prefix_base64", "suffix_base64"}}}
 
 
 def _declared_root(item, operation):
@@ -196,6 +350,7 @@ def input_view(request, item, operation):
             body = {"format": "bytes", "body_base64": base64.b64encode(raw).decode("ascii")}
         path = url.path
         location, selector = item["input_location"], item["input_selector"]
+        multipart_context = False
         if location == "query":
             values = [value for key, value in query if key == selector]
             if len(values) != 1:
@@ -215,11 +370,35 @@ def input_view(request, item, operation):
                 value = values[0]
                 body = {"format": "form", "fields": [(key, other) for key, other in fields if key != selector]}
             elif media == "multipart/form-data":
-                parts = _multipart(raw, headers.get("content-type") or operation.get("content_type", ""))
-                start, end = parts[selector]
-                value = raw[start:end]
+                parsed = parse_multipart(raw, headers.get("content-type") or operation.get("content_type", ""))
+                selected, component, (start, end), value = multipart_selection(parsed, raw, selector)
+                if component == "filename":
+                    declarations = [entry for entry in operation.get("inputs", [])
+                                    if entry.get("location") == location
+                                    and entry.get("selector", entry.get("name")) == selector
+                                    and entry.get("schema_branch") == item.get("schema_branch")]
+                    if len(declarations) != 1:
+                        _ambiguous("Multipart filename controls require one exact declared input and schema branch")
+                control_parts = []
+                for part in parsed["parts"].values():
+                    header_raw = part["headers_raw"]
+                    content_start, content_end = part["content_span"]
+                    if part is selected and component == "filename":
+                        filename_start, filename_end = part["filename_span"]
+                        header_start = part["headers_span"][0]
+                        header_raw = (header_raw[:filename_start - header_start] + b"<bound-filename>"
+                                      + header_raw[filename_end - header_start:])
+                    control_parts.append({"headers_base64": base64.b64encode(header_raw).decode("ascii"),
+                                          "content_base64": None if part is selected and component == "content"
+                                          else base64.b64encode(raw[content_start:content_end]).decode("ascii")})
                 body = {"format": "multipart", "prefix_base64": base64.b64encode(raw[:start]).decode("ascii"),
-                        "suffix_base64": base64.b64encode(raw[end:]).decode("ascii")}
+                        "suffix_base64": base64.b64encode(raw[end:]).decode("ascii"), "control_parts": control_parts,
+                        "preamble_base64": base64.b64encode(parsed["preamble"]).decode("ascii"),
+                        "epilogue_base64": base64.b64encode(parsed["epilogue"]).decode("ascii"),
+                        "delimiters_base64": [base64.b64encode(entry).decode("ascii") for entry in parsed["normalized_delimiters"]]}
+                if "content-type" in headers:
+                    headers["content-type"] = parsed["content_type_context"]
+                multipart_context = True
             elif media in {"application/xml", "text/xml"} or media.endswith("+xml") or raw.lstrip().startswith(b"<"):
                 raise EngineError("input_adapter_blocked", "XML needs a dedicated unique input adapter; DTD and entities are never parsed locally",
                                   {"blocked": True, "next_action": "use_exact_multipart_field_or_dedicated_adapter"})
@@ -235,7 +414,11 @@ def input_view(request, item, operation):
             value, headers["cookie"] = _cookie_view(headers["cookie"], selector)
         else:
             raise EngineError("input_adapter_blocked", "This input location needs a dedicated experiment adapter", {"blocked": True})
-        return value, {"method": request["method"], "path": path, "query": query, "headers": headers, "body": body}
+        context = {"method": request["method"], "path": path, "query": query, "headers": headers, "body": body}
+        if multipart_context:
+            actual_media = (headers.get("content-type") or "").split(";", 1)[0].lower().strip()
+            context = _MultipartInputContext(context, actual_media)
+        return value, context
     except (KeyError, ValueError, TypeError, IndexError) as exc:
         if isinstance(exc, EngineError):
             raise

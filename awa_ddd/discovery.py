@@ -14,11 +14,13 @@ import shutil
 import subprocess
 from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
 
+from .inputs import json_document
+
 MAX_BYTES = 8 * 1024 * 1024
 MAX_ROWS = 10000
 MAX_DEPTH = 24
 MAX_NODES = 50000
-FORMATS = {"openapi", "javascript", "har", "artex", "sarif"}
+FORMATS = {"openapi", "javascript", "har", "artex", "sarif", "assessment_hints"}
 METHODS = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
 _MIME = re.compile(r"^[\w.+-]+/[\w.+-]+$")
 
@@ -34,6 +36,31 @@ def _media(value):
 
 def _name(value):
     return isinstance(value, str) and 0 < len(value) <= 1024 and not any(ord(c) < 32 for c in value)
+
+
+def _bounded_json(text):
+    """Shared strict JSON decoding plus bounded Unicode-scalar validation."""
+    try:
+        document = json_document(text)
+        pending, visited = [(document, 0)], 0
+        while pending:
+            value, depth = pending.pop()
+            visited += 1
+            if visited > MAX_NODES or depth > MAX_DEPTH:
+                raise ValueError("discovery JSON traversal budget exceeded")
+            if isinstance(value, str):
+                value.encode("utf-8", errors="strict")
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    key.encode("utf-8", errors="strict")
+                    pending.append((item, depth + 1))
+            elif isinstance(value, list):
+                pending.extend((item, depth + 1) for item in value)
+        return document
+    except (ValueError, UnicodeError, TypeError, RecursionError) as exc:
+        if isinstance(exc, ValueError) and "budget" in str(exc):
+            raise ValueError("discovery JSON traversal budget exceeded") from exc
+        raise ValueError("discovery input is not an unambiguous finite UTF-8 JSON document") from exc
 
 
 def _url(raw, base=None, schemes=("http", "https")):
@@ -662,6 +689,57 @@ def _sarif(doc, out):
     out.limit("sarif_messages_snippets_and_values_not_imported")
 
 
+def _client_sink_candidates(rows, out):
+    """Join syntactic field names, not taint or execution, within this one bundle."""
+    by_name = {}
+    for operation in out.operations.values():
+        for entry in operation.get("inputs", []):
+            by_name.setdefault(entry["name"], []).append((operation, entry))
+    known_sinks = {"innerHTML.assignment", "innerHTML.object_property", "insertAdjacentHTML",
+                   "location.href", "location.assign", "location.replace"}
+    for row in rows:
+        out.tick()
+        if not isinstance(row, dict) or row.get("sink") not in known_sinks:
+            continue
+        at = row.get("locator", "#")
+        names = sorted({name for name in row.get("referenced_fields", []) if _name(name)})[:64]
+        bindings, seen = [], set()
+        limited = False
+        for name in names:
+            for operation, entry in by_name.get(name, []):
+                identity = (operation["url"], operation["method"], operation["protocol"], operation["operation_name"],
+                            operation["content_type"], entry["location"], entry["selector"], entry.get("schema_branch"))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if len(bindings) >= 50:
+                    limited = True
+                    continue
+                sources = operation.get("sources", [])
+                bindings.append({"url": operation["url"], "method": operation["method"],
+                    "protocol": operation["protocol"], "operation_name": operation["operation_name"],
+                    "content_type": operation["content_type"], "input_name": entry["name"],
+                    "input_location": entry["location"], "input_selector": entry["selector"],
+                    "schema_branch": entry.get("schema_branch"),
+                    "request_locator": sources[0]["locator"] if sources else "#",
+                    "request_locator_count": len(sources), "matching_basis": "same_bundle_field_name_only"})
+        category = "html_execution" if row["sink"] in {"innerHTML.assignment", "innerHTML.object_property", "insertAdjacentHTML"} else "client_navigation"
+        out.candidate({"kind": "client_sink", "sink": row["sink"], "category": category,
+            "test_family": "xss" if category == "html_execution" else "generic",
+            "referenced_fields": names, "possible_input_bindings": bindings,
+            "binding_status": "ambiguous" if len(bindings) > 1 or limited else "possible" if bindings else "unresolved",
+            "references_limited": row.get("references_limited") is True, "bindings_limited": limited,
+            "value_kind": row.get("value_kind") if row.get("value_kind") in {"static", "reference", "dynamic"} else "dynamic",
+            "source_line": row.get("source_line"), "source_column": row.get("source_column"),
+            "sources": [out.source(at, "inferred")], "status": "unverified", "verification_level": "hint_only",
+            "hints_only": True, "taint_proven": False, "consumer_declaration_allowed": False,
+            "independent_evidence_required": True, "usable_for_confirmation": False, "requestable": False})
+        if limited:
+            out.limit("client_sink_input_bindings_truncated", at)
+    if rows:
+        out.limit("client_sink_name_matches_are_not_taint_or_runtime_proof")
+
+
 def _javascript(text, base_url, out):
     node = shutil.which("node")
     helper = Path(__file__).resolve().parents[1] / "src" / "parse-js.mjs"
@@ -675,7 +753,9 @@ def _javascript(text, base_url, out):
         if proc.returncode or len(proc.stdout.encode("utf-8")) > 16 * 1024 * 1024:
             out.limit("javascript_ast_parser_failed")
             return
-        result = json.loads(proc.stdout)
+        result = _bounded_json(proc.stdout)
+        if not isinstance(result, dict):
+            raise ValueError("invalid AST result")
     except (OSError, subprocess.TimeoutExpired, ValueError):
         out.limit("javascript_ast_parser_failed")
         return
@@ -694,6 +774,7 @@ def _javascript(text, base_url, out):
         out.operation(row["url"], row.get("method"), fields, at, "declared", base_url,
                       content_type=row.get("content_type", ""), protocol=row.get("protocol", "http"),
                       operation_name=row.get("operation_name", ""), candidate=not row.get("method"))
+    _client_sink_candidates(result.get("client_sinks", []), out)
     out.limit("static_javascript_does_not_prove_runtime_reachability")
 
 
@@ -719,16 +800,16 @@ def discover(path, format, base_url=None):
     if format == "javascript":
         _javascript(text, base_url, out)
     else:
-        try:
-            doc = json.loads(text)
-        except (ValueError, RecursionError) as exc:
-            raise ValueError("discovery input is not a bounded JSON document") from exc
+        doc = _bounded_json(text)
         if format == "openapi":
             _openapi(doc, base_url, out)
         elif format == "har":
             _har(doc, base_url, out)
         elif format == "artex":
             _artex(doc, base_url, out)
-        else:
+        elif format == "sarif":
             _sarif(doc, out)
+        else:
+            from .assessment_hints import ingest
+            ingest(doc, base_url, out)
     return out.result()

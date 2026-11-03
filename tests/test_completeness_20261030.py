@@ -212,7 +212,8 @@ class CompletenessTests(unittest.TestCase):
         self.assertTrue(any(row["operation_id"] == review["id"] and row["obligation_kind"] == "input_review" for row in rows))
         self.assertEqual({row["test_family"] for row in rows if row["operation_id"] == risky["id"] and "test_family" in row}, {"business_logic", "generic"})
         self.assertTrue(any(row["obligation_kind"] == "baseline" for row in rows))
-        self.assertEqual(result["queue_policy"], "family_round_robin")
+        self.assertEqual(result["queue_policy"], "coverage_first")
+        self.assertEqual(result["queue_fairness"], "family_and_operation_round_robin")
 
     def test_xss_family_requires_reviewed_runtime_not_static_machine_proof(self):
         operation = self.operation(inputs=[{"name": "description", "location": "query", "consumer": "html_render",
@@ -347,6 +348,14 @@ class CompletenessTests(unittest.TestCase):
         for name in ("use_points", "coupon", "discount", "qty", "order_time", "timestamp", "sign"):
             self.assertIn("business_logic", completeness.suggested_families({"name": name}, {"url": self.base}))
         self.assertIn("template_injection", completeness.suggested_families({"name": "rules"}, {"url": self.base + "/promo-rule"}))
+        self.assertIn("template_injection", completeness.suggested_families({"name": "label"}, {"url": self.base + "/api/merchant/promo-rule"}))
+        self.assertIn("sql_injection", completeness.suggested_families({"name": "order"}, {"url": self.base}))
+        self.assertNotIn("sql_injection", completeness.suggested_families({"name": "order_time"}, {"url": self.base}))
+        for name in ("shop_name", "description", "label"):
+            self.assertIn("xss", completeness.suggested_families({"name": name}, {"url": self.base}))
+        for name in ("username", "password", "captcha", "sms_code", "auth_token", "remember_me"):
+            self.assertIn("business_logic", completeness.suggested_families({"name": name}, {"url": self.base + "/api/admin/login"}))
+        self.assertIn("generic", completeness.suggested_families({"name": "redirect"}, {"url": self.base + "/pay"}))
         self.assertIn("deserialization", completeness.suggested_families({"name": "root", "location": "body"}, {"url": self.base + "/import-json"}))
         self.operation(inputs=[{"name": "image_url", "location": "query"}])
         engine.build_plan(self.project)

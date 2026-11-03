@@ -161,6 +161,45 @@ def _format_ratio(value):
     return "未定义（无可计算义务）"
 
 
+def _verification_level(project, finding):
+    """Derive assurance from accepted proof, never a submitted finding label."""
+    if finding.get("current") is not True:
+        return "historical"
+    decision = project.get("decision", finding.get("decision_id"), required=False)
+    if not decision or decision.get("outcome") != "confirmed":
+        return "unverified"
+    proof = decision.get("proof") if isinstance(decision.get("proof"), dict) else {}
+    oracle = decision.get("oracle") if isinstance(decision.get("oracle"), dict) else {}
+    if decision.get("runtime") or proof.get("channel") == "behavioural_diff":
+        return "runtime_verified"
+    item = project.get("obligation", decision.get("obligation_id"), required=False)
+    kind = oracle.get("type") if isinstance(oracle, dict) else None
+    if item and not item.get("superseded"):
+        if kind == "authorization" and item.get("kind") in {"access", "ownership"}:
+            return "runtime_verified"
+        if item.get("kind") == "input_test":
+            if isinstance(kind, str) and kind in {"sql_metadata", "error_channel", "state_invariant", "state_transition"}:
+                return "runtime_verified"
+            if kind == "extraction" and proof.get("scope") == "bounded_input_extraction" \
+                    and proof.get("test_family") in {"xxe", "ssrf", "path_traversal"}:
+                return "runtime_verified"
+    return "analyst_review" if decision.get("mode") == "analyst" else "unverified"
+
+
+def _verification_assurance(findings, candidates):
+    counts = {key: 0 for key in ("runtime_verified", "analyst_review", "unverified", "historical",
+                               "code_hint", "hint_only", "other_unverified")}
+    for finding in findings:
+        counts[finding["verification_level"]] += 1
+    for candidate in candidates:
+        kind = candidate.get("kind")
+        level = ("code_hint" if isinstance(kind, str) and kind in {"client_sink", "source_finding"} else
+                 "hint_only" if isinstance(kind, str) and kind in {"answer_key_hint", "validator_hint", "assessment_hint"} else "other_unverified")
+        counts[level] += 1
+    return {**counts, "hints_count_as_findings": False, "runtime_level_implies_full_coverage": False,
+            "note_zh": "运行时证实仅指当前接受的具体 HTTP/状态/浏览器证明；人工复核单列，不能按提交标签冒充 typed 证明。代码与答案键候选本身不计为发现，分数不代表独立漏洞证据。"}
+
+
 def _finding_groups(findings):
     severity_order = ("critical", "high", "medium", "low", "info")
     current = [item for item in findings if item.get("current") is True]
@@ -173,7 +212,8 @@ def _finding_groups(findings):
             groups.append({"severity": severity, "count": len(rows),
                            "findings": [{"id": item.get("id"), "title": item.get("title"),
                                           "category": item.get("category"),
-                                          "confirmed_scope": item.get("confirmed_scope")}
+                                          "confirmed_scope": item.get("confirmed_scope"),
+                                          "verification_level": item.get("verification_level")}
                                          for item in rows]})
     categories = {}
     for item in current:
@@ -303,6 +343,8 @@ _ZH = {
     "repair_evidence": "修复证据", "database_metadata": "数据库元信息读取",
     "sql_behaviour": "受控 SQL 业务行为差异", "browser_execution": "浏览器实际执行",
     "target": "目标", "scope": "授权范围", "exclude": "排除范围",
+    "runtime_verified": "运行时证实（限当前具体证明）", "analyst_review": "人工复核（非 typed 运行时证实）",
+    "code_hint": "代码级提示（待验证）", "hint_only": "答案键 / 评分提示（待验证）", "unverified": "未取得可分类的有效证明",
 }
 _ZH_PROSE = {
     "No experiment has been recorded for this obligation yet.": "尚未为该义务记录已求值实验。",
@@ -468,6 +510,13 @@ def _render(summary):
             "- 已登记操作 / 输入：" + str(evaluated.get("operations", 0)) + " / " + str(evaluated.get("inputs", 0))]
     if summary.get("reproduction_metadata_only") is True:
         rows.append("- 私有旧浏览器上下文不可恢复：本批仅导出安全台账元数据，不提供请求/正文文件或执行命令；恢复实际本地上下文后再准备复现，不自动重放未知执行。")
+    assurance = summary.get("verification_assurance") or {}
+    if assurance:
+        rows += ["- 验证等级：运行时证实 " + str(assurance.get("runtime_verified", 0))
+                 + "；人工复核 " + str(assurance.get("analyst_review", 0))
+                 + "；代码级提示 " + str(assurance.get("code_hint", 0))
+                 + "；答案键 / 评分提示 " + str(assurance.get("hint_only", 0)),
+                 "- 验证等级边界：" + _md(assurance.get("note_zh", "线索与评分不能替代独立运行时证明。"))]
     security = evaluated.get("security_coverage") or {}
     if security:
         rows.append("- 安全专项已求值：" + str(security.get("evaluated", 0)) + " / " + str(security.get("total", 0))
@@ -491,6 +540,7 @@ def _render(summary):
         rows += ["", "### " + _zh(item.get("severity")) + "：" + _md(item.get("title")), "",
                  "- 漏洞 / 判定：" + _md(item.get("id")) + " / " + _md(item.get("decision_id")),
                  "- 分类 / 复核方式：" + _md(_category_zh(item.get("category"))) + " / " + _zh(item.get("mode")),
+                 "- 验证等级：" + _zh(item.get("verification_level", "unverified")),
                  "- 已确认范围：" + _md(_zh(item.get("confirmed_scope") or "仅限已复核的具体观察，详见限制")),
                  "- 影响与原复核描述：" + _md(item.get("impact")), "- 修复建议：" + _md(item.get("remediation")),
                  "- 证据引用：" + _md(", ".join(item.get("evidence_ids") or []))]
@@ -644,7 +694,8 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         from .engine import evaluate_coverage
         from .continuation import control, require_finalization
         from .reproduction import prepare_reproduction
-        original = evaluate_coverage(project)
+        from .completeness import evaluate_with_inventory
+        original, inventory = evaluate_with_inventory(project)
         finalization = require_finalization(project, finalization_id, evaluated=original) if stage == "final" else None
         continuation = control(project, evaluated=original)
         if stage == "final":
@@ -655,7 +706,10 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             source_context["tscanplus"] = report_context(project)
         reproduction = prepare_reproduction(project, original.get("findings") or [],
             context=source_context)
-        evaluated = original
+        projections = reproduction.get("finding_projections", {})
+        evaluated = {**original, "findings": [
+            {**finding, **projections.get(finding.get("id"), {}),
+             "verification_level": _verification_level(project, finding)} for finding in original.get("findings", [])]}
         delivery = "draft" if stage == "draft" else "final-completed"
         from .browser import coverage as browser_coverage
         operation_metadata = []
@@ -680,6 +734,9 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             "scope": _scope(project.config),
             "coverage": evaluated,
             "finding_groups": _finding_groups(evaluated.get("findings") or []),
+            "verification_assurance": _verification_assurance(evaluated.get("findings") or [], inventory["candidates"] + [
+                item for item in inventory["proof_resolved_candidates"]
+                if isinstance(item.get("kind"), str) and item["kind"] in {"answer_key_hint", "validator_hint", "assessment_hint"}]),
             "operation_metadata": operation_metadata,
             "unverified_candidates": original["completion"]["unresolved_candidates"],
             "browser_coverage": browser_coverage(project),
@@ -745,6 +802,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             staging.rmdir()
     return {"stage": summary["stage"], "completion": summary["completion"], "continuation": summary["continuation"],
             "delivery_status": summary["delivery_status"], "finalization": summary["finalization"],
+            "verification_assurance": summary["verification_assurance"],
             "report": str(destination / "report.md"), "summary": str(destination / "summary.json"),
             "report_sha256": digest, "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
             "manifest": str(destination / "manifest.json"), "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),

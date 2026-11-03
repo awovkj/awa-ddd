@@ -11,6 +11,7 @@ ALL_FAMILIES = ("access_control", "sql_injection", "xss", "ssrf", "xxe", "path_t
                 "command_injection", "template_injection", "deserialization", "file_upload",
                 "business_logic", "generic")
 MIN_FRONTIER_ROUNDS = 2
+MAX_PARAMETER_PROGRESS_KEYS = 50000
 STOP_REASONS = {"completed"}
 REJECTED_STOP_REASONS = {"blocked", "budget_exhausted", "user_stop", "authorization_boundary"}
 STOP_POLICY = "exhaustion_only"
@@ -79,7 +80,7 @@ def _public(project, value):
                             isinstance(identity, str) and identity in known_ids for identity in item):
                         sanitized[key] = list(item)
                     elif key == "status" and isinstance(item, str) and item in {
-                            "reviewed", "blocked", "reopen", "planned", "not_applicable", "api_only"}:
+                            "reviewed", "blocked", "reopen", "planned", "completed", "not_applicable", "api_only"}:
                         sanitized[key] = item
                     elif key == "test_family" and isinstance(item, str) and item in ALL_FAMILIES:
                         sanitized[key] = item
@@ -350,6 +351,37 @@ def _references(project, declaration, *, required=False, cache=None):
     return _digest("FP", references)
 
 
+def _completed_family(project, family, inventory, cache):
+    from .completeness import _status, obligation_family
+
+    def incomplete(message):
+        return EngineError("frontier_categories", family + ": " + message,
+                           {"test_family": family, "next_action": "plan.audit", "help_action": "action.help",
+                            "help_input": {"name": "plan.checkpoint"}})
+
+    items = [item for item in inventory["obligations"] if item["kind"] != "baseline"
+             and obligation_family(item, inventory["operations"].get(item["operation_id"], {})) == family]
+    if not items or any(_status(item, inventory["gaps"]) != "evaluated" for item in items):
+        raise incomplete("completed requires nonempty, currently evaluated security obligations; inspect plan.audit")
+    if any(row.get("test_family") == family for key in ("scope_reductions", "consumer_requirements")
+           for row in inventory.get(key, [])):
+        raise incomplete("completed cannot hide a scope-reduction or untraced-consumer review")
+    decisions = []
+    for item in sorted(items, key=lambda row: row["id"]):
+        decision = inventory["decisions"].get(item.get("decision_id"))
+        if not decision or decision.get("obligation_id") != item["id"]:
+            raise incomplete("completed requires an accepted decision for every current obligation")
+        references = {"evidence_ids": decision.get("evidence_ids", []), "page_visit_ids": []}
+        visit_id = (decision.get("runtime") or {}).get("visit_id")
+        if visit_id:
+            references["page_visit_ids"].append(visit_id)
+        decisions.append({"obligation_id": item["id"], "decision": decision,
+                          "references": _references(project, references, required=True, cache=cache)})
+    # Bind completion to the accepted experiments, not a caller's label or an
+    # unrelated successful response. Revalidation reopens stale checkpoints.
+    return _digest("FC", decisions)
+
+
 def _frontier_review(project, value, inventory, cache=None):
     from .completeness import obligation_family
 
@@ -382,16 +414,22 @@ def _frontier_review(project, value, inventory, cache=None):
     result["categories"] = []
     for declaration in sorted(categories, key=lambda row: row["test_family"]):
         family, status = declaration["test_family"], declaration.get("status")
-        if status not in {"planned", "not_applicable", "blocked"}:
-            raise EngineError("frontier_categories", "Category status must be planned, not_applicable or blocked")
+        if status not in {"planned", "completed", "not_applicable", "blocked"}:
+            raise EngineError("frontier_categories", "Category status must be planned, completed, not_applicable or blocked")
         if status == "planned" and family not in planned:
-            raise EngineError("frontier_categories", "A planned family needs actual current security-test obligations")
+            raise EngineError("frontier_categories", family + ": planned requires actual current security-test obligations; input_review is not testing", {
+                "test_family": family, "next_action": "plan.audit", "help_input": {"name": "surface.declare_consumer"}})
         if status == "not_applicable" and family in planned:
-            raise EngineError("frontier_categories", "Applicability review cannot exclude an existing family's test obligations")
+            raise EngineError("frontier_categories", family + ": not_applicable cannot exclude an existing family's test obligations", {
+                "test_family": family, "next_action": "plan.audit", "help_input": {"name": "plan.checkpoint"}})
         row = {"test_family": family, "status": status, "reason": _text(declaration.get("reason"), family + ".reason"),
                "evidence_ids": _ids(declaration.get("evidence_ids", []), "evidence_ids"),
                "page_visit_ids": _ids(declaration.get("page_visit_ids", []), "page_visit_ids")}
         reference_signatures[family] = _references(project, row, required=status == "not_applicable", cache=cache)
+        if status == "completed":
+            reference_signatures[family] = _digest("FP", {
+                "declaration": reference_signatures[family],
+                "evaluated_family": _completed_family(project, family, inventory, cache)})
         result["categories"].append(row)
     result["reference_signatures"] = reference_signatures
     result["complete"] = result["discovery"]["status"] == "reviewed" \
@@ -572,25 +610,75 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
 
 
 def checkpoint(project, args):
-    from . import completeness, engine
+    from . import completeness, engine, parameter_coverage
 
     label = _text(args.get("label", "Assessment round checkpoint"), "label", 200)
     with project.transaction():
-        evaluated = engine.evaluate_coverage(project)
-        inventory = completeness._inventory(project, evaluated)
+        evaluated, inventory = completeness.evaluate_with_inventory(project)
         current = evaluated["continuation"]
         previous = project.list("checkpoint")
         frontier = _frontier_review(project, args["frontier_review"], inventory) if "frontier_review" in args else None
+        parameters = parameter_coverage.snapshot(project, evaluated, inventory=inventory)
+        projection = parameter_coverage.progress(project, evaluated, inventory=inventory)
+        tested_complete = parameters["summary"]["cell_total"] <= MAX_PARAMETER_PROGRESS_KEYS
+        variant_complete = tested_complete and parameters["summary"]["observations_limited_total"] == 0
+        if not tested_complete:
+            projection = {key: [] for key in projection}
+        elif not variant_complete:
+            projection["variant_keys"] = []
+        projection_complete = tested_complete and variant_complete
+        projection.update(version=2, tested_complete=tested_complete, variant_complete=variant_complete)
+        projection["complete"] = projection_complete
+        prior_projection = previous[-1].get("parameter_progress") if previous else None
+        prior_valid = isinstance(prior_projection, dict) and all(
+            isinstance(prior_projection.get(key), list) and len(prior_projection[key]) <= MAX_PARAMETER_PROGRESS_KEYS
+            and all(isinstance(identity, str) and len(identity) == 27 and identity.startswith("PC-")
+                    and all(char in "0123456789abcdef" for char in identity[3:]) for identity in prior_projection[key])
+            and len(set(prior_projection[key])) == len(prior_projection[key])
+            for key in ("tested_keys", "variant_keys", "consumer_review_keys"))
+        versioned = prior_valid and type(prior_projection.get("version")) is int and prior_projection["version"] == 2 \
+            and type(prior_projection.get("tested_complete")) is bool and type(prior_projection.get("variant_complete")) is bool \
+            and prior_projection.get("complete") is (prior_projection["tested_complete"] and prior_projection["variant_complete"]) \
+            and (prior_projection["tested_complete"] or not prior_projection["tested_keys"]) \
+            and (prior_projection["variant_complete"] or not prior_projection["variant_keys"])
+        # Legacy projections did not record observation-budget completeness.
+        # Their typed keys remain usable, but variants need a new honest baseline.
+        prior_tested = prior_valid and (versioned and prior_projection["tested_complete"] is True
+            or "version" not in prior_projection and prior_projection.get("complete") is True)
+        prior_variants = versioned and prior_projection["tested_complete"] is True and prior_projection["variant_complete"] is True
+        tested_comparable, variants_comparable = tested_complete and prior_tested, variant_complete and prior_variants
+        comparable = tested_comparable and variants_comparable
+        newly_tested = set(projection["tested_keys"]) - set(prior_projection.get("tested_keys", [])) if tested_comparable else set()
+        newly_varied = set(projection["variant_keys"]) - set(prior_projection.get("variant_keys", [])) if variants_comparable else set()
+        reopened = set(prior_projection.get("tested_keys", [])) - set(projection["tested_keys"]) if tested_comparable else set()
+        fields = ("id", "operation_id", "input_name", "input_location", "input_selector", "schema_branch", "test_family")
+
+        def changes(keys):
+            if not keys:
+                return []
+            return [{field: row.get(field) for field in fields} for row in parameters["items"] if row["id"] in keys][:10]
+
+        delta = {"comparison_available": comparable, "projection_complete": projection_complete,
+                 "tested_comparison_available": tested_comparable, "variant_comparison_available": variants_comparable,
+                 "tested_projection_complete": tested_complete, "variant_projection_complete": variant_complete,
+                 "newly_tested_total": len(newly_tested), "newly_observed_variants_total": len(newly_varied),
+                 "reopened_total": len(reopened), "newly_tested": changes(newly_tested),
+                 "newly_observed_variants": changes(newly_varied),
+                 "items_truncated": len(newly_tested) > 10 or len(newly_varied) > 10,
+                 "observation_is_testing": False}
         record = {"id": project.id("CP"), "label": label, "created_at": now(),
                   "snapshot_id": current["snapshot_id"], "progress_id": current["progress_id"],
                   "previous_checkpoint_id": previous[-1]["id"] if previous else None,
                   "progress_changed": bool(previous and previous[-1].get("progress_id") != current["progress_id"]),
                   "remaining": {key: current[key] for key in ("ready_total", "review_total", "blocked_total", "unresolved_total")},
-                  "completion_status": evaluated["completion"]["status"], "frontier_review": frontier}
+                  "completion_status": evaluated["completion"]["status"], "frontier_review": frontier,
+                  "parameter_progress": projection, "parameter_delta": delta}
         project.put("checkpoint", record, create_only=True)
         project.event("plan.checkpoint", {"checkpoint_id": record["id"], "progress_changed": record["progress_changed"]})
         updated = engine.evaluate_coverage(project)["continuation"]
-        public = _public(project, {"checkpoint": record, "continuation": updated, "requests_sent": 0,
+        public_record = {key: value for key, value in record.items() if key != "parameter_progress"}
+        from .publication import publish
+        public = publish(project, "plan.checkpoint", {"checkpoint": public_record, "continuation": updated, "requests_sent": 0,
             "note": "Repeated calls or captures are not closure progress. Review existing evidence or change the bounded hypothesis; never auto-replay uncertain writes."})
     return public
 

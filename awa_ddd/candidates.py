@@ -23,6 +23,7 @@ STATUSES = (UNVERIFIED, LINKED, DISMISSED)
 
 MAX_PAGE = 500
 DISMISSAL_BASES = {"outside_scope", "duplicate_operation"}
+ASSESSMENT_HINT_KINDS = {"answer_key_hint", "validator_hint", "assessment_hint"}
 _LIFECYCLE_FIELDS = {"status", "reason", "created_at", "updated_at", "link",
                      "candidate_closure", "candidate_closure_context"}
 
@@ -32,7 +33,7 @@ def _closure_context(candidate):
 
 
 _PUBLIC_KEYS = {"id", "kind", "url", "finalUrl", "method", "protocol", "name", "status", "category", "severity",
-                "origin", "operation_id", "legacy_id", "reason", "candidate_closure", "version", "basis",
+                "origin", "operation_id", "legacy_id", "reason", "candidate_closure", "version", "basis", "decision_ids",
                 "created_at", "updated_at", "source", "sources", "hint", "inputs", "selector", "location",
                 "consumer", "schema_branch", "schema_type", "schema_locator", "array_template", "required",
                 "test_families", "content_type", "operation_name", "auth", "allowed_roles", "ownership", "state_scope",
@@ -158,6 +159,16 @@ def _restore_candidate_controls(project, original, public, handles=None):
             identity = row.get("operation_id")
             if isinstance(identity, str) and identity in operation_ids and re.fullmatch(r"O-[a-f0-9]{24,32}", identity):
                 result["operation_id"] = identity
+            if field == "candidate_closure" and row.get("basis") == "assessed_hint" \
+                    and type(row.get("version")) is int and row["version"] == 1:
+                receipt = project.get("candidate", original.get("id"), required=False)
+                if receipt and canonical(receipt.get(field)) == canonical(row):
+                    result["version"], result["basis"] = 1, "assessed_hint"
+                    identities = row.get("decision_ids")
+                    if isinstance(identities, list) and all(isinstance(value, str)
+                            and re.fullmatch(r"D-[a-f0-9]{24,32}", value)
+                            and project.get("decision", value, required=False) for value in identities):
+                        result["decision_ids"] = list(identities)
     if _nonrequestable_metadata(public):
         public.update(url_redacted=True, locator_requires_binding=True, native_input_requires_binding=True, requestable=False)
     return public
@@ -286,6 +297,115 @@ def dismissal_valid(project, candidate, evaluated):
             return exc.code == "out_of_scope"
         return False
     except (EngineError, OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def hint_proof_valid(project, candidate, evaluated):
+    """Account an explicitly reviewed hint, not its score or an inferred taint path."""
+    closure = candidate.get("candidate_closure")
+    kind = candidate.get("kind")
+    if not isinstance(kind, str) or kind not in ASSESSMENT_HINT_KINDS or candidate.get("status") != LINKED \
+            or not isinstance(closure, dict) or set(closure) != {"version", "basis", "operation_id", "decision_ids"} \
+            or type(closure.get("version")) is not int or closure["version"] != 1 or closure.get("basis") != "assessed_hint":
+        return False
+    try:
+        from . import engine
+        from .completeness import obligation_family
+        from .scope import normalize_url, require_scope
+
+        if canonical(candidate.get("candidate_closure_context")) != canonical(_closure_context(candidate)):
+            return False
+        operation_id = closure["operation_id"]
+        if not isinstance(operation_id, str) or candidate.get("operation_id") != operation_id \
+                or not isinstance(candidate.get("link"), dict) or candidate["link"].get("operation_id") != operation_id:
+            return False
+        operation = project.get("operation", operation_id, required=False)
+        if not operation or operation.get("auth") == "unknown":
+            return False
+        url, hint = _concrete_url(candidate)
+        if urlsplit(url).query or require_scope(project.config, url) != normalize_url(operation["url"]):
+            return False
+        method = hint.get("method")
+        if method is not None and (not isinstance(method, str) or method.upper() != operation["method"]):
+            return False
+        for field, default in (("protocol", "http"), ("operation_name", "")):
+            if hint.get(field, default) != operation.get(field, default):
+                return False
+        if "content_type" in hint and hint["content_type"] != operation.get("content_type"):
+            return False
+        sources = candidate.get("sources", [])
+        if not isinstance(sources, list) or not sources or any(not isinstance(source, dict)
+                or not isinstance(source.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", source["sha256"])
+                or not isinstance(source.get("locator"), str) or not source["locator"] for source in sources):
+            return False
+        families = hint.get("suggested_test_families")
+        if not isinstance(families, list) or not families or len(families) > 12 \
+                or any(not isinstance(family, str) or family not in {"access_control", *engine.TEST_FAMILIES}
+                       for family in families) or len(set(families)) != len(families):
+            return False
+        identities = closure["decision_ids"]
+        if not isinstance(identities, list) or not 1 <= len(identities) <= 100 \
+                or any(not isinstance(value, str) for value in identities) or len(set(identities)) != len(identities):
+            return False
+        gaps = {item["id"] for item in evaluated.get("gaps", [])}
+        tests = []
+        for identity in identities:
+            decision = project.get("decision", identity, required=False)
+            if not decision or decision.get("outcome") not in {"confirmed", "refuted"}:
+                return False
+            item = project.get("obligation", decision.get("obligation_id"), required=False)
+            if not item or item.get("superseded") or item.get("operation_id") != operation_id \
+                    or item.get("status") != "evaluated" or item.get("decision_id") != identity or item["id"] in gaps \
+                    or item.get("kind") not in {"input_test", "access", "ownership"}:
+                return False
+            engine._decision_valid(project, decision)
+            family = obligation_family(item, operation)
+            if family not in families:
+                return False
+            tests.append((item, decision, family))
+        fields = hint.get("inputs")
+        if not isinstance(fields, list) or len(fields) > 2048 or not fields and families != ["access_control"]:
+            return False
+        requirements = []
+        for field in fields:
+            if not isinstance(field, dict) or not isinstance(field.get("location"), str) \
+                    or not isinstance(field.get("selector", field.get("name")), str):
+                return False
+            selector = field.get("selector", field.get("name"))
+            entries = [entry for entry in operation.get("inputs", []) if entry.get("location") == field["location"]
+                       and entry.get("selector") == selector
+                       and ("schema_branch" not in field or entry.get("schema_branch") == field["schema_branch"])]
+            if not entries:
+                return False
+            requirements.extend((entry["location"], entry["selector"], entry.get("schema_branch")) for entry in entries)
+        link = candidate["link"]
+        if link.get("input_location") is not None and not any(location == link["input_location"]
+                and selector == link.get("input_selector") for location, selector, _ in requirements):
+            return False
+        if not fields:
+            required = [item for item in project.list("obligation") if item.get("operation_id") == operation_id
+                        and not item.get("superseded") and item.get("kind") in {"access", "ownership"}]
+            return bool(required) and {item["id"] for item in required} <= {item["id"] for item, _, _ in tests} \
+                and (method is not None or any(decision["outcome"] == "confirmed" for _, decision, _ in tests))
+        for location, selector, branch in requirements:
+            matched = []
+            for item, decision, family in tests:
+                if item["kind"] == "input_test" and item.get("input_location") == location \
+                        and item.get("input_selector") == selector and item.get("schema_branch") == branch:
+                    matched.append((decision, family))
+                elif family == "access_control" and item["kind"] == "ownership" and branch is None:
+                    resource = project.get("resource", item.get("resource_id"), required=False) or {}
+                    binding = resource.get("request_binding") or {}
+                    if binding.get("location") == location and binding.get("selector") == selector:
+                        matched.append((decision, family))
+            # A positive independently proves one compatible hypothesis. Refuting
+            # only one RCE mechanism or a guessed native method cannot close it.
+            if any(decision["outcome"] == "confirmed" for decision, _ in matched):
+                continue
+            if method is None or not set(families) <= {family for decision, family in matched if decision["outcome"] == "refuted"}:
+                return False
+        return True
+    except (EngineError, OSError, ValueError, TypeError, KeyError, AttributeError):
         return False
 
 
@@ -522,9 +642,14 @@ def _assert_operation_inputs(project, operation_id, location, selector):
 def link_candidate(project, args):
     """把未解析线索记录成对应 Operation（可选到具体 Input）的关联。
 
-    只建立来源关系，不产生输入、不关闭义务、不生成证据：语义提升仍然要求
-    调用方显式 register 输入或执行实验。
+    普通关联只建立来源关系，不产生输入、不关闭义务、不生成证据。
+    可选 proof_decision_ids 仅以已有当前判据复核精确的评估提示，不继承评分权威。
     """
+    proof_requested = "proof_decision_ids" in args
+    identities = args.get("proof_decision_ids")
+    if proof_requested and (not isinstance(identities, list) or not 1 <= len(identities) <= 100
+            or any(not isinstance(value, str) for value in identities) or len(set(identities)) != len(identities)):
+        raise EngineError("candidate_closure", "proof_decision_ids must be a nonempty unique array of 1..100 current accepted decisions")
     with project.transaction():
         candidate = project.get("candidate", args["candidate_id"])
         if candidate.get("status") == DISMISSED:
@@ -544,10 +669,24 @@ def link_candidate(project, args):
                          link={"operation_id": operation_id,
                                "input_location": location, "input_selector": selector,
                                "linked_at": now(), "previous_operation_id": previous})
+        candidate.pop("candidate_closure", None)
+        candidate.pop("candidate_closure_context", None)
+        if proof_requested:
+            from .engine import evaluate_coverage
+
+            candidate["candidate_closure"] = {"version": 1, "basis": "assessed_hint",
+                "operation_id": operation_id, "decision_ids": sorted(identities)}
+            candidate["candidate_closure_context"] = _closure_context(candidate)
+            if not hint_proof_valid(project, candidate, evaluate_coverage(project)):
+                raise EngineError("candidate_closure", "Hint review needs exact source/input/family bindings and current accepted proof; a link, score, baseline, guessed method or same-named client sink is insufficient",
+                                  {"candidate_id": candidate["id"], "operation_id": operation_id,
+                                   "next_action": "candidate.inspect", "help_action": "action.help",
+                                   "help_input": {"name": "candidate.link"}})
         project.put("candidate", candidate)
         project.event("candidate.linked", {"candidate_id": candidate["id"],
                                            "operation_id": operation_id,
-                                           "input_selector": selector})
+                                           "input_selector": selector,
+                                           **({"proof_decision_ids": sorted(identities)} if proof_requested else {})})
         return _public_candidate(project, candidate)
 
 

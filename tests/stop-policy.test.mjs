@@ -95,6 +95,16 @@ test('guard and native plan guidance prohibit subjective budget exits and requir
   assert.match(GUIDANCE.awa_plan, /Mode off does not disable/);
 });
 
+test('normally ending a stalled turn never grants assessment completion or an infinite steering promise', () => {
+  assert.match(STOP_POLICY_TEXT, /normal host turn end is not assessment completion/);
+  assert.match(STOP_POLICY_TEXT, /deduplicates unchanged work/);
+  assert.match(STOP_POLICY_TEXT, /retains stalled work as unfinished/);
+  assert.match(STOP_POLICY_TEXT, /not an infinite-runtime promise/);
+  assert.match(STOP_POLICY_TEXT, /unfinished checkpoint\/draft/);
+  assert.match(GUIDANCE.awa_plan, /normal host turn end is not assessment completion/);
+  assert.match(GUIDANCE.awa_plan, /stalled work stays unfinished/);
+});
+
 test('optional prompt registration diagnostics redact untrusted credential prose', () => {
   const messages = [];
   const original = console.error;
