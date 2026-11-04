@@ -401,7 +401,7 @@ def _render_reproduction(detail):
     if not detail.get("available"):
         rows.append("- 复现资料不完整：" + _literal(detail.get("unavailable_reason") or "部分正文无法安全导出。"))
     rows += ["", "#### 渗透步骤与实际结果", "",
-             "下面是原台账的实际捕获顺序；命令仅为人工复核模板，报告生成未再次执行。响应内容为不可信、已脱敏摘录。", ""]
+             "下面是原台账的实际捕获顺序；请求数据包为人工复核模板，报告生成未再次发送。响应内容为不可信、已脱敏摘录。", ""]
     for step in detail.get("steps") or []:
         rows += [str(step["number"]) + ". " + _literal(step["role"]) + "：" + _literal(step["method"] + " " + step["url"]), "",
                  "- 主体：" + _literal(step.get("actor_id") or "匿名") + "; 会话引用：" + _literal(step.get("session_id") or "无")
@@ -420,17 +420,15 @@ def _render_reproduction(detail):
         if step.get("body_file"):
             rows.append("- 正文文件：[" + _literal(step["body_file"]) + "](" + step["body_file"] + ")")
         if step.get("placeholders"):
-            rows.append("- 执行前必须替换：" + _literal(", ".join(step["placeholders"])))
-        if step.get("request_body_excerpt"):
+            rows.append("- 发包前必须替换：" + _literal(", ".join(step["placeholders"])))
+        if step.get("http_request"):
+            rows += ["", "HTTP 请求数据包（复制到 Yakit Web Fuzzer / Burp Suite Repeater）：", ""]
+            rows += _code(step["http_request"], "http")
+        else:
+            rows.append("- 未生成 HTTP 请求数据包：" + _literal(step.get("unavailable_reason") or "缺少可校验的完整请求文件。"))
+        if not step.get("http_request") and step.get("request_body_excerpt"):
             rows += ["", "请求正文" + ("（摘录已截断，完整脱敏正文见文件）" if step.get("request_body_truncated") else "（已脱敏）") + "：", ""]
             rows += _code(step["request_body_excerpt"])
-        if step.get("curl"):
-            rows += ["", "PowerShell 验证模板（使用 curl.exe，不是 Invoke-WebRequest）：", ""]
-            rows += _code(step["curl"]["powershell"], "powershell")
-            rows += ["", "Linux / macOS / WSL 验证模板：", ""]
-            rows += _code(step["curl"]["posix"], "bash")
-        else:
-            rows.append("- 未生成执行模板：" + _literal(step.get("unavailable_reason")))
         rows += ["", "- 原捕获结果：HTTP " + str(step.get("status_code")) + "；捕获时间：" + _literal(step.get("captured_at")),
                  "- 原材料：" + _literal(step.get("source_artifact")) + "；SHA-256：" + _literal(step.get("source_sha256")),
                  "- 原响应正文 SHA-256：" + _literal(step.get("response_sha256")), "",
@@ -444,13 +442,14 @@ def _render_reproduction(detail):
         rows.append("- 原判定依据：" + _literal(detail["decision_reason"]))
     sqlmap = detail.get("sqlmap")
     if sqlmap:
-        rows += ["", "#### sqlmap 最终结果复核", ""]
+        rows += ["", "#### sqlmap 数据库元信息证据复核", ""]
         if sqlmap.get("available"):
+            metadata_label = {"database": "当前数据库名", "current_user": "当前数据库用户"}.get(sqlmap.get("metadata_type"), "数据库元信息")
             rows += ["- SQL 输入：" + _literal(sqlmap["input_location"] + ":" + sqlmap["input_selector"])
                      + "；sqlmap 参数：" + _literal(sqlmap["parameter"]),
                      "- 正常请求证据：" + _literal(sqlmap["baseline_evidence_id"]) + "；历史工具执行：" + _literal(sqlmap.get("tool_run_id") or "未执行工具，以 HTTP 证明为准"),
                      "- " + _literal(sqlmap["scope"]), "- " + _literal(sqlmap["note"]),
-                     "- 原证明记录的元信息：" + _literal(json.dumps(sqlmap.get("expected_recorded_metadata"), ensure_ascii=False)), "",
+                     "- 原证据获取的" + metadata_label + "：" + _literal(json.dumps(sqlmap.get("expected_recorded_metadata"), ensure_ascii=False)), "",
                      "PowerShell（先设置可信本机 sqlmap.py 的绝对路径到 $env:AWA_SQLMAP_PATH）：", ""]
             if sqlmap.get("recorded_profile"):
                 rows += ["历史实际执行配置（与建议复核模板分别列出）：", ""]
@@ -531,7 +530,9 @@ def _render(summary):
     rows += ["", "## 授权范围", ""]
     rows.extend("- " + _zh(key) + "：" + _md(json.dumps(value, ensure_ascii=False)) for key, value in summary["scope"].items())
     rows += ["", "## 漏洞详情与人工复现", "",
-             "所有命令均为人工复核模板：先核对授权范围、重新获取测试身份、替换 <AWA_...> 占位符，再按编号执行。",
+             "可安全导出的编号步骤展示完整的脱敏 HTTP 请求数据包，可复制到 Yakit Web Fuzzer 或 Burp Suite Repeater。",
+             "先核对授权范围、重新获取测试身份并替换 <AWA_...> 占位符；按该步 URL 设置目标主机、端口和 HTTP/HTTPS，再按编号发送。",
+             "保留请求头与正文之间的空行；修改正文或粘贴时换行改变后，让发包工具重新计算 Content-Length。",
              "正常基线、攻击/另一主体对照和阴性控制只在原证据存在时展示，不补造缺失实验。"]
     severity_order = {name: index for index, name in enumerate(("critical", "high", "medium", "low", "info"))}
     findings = sorted((item for item in evaluated.get("findings") or [] if item.get("current") is True),
@@ -551,7 +552,7 @@ def _render(summary):
         rows += _render_reproduction(detail) if detail else ["- 复现资料缺失：未找到可校验材料，不能猜造请求。"]
     historical = groups.get("historical_findings") or []
     if historical:
-        rows += ["", "## 历史 / 当前不可验证发现", "", "这些条目不计入当前风险分布，不生成当前漏洞复现命令。", ""]
+        rows += ["", "## 历史 / 当前不可验证发现", "", "这些条目不计入当前风险分布，不生成当前漏洞请求数据包。", ""]
         for item in historical:
             rows.append("- " + _md(item.get("id")) + "：" + _md(item.get("title") or item.get("category"))
                         + "；状态原因：" + _md(item.get("reason_code")))

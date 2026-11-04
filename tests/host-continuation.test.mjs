@@ -84,7 +84,8 @@ function setup({ query = async () => audit(), runner = async () => ({ ok: true, 
   const frames = new Map();
   return { ctx, controller, lifetime, diagnostics, calls, definitions,
     async step(subject, { turn = 1, messages = [user('Assess only the authorized fixture.')], signal = new AbortController().signal } = {}) {
-      frames.set(subject, { agent: subject, turn, step: 1, signal });
+      const previous = frames.get(subject);
+      frames.set(subject, { agent: subject, turn, step: previous?.turn === turn ? previous.step + 1 : 1, signal });
       subject.inbox.nextStep.length = 0;
       const decision = { kind: 'enter', messages };
       assert.equal(await ctx.step(frames.get(subject), decision), decision);
@@ -96,6 +97,50 @@ function setup({ query = async () => audit(), runner = async () => ({ ok: true, 
     },
     stop(subject, override = {}) { return ctx.stopping({ ...frames.get(subject), ...override }); },
   };
+}
+
+function actionablePages({ work = [], reviews = [], current = () => audit().data.continuation, onQuery } = {}) {
+  return async (settings, action, args) => {
+    assert.ok(['plan.audit', 'plan.next', 'plan.checkpoint'].includes(action), 'the guard only queries or checkpoints offline');
+    const result = { ok: true, data: { continuation: { ...current() }, requests_sent: 0 } };
+    if (action !== 'plan.checkpoint') {
+      const offset = args.offset ?? 0;
+      const limit = args.limit ?? 3;
+      const rows = action === 'plan.next' ? work : reviews;
+      Object.assign(result.data, { offset, limit, next_offset: offset + limit < rows.length ? offset + limit : null });
+      if (action === 'plan.next') Object.assign(result.data, {
+        work_items: rows.slice(offset, offset + limit), queue_total: work.length,
+        review_followups: reviews.slice(0, limit), review_followup_total: reviews.length,
+        ready_total: work.filter(row => row.queue_status === 'ready').length,
+        review_total: work.filter(row => row.queue_status === 'review').length, blocked_total: 0,
+      });
+      else Object.assign(result.data, { checklist: rows.slice(offset, offset + limit), checklist_total: reviews.length });
+    }
+    return onQuery ? onQuery(settings, action, args, result) : result;
+  };
+}
+
+function evidenceReview(number) {
+  return { id: 'CL-' + number.toString(16).padStart(24, '0'), kind: 'unassessed_observation', status: 'open',
+    action: 'evidence.inspect', evidence_id: 'E-' + number.toString(16).padStart(32, '0'),
+    operation_id: 'O-existing-sql', reason_zh: 'Inspect already captured SQL controls offline; do not repeat the request.' };
+}
+
+function adoptionReview() {
+  return { id: 'CL-' + 'b'.repeat(24), kind: 'orphan_browser_visit', status: 'open',
+    action: 'page.adopt', suggested_action: 'page.adopt', page_visit_id: 'PV-' + 'b'.repeat(32),
+    input_template: { page_visit_id: 'PV-' + 'b'.repeat(32) }, administrative_review_allowed: false,
+    browser_testing: { stage: 'review_existing', execution_blocked: false, must_call_playwright: true,
+      call_needed: false, invoke_now: false, existing_visit_id: 'PV-' + 'b'.repeat(32) } };
+}
+
+function messageTasks(message) {
+  const prefix = 'Current review/ready tasks: ';
+  const line = message.content[0].text.split('\n').find(value => value.startsWith(prefix));
+  assert.ok(line, 'a concrete handoff exposes structured current tasks');
+  return JSON.parse(line.slice(prefix.length)).flatMap(project => project.tasks.map(task => ({
+    ...task, project_id: project.project_id,
+  })));
 }
 
 async function offlineSdkFixture(project_id, body, { expectedRequests = 0, expectedRunTotal = 0,
@@ -346,8 +391,7 @@ test('closed work without the two complete frontier rounds is continued offline,
   const subject = agent('frontier-needed');
   await h.step(subject);
   await h.call(subject, 'assessment.evaluate');
-  assert.equal(h.controller.status().bound_projects, 0, 'standalone evidence review does not arm target testing');
-  await h.call(subject, 'plan.next');
+  assert.equal(h.controller.status().bound_projects, 1, 'standalone evidence assessment binds unfinished offline closure work');
   await h.stop(subject);
   assert.equal(subject.steered.length, 1);
   assert.match(subject.steered[0].content[0].text, /complete the evidence-bound discovery\/category\/page frontier/);
@@ -530,11 +574,419 @@ test('tracked notice IDs deduplicate pending input and unchanged consumed handof
   assert.equal(subject.steered.length, 1);
   await h.step(subject, { signal, messages: [subject.steered[0]] });
   await h.stop(subject);
-  assert.deepEqual(h.calls.map(call => call[1]), ['plan.audit', 'plan.audit', 'plan.checkpoint']);
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, 1);
+  const taskPages = h.calls.filter(call => call[1] === 'plan.next');
+  assert.equal(taskPages.length, 1, 'a stale handoff looks for a current concrete task once');
+  assert.ok(taskPages.every(call => call[2].offset === 0 && call[2].limit >= 1 && call[2].limit <= 3));
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
   assert.equal(subject.steered.length, 1);
   assert.equal(h.controller.status().stalled_checkpoints, 1);
   assert.equal(h.controller.status().bound_projects, 1);
   h.controller.dispose();
+});
+
+test('unchanged progress with saved SQL and browser material receives a concrete offline correction', async () => {
+  const review = evidenceReview(1);
+  const adopt = adoptionReview();
+  const h = setup({ query: actionablePages({ reviews: [review, adopt], current: () => audit({
+    ready_total: 58, review_total: 261, actionable_total: 319, blocked_total: 1, unresolved_total: 320,
+    progress_id: 'PR-existing-session-material', snapshot_id: 'CS-existing-session-material',
+  }).data.continuation }) });
+  const subject = agent('saved-material-handoff');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2, 'a consumed notice cannot release available offline work after only a checkpoint');
+  const correction = subject.steered[1].content[0].text;
+  assert.match(correction, /evidence\.inspect|page\.adopt/);
+  assert.ok(correction.includes(review.evidence_id) || correction.includes(adopt.page_visit_id),
+    'the correction carries the exact current saved-material handle');
+  assert.match(correction, /"ready_total":58/);
+  assert.match(correction, /"review_total":261/);
+  assert.ok(h.calls.some(call => call[1] === 'plan.next'), 'current work page was read instead of guessing a command');
+  const before = { notices: subject.steered.length, checkpoints: h.calls.filter(call => call[1] === 'plan.checkpoint').length };
+  for (let index = 0; index < 40; index++) {
+    await h.step(subject, { signal, messages: subject.inbox.nextStep.splice(0) });
+    await h.stop(subject);
+  }
+  assert.equal(subject.steered.length, before.notices, 'more available rows do not permit a zero-tool notification loop');
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, before.checkpoints);
+  assert.equal(h.controller.status().bound_projects, 1);
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+  h.controller.dispose();
+});
+
+test('a failed candidate review cannot monopolize a later SQL or browser archival handoff', async () => {
+  const candidate = { id: 'CL-' + 'c'.repeat(24), kind: 'candidate', status: 'open', action: 'candidate.inspect',
+    candidate_id: 'C-' + 'c'.repeat(32) };
+  const sql = evidenceReview(2);
+  const adopt = adoptionReview();
+  const h = setup({ query: actionablePages({ reviews: [candidate, sql, adopt], current: () => audit({ progress_id: 'PR-stalled-candidate' }).data.continuation }),
+    runner: async (_settings, action) => {
+      if (action === 'candidate.inspect') throw new BridgeError('fixture_candidate_read', 'The saved candidate cannot be read.');
+      return { ok: true, data: {} };
+    } });
+  const subject = agent('candidate-cannot-close-the-session');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await assert.rejects(h.call(subject, 'candidate.inspect', 'project-a', { candidate_id: candidate.candidate_id }));
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2);
+  const correction = subject.steered[1].content[0].text;
+  assert.ok(correction.includes(sql.evidence_id) || correction.includes(adopt.page_visit_id),
+    'a current unaffected saved-material task is handed off after the candidate failure');
+  assert.match(correction, /evidence\.inspect|page\.adopt/);
+  assert.equal(h.controller.status().bound_projects, 1);
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+  h.controller.dispose();
+});
+
+test('unchanged progress still hands off an existing SQL assessment with its exact controls', async () => {
+  const evidenceIds = [50, 51, 52].map(number => evidenceReview(number).evidence_id);
+  const assessment = { obligation_id: 'G-existing-sql-proof', operation_id: 'O-existing-sql-proof',
+    queue_status: 'ready', suggested_action: 'assessment.evaluate', execution_blocked: false, missing_prerequisites: [],
+    input_location: 'query', input_selector: 'sort', hypothesis_family: 'sql_injection', evidence_ids: evidenceIds,
+    input_template: { obligation_id: 'G-existing-sql-proof', evidence_ids: evidenceIds },
+    required_experiment_fields: ['oracle.type:error_channel', 'oracle.metadata_type:database', 'oracle.expected_value'],
+    browser_testing: { stage: 'backend_controls', must_call_playwright: false, call_needed: false, invoke_now: false } };
+  const h = setup({ query: actionablePages({ work: [assessment], reviews: [adoptionReview()],
+    current: () => audit({ progress_id: 'PR-existing-controls-not-yet-closed' }).data.continuation }),
+    runner: async (_settings, action) => {
+      if (action === 'assessment.evaluate') throw new BridgeError('fixture_missing_assertion', 'Select the actual saved metadata assertion.');
+      return { ok: true, data: {} };
+    } });
+  const subject = agent('review-then-partial-handoff');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: evidenceIds[1] });
+  await assert.rejects(h.call(subject, 'assessment.evaluate', 'project-a', { obligation_id: 'G-previous-baseline',
+    evidence_ids: [evidenceIds[0]], oracle: { type: 'baseline', selector: '/items', expected: [] } }));
+  await h.call(subject, 'page.adopt', 'project-a', adoptionReview().input_template);
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2, 'review attempts without a closed proof do not make partial text a valid exit');
+  const correction = subject.steered[1].content[0].text;
+  assert.match(correction, /assessment\.evaluate/);
+  assert.ok(correction.includes(assessment.obligation_id));
+  assert.ok(evidenceIds.every(id => correction.includes(id)), 'normal, recovery and negative controls remain attached');
+  assert.match(correction, /oracle\.expected_value|error_channel/);
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+  h.controller.dispose();
+});
+
+test('current task pages rotate after real review activity and stay bounded without activity', async () => {
+  const reviews = Array.from({ length: 8 }, (_, index) => evidenceReview(index + 10));
+  const h = setup({ query: actionablePages({ reviews, current: () => audit({ progress_id: 'PR-paged-offline-review' }).data.continuation }) });
+  const subject = agent('paged-review-activity');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2);
+  const first = subject.steered[1].content[0].text;
+  const attempted = reviews.find(row => first.includes(row.evidence_id));
+  assert.ok(attempted, 'a concrete first review is available to the model');
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  for (const action of ['plan.next', 'plan.audit', 'plan.checkpoint', 'report.build']) await h.call(subject, action);
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2, 'queue reads, checkpoints and drafts are not review attempts');
+  await h.step(subject, { signal, messages: [] });
+  await h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: attempted.evidence_id });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3, 'real saved-material review can advance another current task without a new PR');
+  const second = subject.steered[2].content[0].text;
+  assert.ok(reviews.some(row => second.includes(row.evidence_id) && !first.includes(row.evidence_id)),
+    'the review cursor progresses beyond the previously shown handles');
+  const pages = h.calls.filter(call => ['plan.next', 'plan.audit'].includes(call[1]));
+  assert.ok(pages.every(call => Number.isInteger(call[2].limit) && call[2].limit >= 1 && call[2].limit <= 3));
+  assert.ok(pages.some(call => call[2].offset > 0), 'independent current review pages are recovered beyond offset zero');
+  await h.step(subject, { signal, messages: [subject.steered[2]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3);
+  await h.step(subject, { signal, messages: [] });
+  await h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: attempted.evidence_id });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3, 'the same already counted review reference cannot keep rotating notices');
+  h.controller.dispose();
+});
+
+test('standalone offline preparation, assessment and archival actions bind only offline continuation', async () => {
+  const review = { ...evidenceReview(30),
+    browser_testing: { stage: 'review_existing', native_visit_input: { url: 'http://fixture.invalid/nested-target' } },
+    preparation_actions: [
+      { action: 'browser.visit', input_template: { url: 'http://fixture.invalid/nested-target', operation_id: 'O-nested-target' } },
+      { action: 'assessment.prepare', input_template: { evidence_id: evidenceReview(30).evidence_id } },
+    ],
+    assessment_followup_action: 'scenario.run', assessment_followup_input: { operation_id: 'O-nested-target' },
+  };
+  const ready = { obligation_id: 'G-network-ready', operation_id: 'O-network-ready', queue_status: 'ready',
+    suggested_action: 'http.preflight', input_template: { operation_id: 'O-network-ready' }, missing_prerequisites: [] };
+  const actions = [
+    ['assessment.prepare', { evidence_id: review.evidence_id }],
+    ['assessment.evaluate', { obligation_id: 'G-existing-proof', evidence_ids: [review.evidence_id],
+      oracle: { type: 'baseline', selector: '/ok', expected: true } }],
+    ['evidence.inspect', { evidence_id: review.evidence_id }],
+    ['finding.bind', { finding_id: 'F-existing', decision_id: 'D-existing', reviewer: 'fixture', reason: 'Reviewed saved proof' }],
+    ['finding.record', { decision_id: 'D-existing', title: 'Saved fixture proof', category: 'Information Disclosure',
+      impact: 'Observed saved material', remediation: 'Restrict access' }],
+    ['plan.review', { checklist_id: review.id, status: 'reviewed', reviewer: 'fixture', reason: 'Reviewed saved source' }],
+    ['page.adopt', { page_visit_id: adoptionReview().page_visit_id }],
+    ['run.recover', { run_id: 'RUN-existing', stale_seconds: 60 }],
+  ];
+  for (const [action, input] of actions) {
+    const h = setup({ query: actionablePages({ work: [ready], reviews: [review],
+      current: () => audit({ progress_id: 'PR-standalone-offline' }).data.continuation }) });
+    const subject = agent('offline-only-' + action);
+    const signal = await h.step(subject, { messages: [user('Review and archive saved evidence only; do not send new requests.')] });
+    await h.call(subject, action, 'project-a', input);
+    assert.equal(h.controller.status().bound_projects, 1, action + ' starts explicit offline lifecycle work');
+    await h.call(subject, 'plan.next');
+    await h.call(subject, 'plan.build');
+    await h.stop(subject);
+    await h.step(subject, { signal, messages: [subject.steered[0]] });
+    await h.stop(subject);
+    assert.equal(subject.steered.length, 2, action);
+    const messages = subject.steered.map(message => message.content[0].text).join('\n');
+    assert.match(messages, /offline/i);
+    assert.ok(messages.includes(review.evidence_id), action + ' hands off existing evidence instead of a target task');
+    assert.doesNotMatch(messages, /O-network-ready|G-network-ready|O-nested-target|fixture\.invalid\/nested-target/);
+    assert.doesNotMatch(messages, /"action":"browser\.visit"|"assessment_followup_action":"scenario\.run"/);
+    assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+    h.controller.dispose();
+  }
+});
+
+test('a current task lookup hands off fresh progress and unbinds fresh strict completion', async () => {
+  for (const outcome of ['progress', 'complete']) {
+    const oldReview = evidenceReview(70);
+    let live = audit({ progress_id: 'PR-before-current-page', snapshot_id: 'CS-before-current-page' }).data.continuation;
+    let changeOnLookup = false;
+    const h = setup({ query: actionablePages({ reviews: [oldReview], current: () => live,
+      onQuery: (_settings, action, _args, result) => {
+        if (changeOnLookup && action === 'plan.next') live = outcome === 'complete' ? finalAudit().data.continuation
+          : { ...live, progress_id: 'PR-after-current-page', snapshot_id: 'CS-after-current-page' };
+        if (live.state === 'finalized') return finalAudit();
+        return { ...result, data: { ...result.data, continuation: { ...live } } };
+      } }) });
+    const subject = agent('current-page-transition-' + outcome);
+    const signal = await h.step(subject);
+    await h.call(subject, 'plan.next');
+    await h.stop(subject);
+    await h.step(subject, { signal, messages: [subject.steered[0]] });
+    changeOnLookup = true;
+    await h.stop(subject);
+    if (outcome === 'complete') {
+      assert.equal(h.controller.status().bound_projects, 0, 'strict completion from an awaited page closes the binding');
+      assert.equal(subject.steered.length, 1);
+    } else {
+      assert.equal(subject.steered.length, 2, 'fresh progress cannot vanish behind an unchanged outer audit');
+      assert.match(subject.steered[1].content[0].text, /PR-after-current-page|CS-after-current-page/);
+      assert.ok(!subject.steered[1].content[0].text.includes(oldReview.evidence_id),
+        'a progress change produces a fresh continuation instead of stale task references');
+      assert.equal(h.controller.status().bound_projects, 1);
+    }
+    assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+    h.controller.dispose();
+  }
+});
+
+test('filtered task pages advance and failed unknown references cannot manufacture review activity', async () => {
+  const unavailable = Array.from({ length: 3 }, (_, index) => ({ ...evidenceReview(80 + index),
+    status: 'blocked', action: 'plan.audit', execution_blocked: true, missing_prerequisites: ['review_material_missing'] }));
+  const available = Array.from({ length: 5 }, (_, index) => evidenceReview(83 + index));
+  const h = setup({ query: actionablePages({ reviews: [...unavailable, ...available],
+    current: () => audit({ progress_id: 'PR-filtered-current-pages' }).data.continuation }),
+    runner: async (_settings, action) => {
+      if (action === 'evidence.inspect') throw new BridgeError('fixture_evidence_unavailable', 'The selected saved source cannot be inspected.');
+      return { ok: true, data: {} };
+    } });
+  const subject = agent('filtered-pages-and-invented-activity');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  const beforeLookup = h.calls.length;
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2, 'an all-filtered first page does not hide supported tasks on its next page');
+  const first = subject.steered[1].content[0].text;
+  const known = available.find(row => first.includes(row.evidence_id));
+  assert.ok(known);
+  assert.ok(unavailable.every(row => !first.includes(row.evidence_id)));
+  const lookupCalls = h.calls.slice(beforeLookup).filter(call => ['plan.next', 'plan.audit'].includes(call[1]));
+  assert.ok(lookupCalls.some(call => call[1] === 'plan.audit' && call[2].offset >= 3),
+    'the current review cursor advances within the same boundary');
+  assert.ok(lookupCalls.length <= 8 && lookupCalls.every(call => call[2].limit >= 1 && call[2].limit <= 3));
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  for (let index = 0; index < 4; index++) {
+    await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: evidenceReview(900 + index).evidence_id }));
+    await h.stop(subject);
+    assert.equal(subject.steered.length, 2, 'a failed nonexistent ID cannot rotate more current tasks');
+    await h.step(subject, { signal, messages: [] });
+  }
+  await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: known.evidence_id }));
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3, 'a real current source attempt may move to another supported task after failure');
+  const later = subject.steered[2].content[0].text;
+  assert.ok(available.some(row => later.includes(row.evidence_id) && !first.includes(row.evidence_id)));
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+
+  const prefix = Array.from({ length: 9 }, (_, index) => ({ ...evidenceReview(100 + index),
+    status: 'blocked', action: 'plan.audit', execution_blocked: true, missing_prerequisites: ['review_material_missing'] }));
+  const last = evidenceReview(109);
+  const longPages = actionablePages({ reviews: [...prefix, last],
+    current: () => audit({ progress_id: 'PR-beyond-bounded-scan' }).data.continuation });
+  const long = setup({ query: longPages, runner: longPages });
+  const longSubject = agent('review-beyond-nine-filtered-rows');
+  const longSignal = await long.step(longSubject);
+  await long.call(longSubject, 'plan.next');
+  await long.stop(longSubject);
+  await long.step(longSubject, { signal: longSignal, messages: [longSubject.steered[0]] });
+  await long.stop(longSubject);
+  assert.equal(longSubject.steered.length, 2, 'bounded scanning exposes an exact page recovery instead of parking an invisible cursor');
+  const recovery = messageTasks(longSubject.steered[1]).find(task => task.pagination_recovery);
+  assert.ok(recovery);
+  assert.equal(recovery.action, 'plan.audit');
+  assert.deepEqual(recovery.input_template, { offset: 9, limit: 3 });
+  assert.ok(!longSubject.steered[1].content[0].text.includes(last.evidence_id), 'the unvisited tenth row is not guessed');
+  await long.step(longSubject, { signal: longSignal, messages: [longSubject.steered[1]] });
+  await long.call(longSubject, 'plan.audit', recovery.project_id, { offset: 0, limit: 1 });
+  await long.stop(longSubject);
+  assert.equal(longSubject.steered.length, 2, 'an ordinary audit read does not satisfy the exact outstanding recovery');
+  const recovered = await long.call(longSubject, recovery.action, recovery.project_id, recovery.input_template);
+  assert.equal(recovered.data.checklist[0].evidence_id, last.evidence_id);
+  await long.stop(longSubject);
+  assert.equal(longSubject.steered.length, 3, 'the specific successful recovery permits handoff of the later supported source');
+  assert.ok(longSubject.steered[2].content[0].text.includes(last.evidence_id));
+  await long.step(longSubject, { signal: longSignal, messages: [longSubject.steered[2]] });
+  await long.call(longSubject, recovery.action, recovery.project_id, recovery.input_template);
+  for (let boundary = 0; boundary < 12; boundary++) {
+    await long.stop(longSubject);
+    await long.step(longSubject, { signal: longSignal, messages: longSubject.inbox.nextStep.splice(0) });
+  }
+  assert.equal(longSubject.steered.length, 3, 'a consumed pagination receipt and zero-tool tail cannot spin more handoffs');
+  assert.equal(long.calls.filter(call => call[1] === 'plan.checkpoint').length, 1);
+  assert.equal(long.controller.status().bound_projects, 1);
+  long.controller.dispose();
+});
+
+test('the same recovery page can advance two distinct progress states without duplicate read activity', async () => {
+  const prefix = Array.from({ length: 9 }, (_, index) => ({ ...evidenceReview(120 + index),
+    status: 'blocked', action: 'plan.audit', execution_blocked: true, missing_prerequisites: ['review_material_missing'] }));
+  const remaining = [evidenceReview(129), evidenceReview(130)];
+  let phase = 0;
+  const pages = (settings, action, args) => actionablePages({ reviews: [...prefix, remaining[phase]],
+    current: () => audit({ progress_id: 'PR-pagination-state-' + phase, snapshot_id: 'CS-pagination-state-' + phase }).data.continuation,
+  })(settings, action, args);
+  const h = setup({ query: pages, runner: pages });
+  const subject = agent('recovery-page-across-real-progress');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  for (phase = 0; phase < remaining.length; phase++) {
+    const genericCount = phase * 3 + 1;
+    await h.stop(subject);
+    assert.equal(subject.steered.length, genericCount);
+    assert.match(subject.steered.at(-1).content[0].text, new RegExp('PR-pagination-state-' + phase));
+    await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+    await h.stop(subject);
+    assert.equal(subject.steered.length, genericCount + 1);
+    const recovery = messageTasks(subject.steered.at(-1)).find(task => task.pagination_recovery);
+    assert.ok(recovery);
+    assert.equal(recovery.action, 'plan.audit');
+    assert.deepEqual(recovery.input_template, { offset: 9, limit: 3 }, 'both current states require the same exact page');
+    await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+    const beforeRead = h.controller.status().review_activity_receipts;
+    await h.call(subject, 'plan.audit', recovery.project_id, { offset: 0, limit: 1 });
+    await h.stop(subject);
+    assert.equal(subject.steered.length, genericCount + 1);
+    assert.equal(h.controller.status().review_activity_receipts, beforeRead, 'an ordinary read is never the recovery receipt');
+    const result = await h.call(subject, recovery.action, recovery.project_id, recovery.input_template);
+    assert.equal(result.data.checklist[0].evidence_id, remaining[phase].evidence_id);
+    await h.stop(subject);
+    assert.equal(subject.steered.length, genericCount + 2,
+      'the second progress state must not deduplicate its recovery against the first state');
+    assert.ok(subject.steered.at(-1).content[0].text.includes(remaining[phase].evidence_id));
+    assert.equal(h.controller.status().review_activity_receipts, beforeRead + 1);
+    await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+    await h.call(subject, recovery.action, recovery.project_id, recovery.input_template);
+    await h.call(subject, 'plan.audit', recovery.project_id, { offset: 0, limit: 1 });
+    for (let boundary = 0; boundary < 6; boundary++) {
+      await h.stop(subject);
+      await h.step(subject, { signal, messages: subject.inbox.nextStep.splice(0) });
+    }
+    assert.equal(subject.steered.length, genericCount + 2);
+    assert.equal(h.controller.status().review_activity_receipts, beforeRead + 1,
+      'repeating an already consumed page in the same state cannot mint more review activity');
+  }
+  assert.equal(h.calls.filter(call => call[1] === 'plan.checkpoint').length, 2);
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+});
+
+test('a deferred ninth project exposes and commits its concrete tasks only when it is shown', async () => {
+  const heldProject = 'held-review-project';
+  const heldReview = evidenceReview(1000);
+  const h = setup({ query: async (settings, action, args) => actionablePages({
+    reviews: args.project_id === heldProject ? [heldReview] : [],
+    current: () => audit({ progress_id: 'PR-' + args.project_id }).data.continuation,
+  })(settings, action, args) });
+  const subject = agent('fresh-projects-before-held-tasks');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next', heldProject);
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  for (let index = 0; index < 8; index++) await h.call(subject, 'plan.next', 'fresh-project-' + index);
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2);
+  const freshMessage = subject.steered[1].content[0].text;
+  for (let index = 0; index < 8; index++) assert.ok(freshMessage.includes('fresh-project-' + index));
+  assert.ok(!freshMessage.includes(heldProject), 'all message sections use the same shown-project slice');
+  assert.ok(!freshMessage.includes(heldReview.evidence_id), 'a hidden correction does not leak its task into the message');
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3);
+  const heldMessage = subject.steered[2].content[0].text;
+  assert.ok(heldMessage.includes(heldProject) && heldMessage.includes(heldReview.evidence_id),
+    'the previously omitted task remains unconsumed and is actually handed off');
+  await h.step(subject, { signal, messages: [subject.steered[2]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3, 'one shown concrete handoff cannot repeat without review activity');
+  assert.equal(h.controller.status().bound_projects, 9);
+  h.controller.dispose();
+});
+
+test('cancellation and pending real input win while a concrete stale task page is awaited', { timeout: 10000 }, async () => {
+  for (const change of ['cancel', 'user']) {
+    const waiting = deferred();
+    const started = deferred();
+    let hold = false;
+    const pages = actionablePages({ reviews: [evidenceReview(40)] });
+    const h = setup({ query: async (...args) => {
+      if (hold && args[1] === 'plan.next') { started.resolve(); await waiting.promise; }
+      return pages(...args);
+    } });
+    const subject = agent('late-concrete-task-' + change);
+    const turn = new AbortController();
+    await h.step(subject, { signal: turn.signal });
+    await h.call(subject, 'plan.next');
+    await h.stop(subject);
+    await h.step(subject, { signal: turn.signal, messages: [subject.steered[0]] });
+    hold = true;
+    const stopping = h.stop(subject);
+    await started.promise;
+    if (change === 'cancel') turn.abort();
+    else subject.inbox.nextTurn.push(user('Stop testing; explain the saved report.'));
+    waiting.resolve();
+    await stopping;
+    assert.equal(subject.steered.length, 1, 'late current-page data cannot supersede cancellation or user intent');
+    h.controller.dispose();
+  }
 });
 
 test('checkpoint and no-progress counter churn cannot rearm a consumed no-progress notice', async () => {
@@ -987,9 +1439,11 @@ test('an unavailable project receives offline-only recovery alongside other fres
   h.controller.dispose();
 });
 
-test('only explicit testing actions arm; old four-argument toolDefinitions API is unchanged', async () => {
+test('explicit assessment and archival actions arm; the old four-argument toolDefinitions API is unchanged', async () => {
   assert.ok(ARM_ACTIONS.includes('plan.next'));
   assert.ok(ARM_ACTIONS.includes('http.capture'));
+  assert.ok(ARM_ACTIONS.includes('assessment.prepare'));
+  assert.ok(ARM_ACTIONS.includes('finding.bind'));
   assert.equal(ARM_ACTIONS.includes('report.build'), false);
   let called = 0;
   const tools = toolDefinitions(defineTool, config, async () => { called++; return { ok: true, data: {} }; }, undefined);

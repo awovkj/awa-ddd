@@ -360,7 +360,7 @@ export const GROUPS = Object.freeze([{ name: 'awa_project',
     fields: GUIDANCE.awa_assess },
   { name: 'awa_report',
     description: 'Export Chinese evidence-backed reports/redacted reproduction without target traffic. The supported awaited host turn-stopping guard cannot retract streamed text or override real aborts; normal turn end is not completion.',
-    fields: 'report.coverage: offset/limit; follow render_recovery before next_offset. report.build: output_dir,stage:draft (default)|final. Draft success never authorizes stopping. Final needs current strict completed finalization_id; changed material invalidates it. Preserve interrupted work as unfinished checkpoint/draft. Generated reproduction commands are not executed; replace private credential/resource placeholders before authorized manual replay.' },
+    fields: 'report.coverage: offset/limit; follow render_recovery before next_offset. report.build: output_dir,stage:draft(default)|final. Draft success never authorizes stopping. Final needs current strict completed finalization_id. Preserve interruptions as unfinished checkpoint/draft. HTTP steps: full redacted packets and .http files for Yakit Web Fuzzer/Burp Suite Repeater. Replace placeholders; set host/port/HTTPS; update Content-Length after edits. SQLi adds bound sqlmap -r/-p commands with --current-db/--current-user. Export sends no requests.' },
   { name: 'awa_external',
     description: 'Discover local Yakit/sqlmap and loopback TscanPlus. Persist controlled execution and unverified results; never automatically execute scanner/route suggestions.',
     fields: GUIDANCE.awa_external },
@@ -422,7 +422,19 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
         const payload = { ...input, ...(args.project_id !== undefined ? { project_id: args.project_id } : {}) };
         const callerSignal = exec?.signal;
         const signal = ownerSignal && callerSignal ? AbortSignal.any([callerSignal, ownerSignal]) : ownerSignal ?? callerSignal;
-        const invocation = Object.freeze({ action: args.action, project_id: payload.project_id,
+        const references = {};
+        for (const field of ['operation_id', 'obligation_id', 'evidence_id', 'finding_id', 'decision_id', 'candidate_id',
+          'page_visit_id', 'run_id', 'checklist_id', 'session_id', 'resource_id', 'input_location', 'input_selector', 'schema_branch']) {
+          if (typeof payload[field] === 'string' && payload[field].length <= 200) references[field] = payload[field];
+        }
+        if (Array.isArray(payload.evidence_ids) && payload.evidence_ids.length <= 25
+          && payload.evidence_ids.every(identity => typeof identity === 'string' && identity.length <= 200)) {
+          references.evidence_ids = Object.freeze([...payload.evidence_ids]);
+        }
+        for (const field of ['offset', 'limit']) {
+          if (Number.isSafeInteger(payload[field]) && payload[field] >= 0) references[field] = payload[field];
+        }
+        const invocation = Object.freeze({ action: args.action, project_id: payload.project_id, input: Object.freeze(references),
           agent: exec?.agent, callerSignal, signal });
         const observe = async event => {
           if (typeof options?.observer !== 'function') return;

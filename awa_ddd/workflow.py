@@ -284,7 +284,12 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=(), 
                           and item.get("schema_branch") == gap.get("schema_branch")), {})
             row.update(suggested_test_families=suggested_families(entry, operation), hints_only=True,
                        declared_test_families=entry.get("test_families", []),
-                       note_zh="先追踪实际消费点；字段名提示不是已证实的 sink，不会自动创建或确认漏洞。")
+                       input_template={"operation_id": operation["id"], "input_location": gap["input_location"],
+                                       "input_selector": gap["input_selector"]},
+                       required_experiment_fields=["consumer", "actual consumer source or observed business flow; field-name hints are not evidence"],
+                       note_zh="先从实际源码或业务流程追踪消费点，再填写真实 consumer 并选择测试族；字段名提示不是已证实的 sink，不会自动创建或确认漏洞。")
+            if gap.get("schema_branch") is not None:
+                row["input_template"]["schema_branch"] = gap["schema_branch"]
         return row
     from .assessment import _authorized
     try:
@@ -627,7 +632,37 @@ def _fair_work_items(rows):
         for key in order:
             if lanes.get(key):
                 balanced.append(lanes[key].popleft())
-    return balanced
+    if not balanced:
+        return balanced
+
+    def existing_review(row):
+        action = row.get("underlying_suggested_action") if row.get("blocker_reconciliation_required") else row["suggested_action"]
+        return row["queue_status"] in {"ready", "review"} and bool(row.get("evidence_ids")) \
+            and (action in {"evidence.inspect", "assessment.evaluate", "finding.record"}
+                 or row.get("control_candidate_review_required") is True)
+
+    # Small pages must expose both saved-evidence review and unknown-consumer
+    # preparation. Keep the coverage-first lead and the remaining fair order.
+    opening = list(range(min(3, len(balanced))))
+    protected = {0}
+    for predicate in (existing_review, lambda row: row["obligation_kind"] == "input_review"):
+        present = next((index for index in opening if predicate(balanced[index])), None)
+        if present is not None:
+            protected.add(present)
+            continue
+        candidates = [index for index, row in enumerate(balanced) if predicate(row)]
+        if not candidates:
+            continue
+        candidate = min(candidates, key=lambda index: (
+            balanced[index]["obligation_kind"] == "baseline",
+            balanced[index].get("hypothesis_family") == balanced[0].get("hypothesis_family"),
+            balanced[index]["operation_id"] == balanced[0]["operation_id"], index))
+        slot = next(position for position in reversed(range(len(opening))) if opening[position] not in protected)
+        opening[slot] = candidate
+        protected.add(candidate)
+    opening.sort()
+    selected = set(opening)
+    return [balanced[index] for index in opening] + [row for index, row in enumerate(balanced) if index not in selected]
 
 
 def queue_inventory(project, evaluated, inventory=None):

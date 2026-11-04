@@ -35,11 +35,13 @@ coverage/
 !*.env.template
 !*.env.*.template
 
-# Assessment state, backups and temporary files.
+# Assessment state, generated recon/report outputs, backups and temporary files.
 projects/
 /data/
 /backup/
 /backups/
+/recon/
+/reports/
 *.sqlite*
 *.db
 *.db-wal

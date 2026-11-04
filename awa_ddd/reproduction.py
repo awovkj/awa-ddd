@@ -616,12 +616,13 @@ def _step(project, redactor, evidence, artifact, decision, index, folder, files)
                                             ("owner_actor_id", "external_id", "request_binding", "state")})
     if body is not None:
         parsed = urlsplit(url)
-        head = method + " " + parsed.path + ("?" + parsed.query if parsed.query else "") + " HTTP/1.1\r\nHost: " + parsed.netloc + "\r\n"
+        head = method + " " + (parsed.path or "/") + ("?" + parsed.query if parsed.query else "") + " HTTP/1.1\r\nHost: " + parsed.netloc + "\r\n"
         head += "".join(name + ": " + value + "\r\n" for name, value in headers.items())
         if body:
             head += "Content-Length: " + str(len(body)) + "\r\n"
         step["request_file"] = folder + "/" + stem + ".http"
         files[step["request_file"]] = head.encode("utf-8") + b"\r\n" + body
+        step["http_request"] = files[step["request_file"]].decode("utf-8")
         arguments = ["--http1.1", "--globoff", "--path-as-is", "--request", method, "--url", url,
                      "--connect-timeout", "5", "--max-time", "15", "--max-redirs", "0", "--noproxy", "*",
                      "--proto", "=http,https"]
@@ -643,15 +644,15 @@ def _step(project, redactor, evidence, artifact, decision, index, folder, files)
     return step
 
 
-def _manual_sql_parameter(project, step, location, selector):
+def _manual_sql_parameter(project, step, location, selector, *, request=None):
     from .inputs import json_document, locate_json, parse_form
-    evidence = project.get("evidence", step["evidence_id"])
-    artifact = project.read_artifact(evidence)
-    request = artifact["request"]
+    if request is None:
+        evidence = project.get("evidence", step["evidence_id"])
+        request = project.read_artifact(evidence)["request"]
     method = request["method"]
     if method not in {"GET", "POST"} or location not in {"query", "body"}:
         raise ValueError("This input needs a dedicated sqlmap marker/profile")
-    raw = _body_bytes(artifact, "request")
+    raw = _body_bytes({"request": request}, "request")
     if method == "GET" and (raw or location != "query"):
         raise ValueError("The GET profile supports one query input and no body")
     query = parse_form(urlsplit(request["url"]).query)
@@ -700,7 +701,7 @@ def _sqlmap(project, redactor, finding, decision, steps, folder):
     if proof.get("channel") == "behavioural_diff":
         return {"available": False, "reason": "已确认写侧 SQL 业务变化；对这类状态写执行 sqlmap 会重复修改资源，不能将其冒充只读元信息验证。"}
     baseline_id = proof.get("baseline_evidence_id") or proof.get("control_evidence_id")
-    step = next((item for item in steps if item["evidence_id"] == baseline_id), steps[0] if steps else None)
+    step = next((item for item in steps if item["evidence_id"] == baseline_id), None)
     if step is None or not step.get("request_file"):
         return {"available": False, "reason": "缺少可校验、可导出的正常 SQL 请求，不能猜造 sqlmap 命令。"}
     obligation = project.get("obligation", decision.get("obligation_id"), required=False) if decision.get("obligation_id") else {}
@@ -747,8 +748,10 @@ def _sqlmap(project, redactor, finding, decision, steps, folder):
             "request_file": step["request_file"], "tool_run_id": proof.get("tool_run_id"),
             "request_method": step["method"], "recorded_profile": redactor.metadata(recorded.get("profile")),
             "commands": commands, "scope": scope, "manual_only": True, "executed_by_report": False,
+            "metadata_type": proof.get("metadata_type"),
             "expected_recorded_metadata": redactor.structured(proof.get("recovered_value")),
-            "note": "这是待人工执行的验证模板，不是本次报告新执行的结果。先设置 AWA_SQLMAP_PATH 并替换 HTTP 文件中的占位符。"
+            "note": "从本报告目录运行 sqlmap 命令，将输出的 current database / current user 与原证据核对。"
+                    "这是待人工执行的验证模板，不是本次报告新执行的结果。先设置 AWA_SQLMAP_PATH 并替换 HTTP 文件中的占位符。"
                     + " 建议配置仅含 BEU，不覆盖时间盲注 T 或高风险/带外技术；未记录的历史 profile 不冒充已执行。"
                     + (" JSON 参数按字段名交给 sqlmap；嵌套同名字段必须人工确认实际注入点。" if location in {"body", "graphql"} else "")}
 
@@ -820,7 +823,8 @@ def prepare_reproduction(project, findings, *, context=None):
         folder = "reproduction/" + _component(finding["id"], "F")
         detail = {"available": False, "steps": [], "prerequisites": [
             "仅在原授权范围和隔离测试环境复现；不要使用真实用户、生产订单或生产资金。",
-            "从本报告目录运行命令。所有 <AWA_...> 均为待替换占位符，未替换的模板不能直接复现。"],
+            "将完整 HTTP 请求数据包复制到 Yakit Web Fuzzer 或 Burp Suite Repeater，按该步 URL 设置目标主机、端口和 HTTP/HTTPS。"
+            "所有 <AWA_...> 均为待替换占位符；替换正文后让发包工具重新计算 Content-Length。"],
             "limitations": [], "manual_only": True, "executed_by_report": False}
         try:
             decision = project.get("decision", finding["decision_id"])
@@ -866,15 +870,16 @@ def prepare_reproduction(project, findings, *, context=None):
         files["reproduction/README.md"] = (
             "# 人工复现材料\n\n这些文件由经过摘要和当前血缘校验的真实 HTTP 观察派生。报告生成未发送请求。\n\n"
             "1. 仅在授权测试环境操作，准备自建账号/资源并保存初始状态。\n"
-            "2. 从报告目录运行。先替换每个 `<AWA_...>` 占位符；认证、验证码、密码、签名等不能使用历史明文。\n"
-            "3. 按 report.md 的编号顺序核对 curl 请求和结果；HTTP 文件可导入 Burp、Yakit 或 sqlmap。\n"
+            "2. 先替换每个 `<AWA_...>` 占位符；认证、验证码、密码、签名等使用当前测试值。\n"
+            "3. 按 report.md 的编号顺序，将完整 HTTP 请求数据包复制到 Yakit Web Fuzzer 或 Burp Suite Repeater；"
+            "也可打开对应 `.http` 文件。按该步 URL 设置目标主机、端口和 HTTP/HTTPS，保留请求头与正文之间的空行。\n"
             "4. SQL 验证先将 `AWA_SQLMAP_PATH` 设置为本机可信 sqlmap.py 的绝对路径；命令仅验证只读元信息。\n"
             "5. JSON 的敏感字段替换可能规范化 JSON 格式；XML/文本/multipart 除秘密替换外保留已捕获 UTF-8 字节。"
-            "二进制正文不自动导出。HTTP Content-Length 根据导出字节重新计算。\n"
-            "6. 状态变更只执行于自建资源，结束后人工清理并核对业务状态。不要把模板命令视作已执行结果。\n"
+            "二进制正文不自动导出。HTTP Content-Length 根据导出字节重新计算；替换正文或粘贴时换行改变后，让发包工具更新长度。\n"
+            "6. 状态变更只执行于自建资源，结束后人工清理并核对业务状态。请求数据包是人工复核模板。\n"
         ).encode("utf-8")
     # A final pass uses the complete secret registry for both bytes and metadata.
-    # Recompute framing after any late replacement, not only the displayed curl.
+    # Recompute framing after any late replacement before displaying the packet.
     for path, data in list(files.items()):
         if path.endswith(".http"):
             head, separator, body = data.partition(b"\r\n\r\n")
@@ -892,5 +897,12 @@ def prepare_reproduction(project, findings, *, context=None):
             files[path] = clean
         else:
             files[path] = redactor.content(data.decode("utf-8")).encode("utf-8")
-    return {"finding_details": redactor.scrub_generated(details), "finding_projections": finding_projections,
+    sanitized_details = redactor.scrub_generated(details)
+    for identity, detail in details.items():
+        for source, target in zip(detail["steps"], sanitized_details[identity]["steps"]):
+            data = files.get(source.get("request_file"))
+            if data is not None:
+                # Protocol framing and lengths come from the final request bytes.
+                target["http_request"] = data.decode("utf-8")
+    return {"finding_details": sanitized_details, "finding_projections": finding_projections,
             "files": files, "redactor": redactor, "warnings": warnings}

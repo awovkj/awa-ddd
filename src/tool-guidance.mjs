@@ -1,14 +1,14 @@
 /** Short tool-selection guidance; exact schemas and examples live in action.help. */
 export const GUIDANCE = Object.freeze({
   awa_plan: [
-    'Start: surface.recon collection -> surface.import/batch -> plan.next(limit:3,parameter_limit:3); prepare verified identity/fixtures first. plan.list/plan.audit use offset/limit; queues keep family/operation fairness. Empty pages are not exhaustion.',
+    'Start: surface.recon -> surface.import/batch -> plan.next(limit:3,parameter_limit:3); first prepare verified identity/fixtures. plan.list/audit: offset/limit,family/operation fairness. Empty pages are not exhaustion.',
     'parameter_coverage: independent offset/limit/status,default <=3. Carried/observed is not typed tested. Inspect controls offline. render_recovery.combined_input recovers current pages; render_actionable:false cannot execute.',
-    'browser_testing required or assisted both have must_call_playwright:true. Check stage/call_needed/invoke_now; prepare controls first, review_existing offline, and never bypass blocked scope/identity/fixture/provider prerequisites.',
-    'Follow continuation.continue_required: plan.audit -> plan.next/review_followups -> execute or review -> plan.checkpoint. Recover omitted CURRENT pages before next_offset. no_progress_rounds means change the hypothesis or reconcile existing evidence, not repeat uncertain writes.',
-    'plan.checkpoint: label,frontier_review; use help for evidence-bound discovery, all 12 categories and pages. Finalization needs two COMPLETE current same-snapshot frontier rounds, complete nonempty registered coverage and ZERO ready/review/blocked/unresolved work.',
+    'browser_testing required/assisted: must_call_playwright:true. Check stage/call_needed/invoke_now; prepare controls,review_existing offline. Preserve scope/identity/fixture/provider prerequisites.',
+    'While continuation.continue_required,review each registered input,saved HTTP/browser control: plan.audit -> plan.next/review_followups -> inspect,prepare/evaluate,bind/archive -> plan.checkpoint. Finish CURRENT pages before next_offset. no_progress_rounds: switch items or fix prerequisites,not repeat uncertain writes.',
+    'plan.checkpoint: label,frontier_review. Finalization: two COMPLETE current same-snapshot discovery/all 12 categories/page frontier rounds,complete nonempty registered coverage,ZERO ready/review/blocked/unresolved work.',
     'plan.review reconciles administrative checklist_id only, never security obligations/candidates/runs. plan.disposition: obligation_id,status:open|blocked|not_applicable,reason. Caller blocked/N/A or removed families do not erase work; follow offline blocker_reconciliation_required and typed proof.',
-    'plan.finalize: checkpoint_id,reason:completed,explanation,reviewer. budget_exhausted/user_stop/authorization_boundary/blocked are rejected exits; findings, context pressure and elapsed time do not prove exhaustion. report.build stage:draft is progress only; stage:final needs the current finalization_id.',
-    'A normal host turn end is not assessment completion; stalled work stays unfinished with a checkpoint,not infinite steering. Obey user stop/host abort. Mode off does not disable engine gates.',
+    'plan.finalize: checkpoint_id,reason:completed,explanation,reviewer. Reject budget_exhausted/user_stop/authorization_boundary/blocked; findings,context pressure,time do not prove exhaustion. report.build stage:draft is progress; stage:final needs current finalization_id.',
+    'A normal host turn end is not assessment completion. Use concrete current review/ready tasks before a partial handoff; stalled work stays unfinished. Zero-tool repeats stay bounded. Obey user stop/host abort. Mode off does not disable engine gates.',
   ].join(' '),
   awa_browser: [
     'Use real Playwright when required or assisted; Assisted also means mandatory for materially useful UI/login/dynamic-token/multi-role/file-upload/business workflows. Browser contexts include XSS/DOM,CSRF/CORS,clickjacking/CSP,SameSite/HttpOnly/Secure,postMessage,OAuth/OIDC. Pure backend proof need not be browserized.',

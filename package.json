@@ -73,6 +73,8 @@
     "!**/data/**",
     "!**/backup/**",
     "!**/backups/**",
+    "!**/reports/**",
+    "!**/recon/**",
     "!**/tests/**",
     "!**/build/**",
     "!**/dist/**",

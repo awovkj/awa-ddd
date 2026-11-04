@@ -71,13 +71,13 @@ required 和 assisted 都要求实际 Playwright；assisted 不是可选建议�
 
 ## 推进、无进展与交付
 
-按有效工作执行 `plan.audit → plan.next/review_followups → 实验或离线复核落账 → plan.checkpoint`。setup/input/baseline、未归档候选和安全义务分别统计，不把队列条数当漏洞数或召回率。行政 `plan.review` 不关闭安全义务；caller-only blocked/N/A 不是前提或安全证明，按当前离线 reconciliation 模板修正，真实缺前提仍保留。
+逐项复核登记输入、HTTP 控制及浏览器材料，以 accepted typed 正/阴性判据闭环并绑定/归档。`plan.next`/`plan.audit` → 复核/准备落账 → `plan.checkpoint`；读队列/CP非复核。`plan.review`仅行政，blocked/N/A文字非证明。
 
-`continue_required:true` 表示评估未完成，推进当前授权内可做的工作；数量、低收益、请求数或草稿不证明耗尽，不能编造 budget/user_stop/authorization_boundary 来结项。**正常轮次结束不等于评估完成**。相同 closure/frontier 只留一次未完成检查点，换假设或补前提，不重复流量、答复和通知。raw/CP/no_progress 计数不算闭环进展。真实用户取消、新意图和宿主中断优先。
+`continue_required:true` 时推进获准工作，partial/预算非收尾，勿编造取消/预算。**正常轮次结束不等于评估完成**。同 PR 仅 CP 不放行；守卫取具体 ready/review 小页，实际复核/准备回执后再走游标，零工具重复提醒有界。offline-only 绑定仅复核，不授权新流量；真实取消/新意图/宿主中断优先，真实缺前提留 unfinished。
 
-`plan.finalize` 只接受 `reason:completed`，须非空登记范围、有效求值覆盖、零 ready/review/blocked/unresolved、最新同快照 CP 和两轮完整有效证据绑定的 discovery/全部 12 族/pages frontier。`can_finalize` 不是已完成；成功当前 FN 后 `automatic_stop_allowed/can_claim_complete` 才为 true，且只限实际登记范围。未完成留 CP 和 `report.build stage:draft`；`stage:final` 必须引用当前严格 FN，材料变化后旧 FN 失效。不能把未完成交接、抑制重复提醒或实际取消伪造成最终收尾。
+`plan.finalize` 仅 `reason:completed`：登记范围非空、有效求值覆盖、零 ready/review/blocked/unresolved、最新同快照 CP、两轮完整有效证据绑定的 discovery/全部 12 族/pages frontier。`can_finalize` 非完成；当前严格 FN 成功才使 `automatic_stop_allowed/can_claim_complete:true`，限登记范围。未完成存 CP 和 `report.build stage:draft`；`stage:final` 引当前严格 FN，变更使旧 FN 失效。交接/抑制提醒/取消非最终完成。
 
-渲染上限 24 KiB。按 `render_recovery.combined_input/pages` 和原过滤恢复当前主/参数页，再走游标。`render_actionable:false` 的截断模板不可执行；单项太大走 detail，不循环或跳过。中文报告含证据编号及脱敏模板，先替换凭据/自建资源才能授权复测；生成命令不自动执行。
+渲染限 24 KiB。按 `render_recovery.combined_input/pages` 和原过滤恢复主/参数页后走游标；单项过大走 detail，不循环/跳过。`render_actionable:false` 不执行。报告给完整脱敏 HTTP 包供 Yakit/Burp；SQL 默认 sqlmap 取库名/用户，不可用列原因；生成不发包。
 
 并行委派只交接同一 backend/workspace/project_id、scope、operation/obligation/input 与 session/resource 引用；返回 run/evidence/candidate/decision ID 和未满足前提，不复制凭据、不靠口头结论确认，不跨 native/WSL 并发共享 SQLite。
 

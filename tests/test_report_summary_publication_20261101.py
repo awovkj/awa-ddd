@@ -66,6 +66,20 @@ class ReportSummaryPublicationTests(unittest.TestCase):
         finding = self.fixture.finding([evidence["id"]])
         return operation, evidence, finding
 
+    def recorded_sql(self):
+        operation = self.fixture.operation("/products", inputs=[{"name": "sort", "location": "query", "consumer": "sql_order_by"}])
+        engine.build_plan(self.project)
+        obligation = next(row for row in self.project.list("obligation") if row["kind"] == "input_test")
+        values = ["price", "extractvalue(1,concat(0x7e,database(),0x7e))", "extractvalue(1,concat(0x7e,12345,0x7e))"]
+        replies = [{"items": [{"name": "normal"}]}, {"error": "~shop_fixture~"}, {"error": "no database metadata"}]
+        evidence = [self.fixture.capture(operation, response=response, url=operation["url"] + "?sort=" + quote(value, safe=""))
+                    for value, response in zip(values, replies)]
+        decision = evaluate(self.project, {"obligation_id": obligation["id"], "evidence_ids": [row["id"] for row in evidence],
+            "oracle": {"type": "error_channel", "metadata_type": "database", "expected_value": "shop_fixture", "response_pattern": r"~(?P<value>[^~]+)~"}})
+        finding = record_finding(self.project, {"decision_id": decision["id"], "title": "Bound SQL fixture", "category": "SQL Injection",
+                                              "impact": "Recorded metadata", "remediation": "Allowlist the sort expression"})
+        return evidence, decision, finding
+
     def raw_summary(self, findings=()):
         evaluated = engine.evaluate_coverage(self.project)
         prepared = reproduction.prepare_reproduction(self.project, list(findings))
@@ -201,12 +215,23 @@ class ReportSummaryPublicationTests(unittest.TestCase):
         current = engine.evaluate_coverage(self.project)["findings"]
         summary, prepared = self.raw_summary(current)
         summary["reproduction"][finding["id"]]["steps"][0]["curl"] = {"posix": "unsafe invented command", "powershell": "unsafe invented command"}
+        summary["reproduction"][finding["id"]]["steps"][0]["http_request"] = "GET /invented HTTP/1.1\r\nHost: unrelated.invalid\r\n\r\n"
         original = deepcopy(summary)
         public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files=prepared["files"])
         step = public["reproduction"][finding["id"]]["steps"][0]
         self.assertNotIn("unsafe invented command", canonical(step["curl"]))
         self.assertEqual("curl", shlex.split(step["curl"]["posix"])[0])
+        self.assertEqual(prepared["files"][step["request_file"]].decode("utf-8"), step["http_request"])
+        self.assertNotIn("unrelated.invalid", step["http_request"])
         self.assertEqual(original, summary)
+
+    def test_http_packet_is_not_published_without_bound_request_files(self):
+        _, _, finding = self.recorded()
+        current = engine.evaluate_coverage(self.project)["findings"]
+        summary, prepared = self.raw_summary(current)
+        summary["reproduction"][finding["id"]]["steps"][0]["http_request"] = "GET /invented HTTP/1.1\r\nHost: unrelated.invalid\r\n\r\n"
+        public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files={})
+        self.assertNotIn("http_request", public["reproduction"][finding["id"]]["steps"][0])
 
     def test_legacy_unavailable_context_exports_only_metadata_with_no_private_request_files(self):
         secret = "synthetic-unknown-legacy-token"
@@ -228,17 +253,7 @@ class ReportSummaryPublicationTests(unittest.TestCase):
 
     def test_sqlmap_request_reference_and_profile_are_rebuilt_from_safe_bound_material(self):
         self.fill("12")
-        operation = self.fixture.operation("/products", inputs=[{"name": "sort", "location": "query", "consumer": "sql_order_by"}])
-        engine.build_plan(self.project)
-        obligation = next(row for row in self.project.list("obligation") if row["kind"] == "input_test")
-        values = ["price", "extractvalue(1,concat(0x7e,database(),0x7e))", "extractvalue(1,concat(0x7e,12345,0x7e))"]
-        replies = [{"items": [{"name": "normal"}]}, {"error": "~shop_fixture~"}, {"error": "no database metadata"}]
-        evidence = [self.fixture.capture(operation, response=response, url=operation["url"] + "?sort=" + quote(value, safe=""))
-                    for value, response in zip(values, replies)]
-        decision = evaluate(self.project, {"obligation_id": obligation["id"], "evidence_ids": [row["id"] for row in evidence],
-            "oracle": {"type": "error_channel", "metadata_type": "database", "expected_value": "shop_fixture", "response_pattern": r"~(?P<value>[^~]+)~"}})
-        finding = record_finding(self.project, {"decision_id": decision["id"], "title": "Bound SQL fixture", "category": "SQL Injection",
-                                              "impact": "Recorded metadata", "remediation": "Allowlist the sort expression"})
+        evidence, _, finding = self.recorded_sql()
         _, folder, summary, _ = self.report()
         sqlmap = summary["reproduction"][finding["id"]]["sqlmap"]
         arguments = shlex.split(sqlmap["commands"]["posix"])
@@ -249,6 +264,70 @@ class ReportSummaryPublicationTests(unittest.TestCase):
         self.assertNotIn("--dump", arguments)
         self.assertTrue(sqlmap["manual_only"])
         self.assertFalse(sqlmap["executed_by_report"])
+        self.assertEqual("database", sqlmap["metadata_type"])
+        self.assertEqual(evidence[0]["id"], sqlmap["baseline_evidence_id"])
+
+    def test_sqlmap_caller_parameter_attack_baseline_and_metadata_type_are_not_trusted(self):
+        evidence, _, finding = self.recorded_sql()
+        summary, prepared = self.raw_summary(engine.evaluate_coverage(self.project)["findings"])
+        detail = summary["reproduction"][finding["id"]]
+        detail["sqlmap"].update(parameter="invented --dump", input_location="body", input_selector="/invented",
+                               baseline_evidence_id=evidence[1]["id"], request_file=detail["steps"][1]["request_file"],
+                               metadata_type="current_user", commands={"posix": "unsafe invented command", "powershell": "unsafe invented command"})
+        original = deepcopy(summary)
+        public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files=prepared["files"])
+        sqlmap = public["reproduction"][finding["id"]]["sqlmap"]
+        arguments = shlex.split(sqlmap["commands"]["posix"])
+        self.assertTrue(sqlmap["available"])
+        self.assertEqual("sort", arguments[arguments.index("-p") + 1])
+        self.assertEqual(detail["steps"][0]["request_file"], arguments[arguments.index("-r") + 1])
+        self.assertEqual(evidence[0]["id"], sqlmap["baseline_evidence_id"])
+        self.assertEqual("database", sqlmap["metadata_type"])
+        self.assertEqual("query", sqlmap["input_location"])
+        self.assertEqual("sort", sqlmap["input_selector"])
+        self.assertNotIn("--dump", arguments)
+        self.assertNotIn("unsafe invented command", canonical(sqlmap["commands"]))
+        self.assertEqual(original, summary)
+
+    def test_sqlmap_without_declared_baseline_cannot_reuse_the_first_request(self):
+        _, decision, finding = self.recorded_sql()
+        summary, prepared = self.raw_summary(engine.evaluate_coverage(self.project)["findings"])
+        changed = deepcopy(decision)
+        changed["proof"].pop("baseline_evidence_id")
+        actual_get = self.project.get
+
+        def without_baseline(kind, identity, *args, **kwargs):
+            return changed if kind == "decision" and identity == decision["id"] else actual_get(kind, identity, *args, **kwargs)
+
+        with patch.object(self.project, "get", side_effect=without_baseline):
+            public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files=prepared["files"])
+        sqlmap = public["reproduction"][finding["id"]]["sqlmap"]
+        self.assertFalse(sqlmap["available"])
+        self.assertNotIn("commands", sqlmap)
+        self.assertIn("基线", sqlmap["reason"])
+        self.assertEqual(decision, self.project.get("decision", decision["id"]))
+
+    def test_sqlmap_requires_the_complete_validated_baseline_file(self):
+        _, _, finding = self.recorded_sql()
+        summary, prepared = self.raw_summary(engine.evaluate_coverage(self.project)["findings"])
+        baseline_file = summary["reproduction"][finding["id"]]["steps"][0]["request_file"]
+        prepared["files"].pop(baseline_file)
+        public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files=prepared["files"])
+        sqlmap = public["reproduction"][finding["id"]]["sqlmap"]
+        self.assertFalse(sqlmap["available"])
+        self.assertNotIn("commands", sqlmap)
+        self.assertIn("HTTP 文件", sqlmap["reason"])
+
+    def test_sqlmap_rechecks_the_selected_field_in_the_final_safe_packet(self):
+        _, _, finding = self.recorded_sql()
+        summary, prepared = self.raw_summary(engine.evaluate_coverage(self.project)["findings"])
+        baseline_file = summary["reproduction"][finding["id"]]["steps"][0]["request_file"]
+        prepared["files"][baseline_file] = prepared["files"][baseline_file].replace(b"?sort=", b"?different=")
+        public = publish_report_summary(self.project, summary, extra_secrets=prepared["redactor"].values, files=prepared["files"])
+        sqlmap = public["reproduction"][finding["id"]]["sqlmap"]
+        self.assertFalse(sqlmap["available"])
+        self.assertNotIn("commands", sqlmap)
+        self.assertIn("输入", sqlmap["reason"])
 
     def test_a_rejected_artifact_binding_cannot_be_published_as_a_file(self):
         summary, prepared = self.raw_summary()

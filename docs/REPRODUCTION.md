@@ -14,30 +14,41 @@
 
 `draft` 成功不能授权自动停测。只有非空登记范围、完整求值覆盖、零 ready/review/blocked/unresolved、最新同快照 checkpoint 及两轮完整有效 frontier 都成立后，`plan.finalize reason:completed` 才授予有范围边界的停止权。最终报告使用 `stage:final` 和实际 `finalization_id`；门禁在材料准备之前与之后复核，不接受旧部分 FN，也不将未完成工作导出为 final-partial。真实用户暂停/停止或宿主中断保留 checkpoint/draft 和恢复前提，不制造预算耗尽事实或最终完成记录。
 
-- `report.md`：先执行摘要、风险分布、漏洞详情和复现步骤，再覆盖率、未决义务与来源附录。
+- `report.md`：先执行摘要、风险分布、漏洞详情和复现步骤，再覆盖率、未决义务与来源附录；可导出的 HTTP 步骤直接展示完整脱敏请求数据包。
 - `summary.json`：保留完整当前求值结果，区分 machine / analyst、当前 / 历史、登记 / 观察 / 求值 / 安全专项闭环。
 - `reproduction/<finding-id>/`：来自真实、完整、当前血缘有效的 HTTP 证据的脱敏请求文件，以及适用的 JSON/XML/form 正文文件。
 - `manifest.json`：报告、摘要和复现文件的路径、字节数与摘要。摘要可以发现文件变化，不能认证服务端事实。
 
-所有命令仅为人工验证模板，生成报告不会发送请求、确认候选或关闭测试义务。撤回、替代和证据失效的发现只保留历史，不生成新的当前漏洞执行模板。
+所有请求数据包及工具命令仅为人工验证模板，生成报告不会发送请求、确认候选或关闭测试义务。撤回、替代和证据失效的发现只保留历史，不生成新的当前漏洞执行模板。
 
 ## 每条漏洞的复现内容
 
 报告说明原结论与范围、身份/会话/角色、测试资源、请求方法与具体参数、按证据顺序编号的步骤、控制请求与响应摘录、修复建议，以及缺失对照或人工推断的限制。没有原始证据的步骤不会被补造。
 
 1. 在授权隔离环境中重新建立测试账号和必要资源，核验服务器返回的主体/角色。
-2. 从报告目录运行命令，逐一替换 `<AWA_...>` 占位符。历史 session_id 只是血缘引用，不能代替当前登录凭据。
+2. 将报告中的完整 HTTP 数据包复制到 Yakit Web Fuzzer 或 Burp Suite Repeater，按步骤 URL 设置目标主机、端口和 HTTPS，逐一替换 `<AWA_...>` 占位符。历史 session_id 只是血缘引用，不能代替当前登录凭据。
 3. 资源 `external_id` 是原观察的定位值。复测应按报告列出的 `request_binding.location/selector` 改为新建测试资源；全部基线和对照保持同一资源，越权对照仅换主体。
 4. 先核对正常基线与初始业务状态，再执行攻击/阴性对照。HTTP 200 不等于业务成功，核对报告中的业务字段和值。
 5. 对退款、发货、重置等写操作只使用自建资源，确认动作是否已经生效后再继续；超时不能自动重放。完成后清理资源并读取状态确认。
 
-`curl.exe` 与 POSIX curl 模板都明确请求方法，不跟随重定向，不继承系统代理。正文使用 `--data-binary @<body-file>`，避免 PowerShell 多层插值。`.http` 文件可以导入 Burp/Yakit/sqlmap；手动改变正文后应重新计算 Content-Length，或让工具按实际正文重算。
+每个可导出的步骤提供 `http` 代码块和对应 `.http` 文件，请求行、请求头及正文均来自同一份脱敏请求材料。数据包示意如下：
+
+```http
+GET /api/example?limit=1 HTTP/1.1
+Host: 127.0.0.1:8081
+Connection: close
+
+```
+
+在 Burp Suite 的 Repeater 请求编辑区或 Yakit 的 Web Fuzzer 请求编辑区粘贴整个数据包，保留请求头与正文之间的空行、路径和查询参数编码；也可打开对应 `.http` 文件复制其完整内容。HTTP 请求行本身不包含 TLS 配置，HTTPS 步骤须在发包工具中启用 HTTPS。按原观察核对代理和重定向设置，避免自动跟随重定向改变对照条件。手动修改凭据、资源或正文后，让工具按实际正文重新计算 Content-Length；JSON/XML/form 正文文件可单独检查，与 `.http` 中的正文对应。
 
 认证头、Cookie、令牌、密码、短信验证码、支付签名和敏感配置使用一致的占位符；敏感字段可能造成 JSON 格式规范化，报告会说明。不能安全解析或脱敏的二进制/畸形正文不会输出貌似可用的重放模板。不要将脱敏请求视为未经改变的原始证据。
 
-短 PIN、数值/浮点/前导零别名、嵌入式正文、JSON 键和可逆深层百分编码同样脱敏；服务器自行给出的 UUID/hex 字符串不因外形获得免责。真实 evidence/finding 引用、文件字节摘要及台账计数按来源保留，curl/sqlmap 参数仅从绑定的安全文件和证据顺序重建，不能从任意原始命令恢复。已保护的 locator 或无法保持的 multipart/JSON framing 不生成执行模板。若旧浏览器 fill 上下文未知，`reproduction_metadata_only:true` 表示本批仅有安全台账元数据，没有请求/正文文件或执行命令；它不授权停测，恢复实际本地上下文后再准备材料，不重放未知执行。
+短 PIN、数值/浮点/前导零别名、嵌入式正文、JSON 键和可逆深层百分编码同样脱敏；服务器自行给出的 UUID/hex 字符串不因外形获得免责。真实 evidence/finding 引用、文件字节摘要及台账计数按来源保留，请求数据包和 sqlmap 参数仅从绑定的安全文件和证据顺序重建，不能从任意原始命令恢复。已保护的 locator 或无法保持的 multipart/JSON framing 不生成执行模板。若旧浏览器 fill 上下文未知，`reproduction_metadata_only:true` 表示本批仅有安全台账元数据，没有请求/正文文件或执行命令；它不授权停测，恢复实际本地上下文后再准备材料，不重放未知执行。
 
 ## SQL 注入的最终结果复核
+
+每条可适配的当前 SQL 注入发现在 HTTP 数据包之外，默认附上一个获取当前库名和数据库用户的 sqlmap 人工复核命令。`-r` 使用报告中经过证据校验及脱敏的基线 `request_file`，`-p` 指定该发现实际绑定的注入参数；普通 HTTP 步骤仍直接使用数据包在 Yakit/Burp 中复现。
 
 先配置本机可信的 `sqlmap.py` 绝对路径，不从目标响应或报告中的不可信文本下载/执行程序：
 
@@ -45,15 +56,17 @@
 $env:AWA_SQLMAP_PATH = 'D:\TrustedTools\sqlmap\sqlmap.py'
 ```
 
-随后使用对应漏洞的报告命令，示意结构如下（实际请求文件和参数以报告为准）：
+先替换请求文件中的凭据和自建资源占位符，再从报告目录手动执行对应漏洞的命令，示意结构如下（实际请求文件和参数以报告为准）：
 
 ```powershell
 & 'python' '-X' 'utf8' $env:AWA_SQLMAP_PATH '-r' 'reproduction/F-example/01-E-example.http' '-p' 'sort' '--batch' '--level=1' '--risk=1' '--threads=1' '--technique=BEU' '--timeout=5' '--retries=0' '--ignore-redirects' '--ignore-proxy' '--current-db' '--current-user' '--output-dir=sqlmap-results/F-example'
 ```
 
-该命令只验证当前数据库名和数据库用户，不包含 `--dump`、系统命令、SQL shell 或任意 SQL。SQLite 使用适配器固定的只读 `pragma_database_list` 查询，不伪称支持 `database()/current_user()`。
+默认命令包含 `--current-db --current-user`，只获取当前数据库名和数据库用户等只读证据，不包含 `--dump`、系统命令、SQL shell 或任意 SQL。SQLite 使用适配器固定的只读 `pragma_database_list` 查询，不伪称支持 `database()/current_user()`。
 
-报告分别列出历史实际工具 run / profile 和建议人工命令；建议命令未被报告生成器执行。`-p` 优先取真实 run 的 `tool_parameter`，不能把 JSON Pointer 直接当作 sqlmap 字段名。GET 与 POST 使用对应原请求；HTTPS 的请求文件模式需要 `--force-ssl`。
+报告分别列出历史实际工具 run / profile 和建议人工命令；建议命令未被报告生成器执行，运行后须另行保存新的请求、响应及工具输出。`-p` 优先取真实 run 的 `tool_parameter`，否则从已绑定的唯一 query、标量 JSON 或 form 参数推导，不能把 JSON Pointer 直接当作 sqlmap 字段名。GET 与 POST 使用对应原请求；HTTPS 的请求文件模式需要 `--force-ssl`。
+
+缺少完整且可安全导出的基线请求、注入点不明确或名称有歧义、当前输入格式无法适配，以及写侧重放会重复修改资源时，报告明确列出无法生成 sqlmap 命令的原因。缺失前提须先补齐，不猜造请求文件或 `-p` 参数。
 
 BEU、level1、risk1、单线程并非全技术覆盖，未执行的时间/堆叠注入和其他输入必须保留为盲区。只回收元信息不证明业务表读取、全库导出或数据库写入。写侧行为证明不能伪装成只读 SQL 验证，报告不会自动生成重复修改资源的 sqlmap 模板。
 

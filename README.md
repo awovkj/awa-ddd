@@ -23,7 +23,7 @@ awa-ddd 2.0.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 | 2.0 战役 | `assessmentModel:v2` 六组工具；Campaign 持久目标、Universe 快照、KnownCase 三轨、Hypothesis 稳定键、公平调度、五维覆盖矩阵；`partial_accepted` 与 exhausted authority 分离 |
 | 原生接入 | 63 个动作与 Python help catalog 一致；精简常驻说明，统一 awa_project action.help 按需查完整契约；UTF-8 stdin、固定 argv、取消与独立截止时间 |
 | 信息先行 | surface.recon 统筹当前授权站点、技术/框架提示、页面/API/功能/输入、歧义线索与收集缺口；零目标流量，复用信息基线、只补实际变化，不冒充全站发现或漏洞证明 |
-| 开局与续接 | 真实 progress/frontier 状态幂等交接；raw/CP/计数变化不重启提醒，同状态仅一次停滞 CP，保留未完成与严格 final 门禁；页内截断同样要求恢复 |
+| 开局与续接 | progress/frontier 状态幂等交接；同 PR 先取具体 ready/review 小页，真实复核/准备回执后推进游标；raw/CP/队列读取不算闭环，零工具重复通知有界；页内截断须恢复 |
 | 项目与发现 | 多源离线 OpenAPI/JS AST/HAR/ARTEX/SARIF/assessment_hints 导入；JS 消费点反查仅为可能绑定，定义/评分只作选题，不成为漏洞证据 |
 | 参数与调度 | 精确操作/位置/selector/分支/族矩阵；优先保留任务动作、前提与完整控制 ID；主任务和参数页独立恢复，参数页默认随主页最多 3 条；typed/variant 分开，coverage_first 保留公平性 |
 | 证明准备与绑定 | assessment.prepare 按义务、发现或已有证据复核当前控制与缺字段，零请求、零新判定；finding.bind 校验真实当前证明后创建替代发现并保留原始证明与生命周期历史 |
@@ -92,7 +92,7 @@ awa-ddd 2.0.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 `project.status` 默认最多 10 条各类实体与 5 个 gap 示例；`plan.list/report.coverage/finding.list` 默认 25 条、最多 100 条。展示限制为 24 KiB；条目内部字段截断也会给 `render_recovery`，保留原过滤条件先读当前页，不能跳到正式 `next_offset`。单条仍超限则标 `retry_same_page:false/projection_limit:single_record`，按 detail_action 找精确查询或用文件式 CLI 读取完整已脱敏结果，不循环相同页。`plan.build.obligations` 是整数，`obligation_items` 才是分页明细。
 
-闭环为 `plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint`。`continue_required:true` 表示评估未完成，推进现有授权内可做的 ready/review；空页、已有漏洞、请求数、低收益或草稿成功不能证明耗尽，也不能编造预算/取消记录来收尾。无真实进展时换假设或补前提，保留未完成交接，不无限重复请求、答复或宿主继续提示；正常轮次结束不授予完成声明或最终报告。
+闭环为 `plan.audit → plan.next / review_followups → 执行或复核并落账 → plan.checkpoint`。AI 应逐项复核登记输入、既有 HTTP 控制和浏览器观察，从实际证据形成 accepted typed 正向或阴性判据，绑定支持的发现并归档观察，再检查完整性。`continue_required:true` 时继续处理现有授权内可做的 ready/review；partial 总结、读取队列、保存 CP、已有漏洞、请求数、低收益、预算或草稿成功均不能作为常规收尾原因。某个证明通道停滞时，先复核已有材料、准备缺失控制或推进另一条具体未复核项；正常轮次结束不授予完成声明或最终报告。
 
 `can_finalize:true` 只在非空登记范围、`completion.status:complete`、零 ready/review/blocked/unresolved、最新同快照 checkpoint 及两轮**完整、有效、证据绑定**的发现/12 族适用性/页面复核同时成立时出现。blocked frontier 不计完整轮次，全部任务标受阻也不等于测无可测。成功 `plan.finalize reason:completed` 后才有 `automatic_stop_allowed:true` 和 `can_claim_complete:true`；二者只针对有证据的登记范围，不证明未知攻击面不存在。
 
@@ -106,7 +106,9 @@ awa-ddd 2.0.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 `blocked/budget_exhausted/user_stop/authorization_boundary` 均被最终收尾 API 拒绝；调用方文字、force/override 或自称宿主事件不能建立停止权。真实用户明确暂停/停止或宿主真实中断时遵守该事件，保存 checkpoint、必要的 draft 和真实恢复前提，不制造最终停止记录。旧部分 FN 原样保留，只读重开也不会恢复停止权。systemPrompt 的停止指引不受渗透模式开关影响；没有该服务仍保留引擎硬门禁。
 
-已核验 rc.3 SDK 的 **`agent/turn-stopping` awaited serial 钩子**：离线审计真实 agent 当前绑定，以插件来源 `agent.steer` 交接新的真实 progress/frontier 状态。同状态仅提醒一次，重复边界保留一次停滞 CP，不把 raw capture、CP ID 或 no_progress 计数当进展；CP 等待期间的并行真实进展会重检后交接。新意图/实际取消优先，纯报告检查不变成测试；未完成绑定、义务和 final 门禁不因抑制提醒而删除。缺接口有降级，不承诺无限运行。`continuationGuard:false` 只关闭可选宿主钩子，不关闭最终报告门禁。
+已核验 rc.3 SDK 的 **`agent/turn-stopping` awaited serial 钩子**：离线审计真实 agent 当前绑定，以插件来源 `agent.steer` 交接新的 progress/frontier 状态。同 PR 不能只保存停滞 CP 就放行；守卫继续读取 `plan.next`/`plan.audit` 的具体小页，交接精确输入、证据 ID、复核/准备及浏览器绑定或归档动作。真实工具调用产生复核或前提准备回执后，才继续推进其他当前游标项；回执本身不代替 accepted typed 判据。仅重复读队列、保存 CP 或不调用工具，不会无限重启同一通知，未完成义务和严格 FN 门禁仍保留。CP 等待期间的并行真实进展会重新检查。
+
+`assessment.prepare`、`evidence.inspect`、`finding.bind`、`page.adopt` 等真实离线生命周期调用可建立 offline-only 续接绑定，完成既有材料的复核与归档；这种绑定不提供新网络授权。新意图、真实取消及宿主中断优先，外部前提确实不可用时保存 unfinished checkpoint/draft 和恢复条件。纯报告或历史查询不变成目标测试。缺接口有降级，不承诺无限运行；`continuationGuard:false` 只关闭可选宿主钩子，不关闭最终报告门禁。
 
 ## Playwright 测试策略
 
@@ -136,9 +138,11 @@ native 不提供上传、任意 evaluate、独立多 context 或下载测试，3
 {"action":"report.build","project_id":"assessment","input":{"stage":"final","finalization_id":"<实际停止记录ID>"}}
 ```
 
-新批次包含中文 `report.md`、完整 `summary.json`、`manifest.json` 和适用的 `reproduction/`，同时保留阶段、继续判定、停止依据与剩余工作。最终报告在准备材料之前及准备后分别检查严格闭环、当前快照/CP/FN 和全部零剩余计数；部分或不一致停止直接拒绝，不写最终报告目录。新材料或新 checkpoint 使旧停止记录失效。漏洞按严重度置前，每条说明主体/资源前提、编号步骤、实际请求与响应、修复和边界。SQL 注入只提供匹配参数和基线请求的只读元信息命令。
+新批次包含中文 `report.md`、完整 `summary.json`、`manifest.json` 和适用的 `reproduction/`，同时保留阶段、继续判定、停止依据与剩余工作。最终报告在准备材料之前及准备后分别检查严格闭环、当前快照/CP/FN 和全部零剩余计数；部分或不一致停止直接拒绝，不写最终报告目录。新材料或新 checkpoint 使旧停止记录失效。漏洞按严重度置前，每条说明主体/资源前提、编号步骤、实际请求与响应、修复和边界。
 
-所有 `<AWA_...>` 都需人工替换，重新登录并准备自建资源后才能在授权范围复测；报告生成不执行命令。原始认证、重置令牌、验证码、支付密码和敏感配置不会直接导出，不能安全脱敏的正文明确不可复现。完整操作见 [REPRODUCTION.md](docs/REPRODUCTION.md)。
+每个可导出的 HTTP 复现步骤在 `report.md` 内展示完整脱敏请求数据包，包括请求行、Host、请求头、空行和正文，并保留对应的 `.http` 文件。复制数据包到 Yakit Web Fuzzer 或 Burp Suite Repeater，按步骤 URL 设置目标主机、端口和 HTTPS，替换 `<AWA_...>` 凭据及自建资源后发送；修改正文后让工具重新计算 Content-Length。报告生成不发送请求。原始认证、重置令牌、验证码、支付密码和敏感配置不会直接导出，不能安全脱敏的正文明确不可复现。完整操作见 [REPRODUCTION.md](docs/REPRODUCTION.md)。
+
+每条可适配的 SQL 注入发现默认再附一个 sqlmap 人工复核命令：`-r` 指向已校验的脱敏基线请求文件，`-p` 绑定具体注入参数，使用 `--current-db --current-user` 获取当前库名和数据库用户等只读证据。SQLite 使用固定只读元信息查询；缺少安全请求、参数不明确、格式不支持或写侧重放会修改资源时，报告列出无法生成命令的具体原因。命令不会由报告生成器自动执行。
 
 ## TscanPlus MCP
 

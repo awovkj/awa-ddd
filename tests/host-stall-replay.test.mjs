@@ -27,6 +27,11 @@ function fixture() {
   const turn = new AbortController();
   let current = continuation();
   let step = 0;
+  const reviews = Array.from({ length: 3 }, (_, index) => ({
+    id: 'CL-' + (index + 1).toString(16).padStart(24, '0'), kind: 'unassessed_observation', status: 'open',
+    action: 'evidence.inspect', evidence_id: 'E-' + (index + 1).toString(16).padStart(32, '0'),
+    operation_id: 'O-offline-stall-existing', reason_zh: 'Inspect and archive existing evidence offline.',
+  }));
   const subject = {
     id: 'offline-stall-agent', session: { id: 'offline-stall-session' }, status: 'running',
     inbox: { nextStep: [], nextTurn: [] },
@@ -44,18 +49,28 @@ function fixture() {
   const controller = createController({ workspace: join(tmpdir(), 'awa-offline-stall-replay') }, {
     signal: lifetime.signal,
     invoke: async (_settings, action, args) => {
-      assert.ok(['plan.audit', 'plan.checkpoint'].includes(action), 'only offline engine actions are invoked');
+      assert.ok(['plan.audit', 'plan.next', 'plan.checkpoint'].includes(action), 'only offline engine actions are invoked');
       assert.equal(args.project_id, 'offline-stall-project');
       calls.push({ action, args });
       if (action === 'plan.checkpoint') current = { ...current, checkpoint_id: 'CP-offline-stall-retained' };
-      return { ok: true, data: { continuation: { ...current } } };
+      const data = { continuation: { ...current }, requests_sent: 0 };
+      if (action !== 'plan.checkpoint') {
+        const offset = args.offset ?? 0;
+        const limit = args.limit ?? 3;
+        Object.assign(data, { offset, limit });
+        if (action === 'plan.next') Object.assign(data, { work_items: [], queue_total: 0, next_offset: null,
+          review_followups: reviews.slice(0, limit), review_followup_total: reviews.length });
+        else Object.assign(data, { checklist: reviews.slice(offset, offset + limit), checklist_total: reviews.length,
+          next_offset: offset + limit < reviews.length ? offset + limit : null });
+      }
+      return { ok: true, data };
     },
   });
   controller.attach(ctx);
   const frame = () => ({ agent: subject, turn: 1, step, signal: turn.signal });
 
   return {
-    subject, controller, calls, notices, turn,
+    subject, controller, calls, notices, turn, reviews,
     get current() { return current; },
     update(values) { current = { ...current, ...values }; },
     async enter(messages = subject.inbox.nextStep.splice(0)) {
@@ -68,9 +83,9 @@ function fixture() {
       }
       assert.equal(await next(), decision);
     },
-    settle(action = 'plan.next') {
+    settle(action = 'plan.next', input = {}) {
       // Public observer events are synthetic; no tool, server or target is executed.
-      const invocation = { action, project_id: 'offline-stall-project', agent: subject,
+      const invocation = { action, project_id: 'offline-stall-project', input, agent: subject,
         callerSignal: turn.signal, signal: new AbortController().signal };
       controller.observe({ phase: 'start', invocation });
       controller.observe({ phase: 'success', invocation, ok: true });
@@ -91,7 +106,7 @@ function assertUnfinished(h) {
   assert.equal(h.current.can_claim_complete, false);
   assert.equal(h.current.finalization_id, null);
   assert.equal(h.controller.status().bound_projects, 1);
-  assert.ok(h.calls.every(call => ['plan.audit', 'plan.checkpoint'].includes(call.action)));
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call.action)));
   assert.ok(h.notices.every(message => message.source.kind === 'awa-ddd-host-continuation'));
 }
 
@@ -104,7 +119,9 @@ test('536 unchanged boundaries including a 427-step zero-tool tail cannot create
       if (boundary < 109) h.settle('plan.next');
       await h.stop();
     }
-    assert.equal(h.notices.length, 1, 'unchanged closure progress receives only the initial continuation notice');
+    assert.equal(h.notices.length, 2, 'available saved evidence gets an initial notice and one concrete correction, then no zero-tool feedback loop');
+    assert.match(h.notices[1].content[0].text, /evidence\.inspect/);
+    assert.ok(h.reviews.some(row => h.notices[1].content[0].text.includes(row.evidence_id)));
     assert.equal(h.calls.filter(call => call.action === 'plan.checkpoint').length, 1,
       'the repeated boundary retains one unfinished checkpoint rather than manufacturing progress');
     assertUnfinished(h);
@@ -123,7 +140,8 @@ test('raw capture snapshot churn is not closure progress and does not rearm repe
       h.settle('http.capture');
       await h.stop();
     }
-    assert.equal(h.notices.length, 1, 'raw observations cannot defeat progress-based host deduplication');
+    assert.ok(h.notices.length >= 2 && h.notices.length <= 1 + h.reviews.length,
+      'capture activity may hand off remaining saved tasks once, but snapshot churn does not reset the seen task set');
     assert.ok(h.calls.filter(call => call.action === 'plan.checkpoint').length <= 1);
     assertUnfinished(h);
   } finally { h.dispose(); }
@@ -165,7 +183,7 @@ test('frontier review progress can rearm the same snapshot while finalization is
     assert.equal(h.current.can_claim_complete, false);
     assert.equal(h.current.finalization_id, null);
     assert.equal(h.controller.status().bound_projects, 1);
-    assert.ok(h.calls.every(call => ['plan.audit', 'plan.checkpoint'].includes(call.action)));
+    assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call.action)));
   } finally { h.dispose(); }
 });
 

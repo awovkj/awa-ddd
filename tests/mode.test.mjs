@@ -117,11 +117,13 @@ test('active policy keeps strict finalization separate from normally ending an u
   assert.match(text, /只允许 reason:completed/);
   assert.match(text, /budget_exhausted\/user_stop\/authorization_boundary\/blocked 都不能/);
   assert.match(text, /正常轮次结束不等于评估完成/);
-  assert.match(text, /对未变化工作去重，不承诺无限运行/);
-  assert.match(text, /停滞.*checkpoint 和未完成状态/);
+  assert.match(text, /交接具体任务/);
+  assert.match(text, /零工具重复通知有界/);
+  assert.match(text, /不以 partial 报告或未复核前提收尾/);
+  assert.match(text, /真实用户停止\/宿主中断存未完成 checkpoint/);
   assert.match(text, /零 ready\/review\/blocked\/unresolved/);
   assert.match(text, /旧 partial 停止记录仅留历史/);
-  assert.match(text, /渗透模式关闭也不放宽引擎硬门禁/);
+  assert.match(text, /关闭模式不放宽硬门禁/);
   assert.match(text, /stage:draft/);
   assert.match(text, /finalization_id/);
   assert.match(text, /completion\.status:complete/);

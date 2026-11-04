@@ -497,7 +497,12 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(agent.inbox.nextStep.length, 1);
     await consumeNotice();
     await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
-    assert.equal(agent.inbox.nextStep.length, 0, 'An unchanged packaged handoff must settle unfinished, not queue duplicate notices.');
+    assert.equal(agent.inbox.nextStep.length, 1, 'Unchanged progress must first receive concrete current review/preparation work.');
+    assert.match(agent.inbox.nextStep[0].content[0].text, /Current review\/ready tasks:/);
+    assert.match(agent.inbox.nextStep[0].content[0].text, /input_template/);
+    await consumeNotice();
+    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
+    assert.equal(agent.inbox.nextStep.length, 0, 'A zero-tool tail cannot repeat the concrete corrective handoff.');
     await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
     assert.equal(agent.inbox.nextStep.length, 0);
     const unfinished = await dispatch('awa_project', 'project.status');
@@ -627,7 +632,7 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
         'packaged action/help catalog equality', 'native runtime inventory', 'bounded inventory/readiness',
         'packaged information-first prepare/aggregate and non-proof semantic baseline reuse with zero traffic',
         'packaged passive framework/server parser emits only source hints without code or network execution',
-        'packaged consumed unchanged host handoffs settle unfinished rather than looping notices',
+        'packaged unchanged progress receives concrete current review/preparation before bounded zero-tool deduplication',
         'packaged eight-discriminator oracle help and typed extraction contract',
         'packaged native and normalized assessment hints stay unverified with no finding or guessed method',
         'packaged JavaScript HTML/navigation sinks retain uncertain input bindings without source execution',
