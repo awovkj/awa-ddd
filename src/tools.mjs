@@ -427,6 +427,7 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
           'page_visit_id', 'run_id', 'checklist_id', 'session_id', 'resource_id', 'input_location', 'input_selector', 'schema_branch']) {
           if (typeof payload[field] === 'string' && payload[field].length <= 200) references[field] = payload[field];
         }
+        if (payload.schema_branch === null) references.schema_branch = null;
         if (Array.isArray(payload.evidence_ids) && payload.evidence_ids.length <= 25
           && payload.evidence_ids.every(identity => typeof identity === 'string' && identity.length <= 200)) {
           references.evidence_ids = Object.freeze([...payload.evidence_ids]);
@@ -444,12 +445,17 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
         await observe({ phase: 'start' });
         try {
           const value = await invoke(settings, args.action, payload, { signal });
-          await observe({ phase: 'success', ok: value?.ok === true });
+          const failureCode = typeof value?.error?.code === 'string' && /^[A-Za-z0-9_:-]{1,80}$/.test(value.error.code)
+            ? value.error.code : undefined;
+          await observe({ phase: 'success', ok: value?.ok === true, ...(failureCode ? { failure_code: failureCode } : {}) });
           return value;
         } catch (error) {
           const runPattern = args.action === 'scenario.run' ? /^SC-[A-Za-z0-9_-]+$/ : /^RUN-[A-Za-z0-9_-]+$/;
+          const failureCode = typeof error?.code === 'string' && /^[A-Za-z0-9_:-]{1,80}$/.test(error.code)
+            ? error.code : 'tool_failure';
           await observe({ phase: 'failure', claimed_run: typeof error?.details?.run_id === 'string'
-            && runPattern.test(error.details.run_id), dispatch_uncertain: error?.[ENGINE_DISPATCH_UNCERTAIN] === true });
+            && runPattern.test(error.details.run_id), dispatch_uncertain: error?.[ENGINE_DISPATCH_UNCERTAIN] === true,
+            failure_code: failureCode });
           throw error;
         }
       } catch (error) { throw asHostError(error); }

@@ -716,6 +716,135 @@ test('current task pages rotate after real review activity and stay bounded with
   h.controller.dispose();
 });
 
+test('18 administrative progress states retain failed task history and never repeat adopted or inspected material', async () => {
+  const failed = evidenceReview(160);
+  const adopted = adoptionReview();
+  const consumer = { id: 'OB-current-consumer', obligation_id: 'OB-current-consumer', operation_id: 'O-current-consumer',
+    kind: 'input_review', status: 'open', suggested_action: 'surface.declare_consumer', missing_prerequisites: [],
+    input_location: 'query', input_selector: 'confirm', schema_branch: null,
+    input_template: { operation_id: 'O-current-consumer', input_location: 'query', input_selector: 'confirm', schema_branch: null } };
+  let round = 0;
+  const h = setup({ query: actionablePages({ reviews: [failed, adopted, consumer], current: () => audit({
+    progress_id: 'PR-administrative-state-' + round, snapshot_id: 'CS-administrative-state-' + round,
+    semantic_progress_id: 'PR-no-real-closure', frontier_rounds: 0,
+  }).data.continuation }), runner: async (_settings, action) => {
+    if (action === 'evidence.inspect') throw new BridgeError('fixture_missing_proof', 'private fixture evidence cannot be evaluated');
+    return { ok: true, data: {} };
+  } });
+  const subject = agent('administrative-cycle-regression');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2);
+  const tasks = messageTasks(subject.steered[1]);
+  assert.ok(tasks.some(task => task.input_template.evidence_id === failed.evidence_id));
+  assert.ok(tasks.some(task => task.action === 'page.adopt'));
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  const beforeFailed = h.controller.status().review_activity_receipts;
+  await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: failed.evidence_id }));
+  assert.equal(h.controller.status().review_activity_receipts, beforeFailed, 'a rejected read is not a completed review receipt');
+  await h.call(subject, 'page.adopt', 'project-a', adopted.input_template);
+  await h.call(subject, 'surface.declare_consumer', 'project-a', consumer.input_template);
+  for (round = 1; round <= 18; round++) {
+    await h.stop(subject);
+    await h.step(subject, { signal, messages: subject.inbox.nextStep.splice(0) });
+    await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: failed.evidence_id }));
+  }
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 2, 'caller status/CP churn cannot reproduce the 18-notice loop');
+  assert.equal(h.controller.status().failed_task_attempts, 1, 'the same context failure is retained across every old PR');
+  assert.equal(h.controller.status().bound_projects, 1, 'deduplication grants no exhaustion');
+  assert.ok(h.controller.status().task_failure_deferrals > 0);
+  assert.ok(h.calls.every(call => ['plan.audit', 'plan.next', 'plan.checkpoint'].includes(call[1])));
+  assert.doesNotMatch(JSON.stringify(subject.steered), /private fixture evidence/);
+  h.controller.dispose();
+});
+
+test('a failed concrete task advances another current page and only changed evidence or prerequisites permit reissue', async () => {
+  const failed = evidenceReview(170);
+  const reviews = [failed, ...Array.from({ length: 5 }, (_, index) => evidenceReview(171 + index))];
+  let progress = 'PR-before-proof';
+  let fail = true;
+  const h = setup({ query: actionablePages({ reviews, current: () => audit({
+    progress_id: 'PR-state-' + progress, semantic_progress_id: progress,
+  }).data.continuation }), runner: async (_settings, action) => {
+    if (fail && action === 'evidence.inspect') throw new BridgeError('fixture_unavailable_adapter', 'fixture private path');
+    return { ok: true, data: {} };
+  } });
+  const subject = agent('task-context-retry');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  assert.ok(messageTasks(subject.steered[1]).some(task => task.input_template.evidence_id === failed.evidence_id));
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: failed.evidence_id }));
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 3, 'one known failure permits the next feasible saved-material page');
+  assert.ok(messageTasks(subject.steered[2]).some(task => reviews.slice(3).some(row => row.evidence_id === task.input_template.evidence_id)));
+  assert.ok(messageTasks(subject.steered[2]).every(task => task.input_template.evidence_id !== failed.evidence_id));
+  assert.match(subject.steered[2].content[0].text, /Deferred failed tasks/);
+  assert.doesNotMatch(subject.steered[2].content[0].text, /fixture private path/);
+  await h.step(subject, { signal, messages: [subject.steered[2]] });
+  progress = 'PR-unrelated-real-proof';
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+  const notices = subject.steered.length;
+  await h.stop(subject);
+  assert.equal(subject.steered.length, notices, 'another task closing does not erase the failed context');
+
+  // Actual saved-material/source or prerequisite changes permit one new review,
+  // while changing only PR/CP/status above did not.
+  failed.source_signature = 'CM-current-fixed-material';
+  failed.missing_prerequisites = [];
+  failed.evidence_ids = [failed.evidence_id, evidenceReview(190).evidence_id];
+  progress = 'PR-fixed-current-prerequisite';
+  await h.step(subject, { signal, messages: [] });
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+  await h.stop(subject);
+  assert.ok(messageTasks(subject.steered.at(-1)).some(task => task.input_template.evidence_id === failed.evidence_id));
+  fail = false;
+  await h.step(subject, { signal, messages: [subject.steered.at(-1)] });
+  await h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: failed.evidence_id });
+  const afterRetry = subject.steered.length;
+  await h.stop(subject);
+  assert.equal(subject.steered.length, afterRetry, 'the repaired context is still issued only once');
+  assert.equal(h.controller.status().failed_task_attempts, 1);
+  assert.equal(h.controller.status().bound_projects, 1);
+  h.controller.dispose();
+});
+
+test('a project-local failed review does not suppress another project with the same handle', async () => {
+  const review = evidenceReview(200);
+  const h = setup({ query: (settings, action, args) => actionablePages({ reviews: [review],
+    current: () => audit({ progress_id: 'PR-' + args.project_id, semantic_progress_id: 'PR-semantic-' + args.project_id }).data.continuation,
+  })(settings, action, args), runner: async (_settings, action, args) => {
+    if (action === 'evidence.inspect' && args.project_id === 'project-a') throw new BridgeError('fixture_source_unreadable', 'private project-a fixture');
+    return { ok: true, data: {} };
+  } });
+  const subject = agent('failure-is-project-local');
+  const signal = await h.step(subject);
+  await h.call(subject, 'plan.next', 'project-a');
+  await h.call(subject, 'plan.next', 'project-b');
+  await h.stop(subject);
+  await h.step(subject, { signal, messages: [subject.steered[0]] });
+  await h.stop(subject);
+  const tasks = messageTasks(subject.steered[1]);
+  assert.deepEqual(new Set(tasks.map(task => task.project_id)), new Set(['project-a', 'project-b']));
+  await h.step(subject, { signal, messages: [subject.steered[1]] });
+  await assert.rejects(h.call(subject, 'evidence.inspect', 'project-a', { evidence_id: review.evidence_id }));
+  await h.call(subject, 'evidence.inspect', 'project-b', { evidence_id: review.evidence_id });
+  assert.equal(h.controller.status().failed_task_attempts, 1);
+  assert.equal(h.controller.status().review_activity_receipts, 1);
+  await h.stop(subject);
+  assert.equal(h.controller.status().bound_projects, 2);
+  h.controller.dispose();
+});
+
 test('standalone offline preparation, assessment and archival actions bind only offline continuation', async () => {
   const review = { ...evidenceReview(30),
     browser_testing: { stage: 'review_existing', native_visit_input: { url: 'http://fixture.invalid/nested-target' } },

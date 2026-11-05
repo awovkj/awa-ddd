@@ -1,6 +1,6 @@
 {
   "name": "awa-ddd",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Evidence-driven security assessment tools for DeepSeek Harness, with a local Python and SQLite engine and an assumption-driven 2.0 campaign model.",
   "type": "module",
   "license": "MIT",

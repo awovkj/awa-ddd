@@ -1,5 +1,6 @@
 """Browser scope and evidence contracts exercised through Node and loopback HTTP."""
 from datetime import datetime, timedelta, timezone
+import hashlib
 import http.server
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from awa_ddd import browser, engine
+from awa_ddd.__main__ import dispatch
 from awa_ddd.store import EngineError, Project
 from awa_ddd.scope import require_scope
 
@@ -24,7 +26,7 @@ _FAKE_PLAYWRIGHT = r"""
 const { EventEmitter } = require('events');
 const http = require('http');
 const https = require('https');
-function fetchOne(url, method, headers) {
+function fetchOne(url, method, headers, body) {
   return new Promise((resolve, reject) => {
     const client = new URL(url).protocol === 'https:' ? https : http;
     const request = client.request(url, { method, headers }, response => {
@@ -36,6 +38,7 @@ function fetchOne(url, method, headers) {
       }));
     });
     request.on('error', reject);
+    if (body) request.write(body);
     request.end();
   });
 }
@@ -43,19 +46,20 @@ class FakePage extends EventEmitter {
   constructor(context) { super(); this.context = context; this.current = 'about:blank'; this.document = {}; }
   url() { return this.current; }
   mainFrame() { return this; }
-  async request(url, method = 'GET', type = 'fetch', navigation = false) {
+  async request(url, method = 'GET', type = 'fetch', navigation = false, body = null) {
     let result, aborted = false;
     const request = {
       url: () => url, method: () => method, resourceType: () => type,
       allHeaders: async () => ({...this.context.options.extraHTTPHeaders}),
       isNavigationRequest: () => navigation, frame: () => this,
+      postDataBuffer: () => body == null ? null : Buffer.from(body, 'utf8'),
     };
     const route = {
       request: () => request,
       abort: async () => { aborted = true; },
       fetch: async options => {
         if (options.maxRedirects !== 0) throw new Error('unguarded_redirect_fetch');
-        return fetchOne(url, method, options.headers);
+        return fetchOne(url, method, options.headers, body);
       },
       fulfill: async options => { result = options.response; },
     };
@@ -88,7 +92,10 @@ class FakePage extends EventEmitter {
   async click(selector) {
     if (selector === '#missing') throw new Error('selector_missing');
     for (const request of (this.document.click_requests || {})[selector] || []) {
-      await this.request(request.url, request.method || 'GET', 'fetch', !!request.navigation);
+      await this.request(request.url, request.method || 'GET', request.type || 'fetch', !!request.navigation, request.body);
+    }
+    for (const message of (this.document.click_dialogs || {})[selector] || []) {
+      this.emit('dialog', {type: () => 'alert', message: () => message, dismiss: async () => {}});
     }
     if (this.document.click_urls && this.document.click_urls[selector]) {
       this.current = this.document.click_urls[selector];
@@ -373,6 +380,97 @@ class BrowserContractTests(unittest.TestCase):
         changed["actions"][0]["ok"] = False
         self.project.put("page_visit", changed)
         self.assertFalse(browser.coverage(self.project)["complete"])
+
+    def test_native_body_digests_match_actual_document_and_api_response_bytes(self):
+        self.server.documents["/ui"] = {"title": "Digest fixture", "resources": [
+            {"url": self.base + "/ui/data", "type": "xhr"},
+            {"url": self.base + "/ui/asset", "type": "image"}]}
+        self.server.documents["/ui/data"] = {"private_payload": "synthetic-api-body-012345"}
+        self.server.documents["/ui/asset"] = "synthetic-untracked-image"
+        public = self.drive()
+        visit = self.project.get("page_visit", public["id"])
+        raw = self.project.read_artifact(visit)
+        for path in ("/ui", "/ui/data"):
+            entry = next(item for item in raw["network"] if item["url"] == self.base + path)
+            response = json.dumps(self.server.documents[path]).encode("utf-8")
+            self.assertTrue(entry["response_body_complete"])
+            self.assertEqual(len(response), entry["response_body_bytes"])
+            self.assertEqual(hashlib.sha256(response).hexdigest(), entry["response_body_sha256"])
+            self.assertEqual(0, entry["request_body_bytes"])
+            self.assertEqual(hashlib.sha256(b"").hexdigest(), entry["request_body_sha256"])
+        asset = next(item for item in raw["network"] if item["url"].endswith("/asset"))
+        self.assertNotIn("response_body_sha256", asset)
+        self.assertNotIn("synthetic-api-body-012345", json.dumps(raw))
+
+    def test_native_body_digest_does_not_grant_permission_to_submit_a_write(self):
+        body = "message=synthetic-wire-body-012345"
+        self.server.documents["/ui"] = {"click_requests": {"#save": [
+            {"url": self.base + "/ui/save", "method": "POST", "body": body}]}}
+        blocked = self.drive(actions=[{"type": "click", "selector": "#save"}])
+        self.assertEqual(["/ui"], [call[1] for call in self.server.calls])
+        self.assertEqual("BLOCKED", blocked["observation_status"])
+        engine.update_project(self.project, {"allow_mutation": True})
+        observed = self.drive(actions=[{"type": "click", "selector": "#save"}])
+        raw = self.project.read_artifact(self.project.get("page_visit", observed["id"]))
+        entry = next(item for item in raw["network"] if item["method"] == "POST")
+        self.assertEqual(len(body.encode("utf-8")), entry["request_body_bytes"])
+        self.assertEqual(hashlib.sha256(body.encode("utf-8")).hexdigest(), entry["request_body_sha256"])
+        self.assertTrue(raw["write_authorized"])
+        self.assertTrue(raw["write_requests"])
+        self.assertNotIn(body, json.dumps(raw))
+
+    def test_oversized_api_body_renders_without_manufacturing_a_complete_digest(self):
+        self.server.documents["/ui"] = {"resources": [{"url": self.base + "/ui/large", "type": "fetch"}]}
+        self.server.documents["/ui/large"] = "x" * (8 * 1024 * 1024 + 1)
+        observed = self.drive()
+        raw = self.project.read_artifact(self.project.get("page_visit", observed["id"]))
+        entry = next(item for item in raw["network"] if item["url"].endswith("/large"))
+        self.assertEqual("visited", observed["observation_status"])
+        self.assertFalse(entry["response_body_complete"])
+        self.assertNotIn("response_body_sha256", entry)
+        self.assertNotIn("response_body_bytes", entry)
+
+    def test_native_fill_stays_private_while_actions_dialog_document_and_timing_are_bound(self):
+        value = "synthetic-search-value-012345-商城"
+        marker = "AWA-XSS-0011223344556677"
+        self.server.documents["/ui"] = {"click_dialogs": {"#search": [marker]}}
+        public = self.drive(actions=[{"type": "fill", "selector": "#search", "value": value},
+                                     {"type": "press", "selector": "#search", "key": "Enter"}])
+        visit = self.project.get("page_visit", public["id"])
+        raw = self.project.read_artifact(visit)
+        self.assertEqual(value, raw["actions"][0]["value"])
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        self.assertEqual(digest, raw["actions"][0]["value_sha256"])
+        self.assertEqual("Enter", raw["actions"][1]["key"])
+        self.assertEqual(self.base + "/ui", raw["dialogs"][0]["document_url"])
+        self.assertEqual(1, raw["dialogs"][0]["action_index"])
+        self.assertLessEqual(datetime.fromisoformat(raw["started_at"].replace("Z", "+00:00")),
+                             datetime.fromisoformat(raw["completed_at"].replace("Z", "+00:00")))
+        event = json.loads(self.project.connection.execute(
+            "SELECT document FROM events WHERE type='browser.visited'").fetchone()[0])
+        for key in ("started_at", "completed_at"):
+            self.assertEqual(raw[key], visit[key])
+            self.assertEqual(raw[key], event[key])
+        page_id = public["page_ids"][0]
+        marked = dispatch(self.tmp.name, "page.mark", {"project_id": "browser", "page_id": page_id,
+                          "target": "page", "status": "BLOCKED", "reason": value})
+        inspected = dispatch(self.tmp.name, "run.inspect", {"project_id": "browser", "run_id": public["run_id"]})
+        for output in (public, marked, inspected):
+            serialized = json.dumps(output, ensure_ascii=False)
+            self.assertNotIn(value, serialized)
+            self.assertNotIn(digest, serialized)
+        with self.assertRaises(EngineError) as caught:
+            dispatch(self.tmp.name, "page.mark", {"project_id": "browser", "page_id": page_id,
+                     "target": "page", "status": "visited", "page_visit_id": value})
+        self.assertNotIn(value, str(caught.exception))
+
+    def test_visit_timing_cannot_be_relabelled_in_mutable_metadata(self):
+        observed = self.drive()
+        visit = self.project.get("page_visit", observed["id"])
+        self.project.put("page_visit", {**visit, "completed_at": "2099-01-01T00:00:00.000Z"})
+        with self.assertRaises(EngineError) as caught:
+            browser._verified_visit(self.project, observed["id"], self.base + "/ui")
+        self.assertEqual("page_evidence_invalid", caught.exception.code)
 
     def test_mcp_import_requires_page_structure_real_network_and_scope(self):
         for overrides in ({"signals": {}}, {"signals": {"claim": "visited"}},

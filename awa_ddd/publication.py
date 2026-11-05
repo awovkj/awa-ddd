@@ -441,7 +441,7 @@ def _schemas():
         "state": _enum("continue", "blocked", "review_coverage", "review_frontier", "ready_to_finalize", "stalled", "not_started", "finalized"),
         "reason_code": _enum("work_remaining", "blocked_preconditions", "coverage_incomplete", "frontier_review_required",
                              "registered_scope_exhausted", "no_closure_progress", "inventory_missing", "completed"),
-        "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64),
+        "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64), "semantic_progress_id": _digest("PR", 64),
         "checkpoint_id": _handle("checkpoint"), "finalization_id": _handle("finalization")}
     bucket = {**_fields("total evaluated open blocked not_applicable", _COUNT), "ratio": _RATIO}
     security = {**bucket, **_fields("operations_total operations_with_security_tests operations_complete operations_without_security_tests", _COUNT),
@@ -527,6 +527,7 @@ def _schemas():
     browser_counts = _fields("required_total assisted_total call_needed_total invoke_now_total blocked_total "
                              "native_unsupported_total followup_total task_total", _COUNT)
     work = {**gap, **_fields("url help_input required_experiment_fields hypothesis_hint browser_handoff_note"), "method": method,
+            "runtime_binding_modes": _Many(_enum("direct_document", "stored_api")),
             "parameter_coverage_id": _digest("PC"), "parameter_test_status": parameter_state,
             "selected_input_observation_count": _COUNT, "selected_input_variant_observed": _BOOL,
             "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_review_required": _BOOL,
@@ -650,6 +651,7 @@ def _schemas():
                     "test_family": family, "evidence_ids": _Many(_handle("evidence")), "page_visit_ids": _Many(_handle("page_visit"))}
     frontier = {"complete": _BOOL, "discovery": frontier_row, "categories": _Many(frontier_row), "pages": frontier_row}
     checkpoint = {**_fields("label created_at"), "id": _handle("checkpoint"), "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64),
+        "semantic_progress_id": _digest("PR", 64), "semantic_progress_changed": _BOOL,
         "previous_checkpoint_id": _handle("checkpoint"), "progress_changed": _BOOL, "remaining": remaining,
         "completion_status": completion["status"], "frontier_review": frontier,
         "parameter_delta": {**_fields("comparison_available projection_complete items_truncated tested_comparison_available "
@@ -766,6 +768,7 @@ def _schemas():
                 "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls"),
                 "suggested_action": action, "assessment_action": action, "input_template": template, "help_input": {"name": action},
                 "assessment_template": template, "suggested_test_families": _Many(family),
+                 "runtime_binding_modes": _Many(_enum("direct_document", "stored_api")),
                 "scenario_run_ids": _Many(_handle("run")), "oracle_options": _Many({
                     "oracle_type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"),
                     "oracle_template": {"type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"), "test_family": family},
@@ -833,6 +836,10 @@ def _schemas():
     error = {"code": _enum(*_ERROR_CODES), "message": _TEXT, "details": {**_fields("field step_id reason missing_prerequisites"), "action": action,
         "next_action": action, "help_action": action, "help_input": {"name": action}, "continuation": continuation,
         "test_family": family, "framing_issue": _enum("utf8_bom", "invalid_multipart"),
+        "reason_code": _enum("not_configured", "backend_mismatch", "overescaped_path", "not_absolute", "file_missing",
+                             "wrong_filename", "invalid_path", "source_input_mismatch", "consumption_chain_required"),
+        "execution_backend": _enum("native", "wsl"), "path_field": _enum("sqlmap_path", "yak_path"), "configured": _BOOL,
+        "input_template": {"backend": _enum("all", "native", "wsl")},
         "repair": _enum("rewrite_utf8_without_bom", "rebuild_exact_multipart"),
         "oracle_type": _enum("baseline", "authorization", "semantic_negative", "extraction", "sql_metadata", "error_channel", "state_invariant", "state_transition"),
         "required_fields": _Many(_TEXT),
@@ -885,12 +892,21 @@ def publish_report_summary(project, summary, *, extra_secrets=(), files=None):
     context = PublicationContext(project, extra_secrets=extra_secrets)
     finding = dict(_ACTION_SCHEMAS["finding.record"])
     proof = {**_fields("channel source metadata_type input_location input_selector response_selector recovered_value observed_change "
-                       "expression source_reference witness marker consumer_url limitations"),
+                       "expression source_reference witness marker consumer_url limitations content_selector resource_selector schema_branch runtime_marker"),
              "operation_id": _handle("operation"), "obligation_id": _handle("obligation"), "tool_run_id": _handle("run"),
              "visit_id": _handle("page_visit"), "runtime_visit_id": _handle("page_visit"),
+             "normal_runtime_visit_id": _handle("page_visit"), "read_operation_id": _handle("operation"),
+             "resource_id": _handle("resource"), "readback_evidence_ids": _Many(_handle("evidence")),
+             "binding_version": _COUNT, "mechanism": _enum("stored_api_consumer"),
+             "operation_signature": _digest("S"), "read_operation_signature": _digest("S"),
+             "input_signature": _digest("I"), "resource_signature": _digest("RS"),
+             "artifact_sha256": _SHA256, "normal_artifact_sha256": _SHA256,
+             "consumption_signature": _digest("XCHAIN"),
+             "identity": {"actor_id": _handle("actor"), "session_id": _handle("session"), "session_generation": _COUNT},
+             "viewer_identity": {"actor_id": _handle("actor"), "session_id": _handle("session"), "session_generation": _COUNT},
              **{name: _handle("evidence") for name in ("baseline_evidence_id", "recovery_evidence_id", "negative_evidence_id",
                                                       "control_evidence_id", "injection_evidence_id", "before_evidence_id",
-                                                      "action_evidence_id", "after_evidence_id")}}
+                                                      "action_evidence_id", "after_evidence_id", "attack_evidence_id")}}
     finding["proof"] = proof
     coverage = {**_ACTION_SCHEMAS["report.coverage"], "findings": _Many(finding)}
     group = {"current": _COUNT, "historical": _COUNT,

@@ -58,7 +58,7 @@ v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test
 
 - SQL 仅有效元数据/报错控制、真实完整只读 sqlmap transcript，或受控写侧真实有限业务状态证明；反射、延迟和告警不自动确认或扩大为全库访问。
 - typed extraction 需 `expected_value/source_reference` 和敏感性控制；状态链用实际 scenario 的读/动作/读 `state_transition`，不重复写入冒充读回。
-- XSS 必须由应用消费攻击输入触发实际运行时标记，并绑定正常/攻击 HTTP 控制、真实消费页和身份；人工 `evaluate(alert)`、静态 HTML、存储原值或无弹窗均不够。人工发现保留 analyst 来源，不伪装机器证明。
+- XSS GET 用同身份精确文档；存储 API→SPA 用实际写入源、内容版本回读与 native 正常/攻击 viewer，查 `finding.record` 的 `xss_consumption`。搜索定位词不代替源输入；`evaluate(alert)`、无弹窗非证明，保持 analyst 来源。
 - `candidate.link` 通常仅记录血缘，扫描器、JS AST 和 assessment_hints 都是未验证线索。只有精确绑定的当前有效 proof 才能复核支持的提示；普通 dismiss/review 文字不能抹掉发现或安全义务。
 
 ## 实际浏览器与外部工具
@@ -67,13 +67,13 @@ required 和 assisted 都要求实际 Playwright；assisted 不是可选建议�
 
 查看 `call_needed/invoke_now/stage`：capture_controls/prepare 先补控制，blocked 不绕前提，review_existing 离线复核。优先宿主 Playwright MCP；本地不可用不能否定宿主 MCP，native 先 `browser.probe`。MCP 导入不绑定 session/actor；native 不支持上传/任意 evaluate/多 context，不伪装成 click。
 
-`runtime.probe` 只查本地能力；实际可信工具用 `tool.probe`，不编造能力。Yakit/sqlmap 仍受范围/身份/fixture 门禁；TscanPlus 只用 loopback 和登记短 namespace（最多 20 字符），只读结果不执行扫描/POC/爆破/JWT 建议，断连不证明远端停止。具体工具按需查帮助。
+`runtime.probe` 的 `sqlmap_candidates` 给已验证 backend/路径，按模板显式 `tool.probe`；保留当前后端，WSL 用独立台账。Yakit/sqlmap 仍受范围/身份/fixture 门禁；TscanPlus 只用 loopback、短 namespace（最多 20 字符），只读结果不执行扫描/POC/爆破/JWT 建议，断连不证明远端停止。
 
 ## 推进、无进展与交付
 
 逐项复核登记输入、HTTP 控制及浏览器材料，以 accepted typed 正/阴性判据闭环并绑定/归档。`plan.next`/`plan.audit` → 复核/准备落账 → `plan.checkpoint`；读队列/CP非复核。`plan.review`仅行政，blocked/N/A文字非证明。
 
-`continue_required:true` 时推进获准工作，partial/预算非收尾，勿编造取消/预算。**正常轮次结束不等于评估完成**。同 PR 仅 CP 不放行；守卫取具体 ready/review 小页，实际复核/准备回执后再走游标，零工具重复提醒有界。offline-only 绑定仅复核，不授权新流量；真实取消/新意图/宿主中断优先，真实缺前提留 unfinished。
+`continue_required:true` 推进获准工作，partial/预算非收尾。**正常轮次结束不等于评估完成**。`semantic_progress_id` 区分真实闭环/前提改善，blocked/open 往返和失败不清零停滞；守卫保留每项失败材料，取下一 ready/review 小页，重复通知有界。offline-only 仅复核；真实取消/新意图/宿主中断优先，缺前提留 unfinished。
 
 `plan.finalize` 仅 `reason:completed`：登记范围非空、有效求值覆盖、零 ready/review/blocked/unresolved、最新同快照 CP、两轮完整有效证据绑定的 discovery/全部 12 族/pages frontier。`can_finalize` 非完成；当前严格 FN 成功才使 `automatic_stop_allowed/can_claim_complete:true`，限登记范围。未完成存 CP 和 `report.build stage:draft`；`stage:final` 引当前严格 FN，变更使旧 FN 失效。交接/抑制提醒/取消非最终完成。
 

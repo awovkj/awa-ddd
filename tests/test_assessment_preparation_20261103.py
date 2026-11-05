@@ -104,7 +104,7 @@ class AssessmentPreparationTests(unittest.TestCase):
         self.assertIn("business_logic", row["suggested_test_families"])
         self.assertIs(row["positive_machine_adapter"], False)
         self.assertEqual(before, self.fixture.snapshot())
-        self.assertEqual({"operation_id": operation["id"], "input_location": "query", "input_selector": "amount"}, row["input_template"])
+        self.assertEqual({"operation_id": operation["id"], "input_location": "query", "input_selector": "amount", "schema_branch": None}, row["input_template"])
         self.call(row["suggested_action"], **row["input_template"], consumer="business_amount", test_families=["business_logic"])
         active = [item for item in self.project.list("obligation") if item["operation_id"] == operation["id"] and not item.get("superseded")]
         self.assertTrue(any(item.get("test_family") == "business_logic" for item in active))

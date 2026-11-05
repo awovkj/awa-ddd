@@ -24,7 +24,8 @@ const CONTINUATION_BOOLEANS = ['continue_required', 'can_finalize', 'can_claim_c
 const CONTINUATION_COUNTS = ['actionable_total', 'ready_total', 'review_total', 'blocked_total', 'no_progress_rounds',
   'frontier_rounds', 'unresolved_total', 'applicability_review_total', 'scope_reduction_review_total'];
 const CONTINUATION_VERSIONS = ['contract_version', 'stop_policy_version'];
-const CONTINUATION_CODES = ['state', 'reason_code', 'next_action', 'snapshot_id', 'checkpoint_id', 'finalization_id', 'progress_id', 'coverage_status', 'stop_policy'];
+const CONTINUATION_CODES = ['state', 'reason_code', 'next_action', 'snapshot_id', 'checkpoint_id', 'finalization_id',
+  'progress_id', 'semantic_progress_id', 'coverage_status', 'stop_policy'];
 
 /** Dynamic error prose is data, not a channel for credentials or raw URLs. */
 export function safeErrorText(value, limit = 1600) {
@@ -87,6 +88,10 @@ export function safeErrorDetails(details) {
     oracle_type: ['baseline', 'authorization', 'semantic_negative', 'extraction', 'sql_metadata', 'error_channel', 'state_invariant', 'state_transition'],
     framing_issue: ['utf8_bom', 'invalid_multipart'],
     repair: ['rewrite_utf8_without_bom', 'rebuild_exact_multipart'],
+    reason_code: ['not_configured', 'backend_mismatch', 'overescaped_path', 'not_absolute', 'file_missing',
+      'wrong_filename', 'invalid_path', 'source_input_mismatch', 'consumption_chain_required'],
+    execution_backend: ['native', 'wsl'],
+    path_field: ['sqlmap_path', 'yak_path'],
   };
   for (const [key, values] of Object.entries(recoveryEnums)) {
     if (values.includes(safe[key])) add(key, safe[key]);
@@ -101,6 +106,10 @@ export function safeErrorDetails(details) {
   }
   if (safe.stop_policy === 'exhaustion_only') add('stop_policy', safe.stop_policy);
   if (safe.requests_sent === 0) add('requests_sent', 0);
+  if (typeof safe.configured === 'boolean') add('configured', safe.configured);
+  if (safe.input_template && ['all', 'native', 'wsl'].includes(safe.input_template.backend)) {
+    add('input_template', { backend: safe.input_template.backend });
+  }
   if (safe.progress_export?.action === 'report.build' && safe.progress_export?.input?.stage === 'draft') {
     add('progress_export', { action: 'report.build', input: { stage: 'draft' } });
   }

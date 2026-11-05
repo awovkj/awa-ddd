@@ -54,6 +54,10 @@ async function verifyUpgradeSmoke(dispatch, installedRoot, fixtureRoot, workspac
   const bindingHelp = await dispatch('awa_project', 'action.help', { name: 'finding.bind' }, null);
   assert.equal(bindingHelp.group, 'awa_assess');
   assert.deepEqual(bindingHelp.required, ['finding_id', 'decision_id', 'reviewer', 'reason']);
+  const runtimeBindingHelp = await dispatch('awa_project', 'action.help', { name: 'finding.record' }, null);
+  assert.match(runtimeBindingHelp.fields.xss_consumption, /stored_api/);
+  const consumerHelp = await dispatch('awa_project', 'action.help', { name: 'surface.declare_consumer' }, null);
+  assert.match(consumerHelp.fields.schema_branch, /null/);
 
   // Keep new source-only hypotheses out of the existing release fixture's queue.
   const projectId = 'package-upgrade';
@@ -414,6 +418,14 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.match(stopHelp.fields.reason, /^completed/);
     assert.doesNotMatch(stopHelp.fields.reason, /\|/);
     const runtime = await dispatch('awa_external', 'runtime.probe', { backend: 'native' }, null);
+    assert.ok(Array.isArray(runtime.sqlmap_candidates));
+    for (const candidate of runtime.sqlmap_candidates) {
+      assert.equal(candidate.automatic_execution_allowed, false);
+      assert.equal(candidate.verified_absolute, true);
+      assert.equal(candidate.verified_file, true);
+      assert.equal(candidate.action, 'tool.probe');
+      assert.equal(candidate.input_template.sqlmap_path, candidate.path);
+    }
     assert.equal(runtime.target_traffic_sent, false);
     await dispatch('awa_project', 'project.create', { target: 'https://example.invalid/', scope: ['https://example.invalid/'] });
     const projects = await dispatch('awa_project', 'project.list', {}, null);
@@ -489,12 +501,13 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(agent.inbox.nextStep[0].source.kind, 'awa-ddd-host-continuation');
     assert.match(agent.inbox.nextStep[0].content[0].text, /OFFLINE/);
     await dispatch('awa_plan', 'plan.disposition', blocker.input_template);
-    // A new real disposition can rearm once; identical consumed handoffs cannot loop.
+    const afterReopen = await dispatch('awa_project', 'project.status');
+    assert.equal(afterReopen.continuation.semantic_progress_id, boundReady.continuation.semantic_progress_id,
+      'A caller blocked/open cycle is administrative state, not new semantic closure progress.');
+    // The second notice supplies concrete current work; an administrative reopen
+    // must not insert another generic notice or reset the zero-tool bound.
     const consumeNotice = async () => hooks.get('agent/pre-step')(boundary,
       async () => ({ kind: 'enter', messages: agent.inbox.nextStep.splice(0) }));
-    await consumeNotice();
-    await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
-    assert.equal(agent.inbox.nextStep.length, 1);
     await consumeNotice();
     await hooks.get(hostContinuation.TURN_STOPPING_EVENT)(boundary);
     assert.equal(agent.inbox.nextStep.length, 1, 'Unchanged progress must first receive concrete current review/preparation work.');
@@ -572,6 +585,10 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(draft.continuation.continue_required, true);
     assert.ok(draft.continuation.actionable_total > 0);
     const round = await dispatch('awa_plan', 'plan.checkpoint', { label: 'Offline package fixture pause' });
+    assert.match(round.continuation.semantic_progress_id, /^PR-[a-f0-9]{64}$/);
+    assert.equal(round.checkpoint.semantic_progress_id, round.continuation.semantic_progress_id);
+    assert.equal(typeof round.checkpoint.semantic_progress_changed, 'boolean');
+    assert.equal(round.checkpoint.semantic_progress, undefined, 'The private milestone projection must not enter the host context.');
     await assert.rejects(dispatch('awa_plan', 'plan.finalize', {
       checkpoint_id: round.checkpoint.id, reason: 'completed', reviewer: 'package fixture reviewer',
       explanation: 'This attempt must fail because ready/review fixture tasks remain.',

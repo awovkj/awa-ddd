@@ -44,7 +44,7 @@ class WorkflowReviewHandoffTests(unittest.TestCase):
             prepared = prepare(self.project, {"obligation_id": row["obligation_id"]})["items"][0]
         network.assert_not_called()
         self.assertEqual(before, self.snapshot())
-        self.assertEqual({"operation_id": operation["id"], "input_location": "query", "input_selector": "amount"}, row["input_template"])
+        self.assertEqual({"operation_id": operation["id"], "input_location": "query", "input_selector": "amount", "schema_branch": None}, row["input_template"])
         self.assertEqual(prepared["input_template"], row["input_template"])
         self.assertEqual("surface.declare_consumer", row["suggested_action"])
         self.assertIn("consumer", row["required_experiment_fields"])

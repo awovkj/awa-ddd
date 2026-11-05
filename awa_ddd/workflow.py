@@ -285,11 +285,9 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=(), 
             row.update(suggested_test_families=suggested_families(entry, operation), hints_only=True,
                        declared_test_families=entry.get("test_families", []),
                        input_template={"operation_id": operation["id"], "input_location": gap["input_location"],
-                                       "input_selector": gap["input_selector"]},
+                                       "input_selector": gap["input_selector"], "schema_branch": gap.get("schema_branch")},
                        required_experiment_fields=["consumer", "actual consumer source or observed business flow; field-name hints are not evidence"],
                        note_zh="先从实际源码或业务流程追踪消费点，再填写真实 consumer 并选择测试族；字段名提示不是已证实的 sink，不会自动创建或确认漏洞。")
-            if gap.get("schema_branch") is not None:
-                row["input_template"]["schema_branch"] = gap["schema_branch"]
         return row
     from .assessment import _authorized
     try:
@@ -368,9 +366,13 @@ def _work_item(project, gap, operations, live, observations, foreign_actors=(), 
             row["required_experiment_fields"] += ["oracle.source_reference", "oracle.expected_value", "recovery and source-free negative captures"]
         if family == "xss":
             row["required_experiment_fields"] += ["runtime_visit_id", "consumer_url", "runtime_marker from an application-triggered browser dialog"]
+            if operation["method"] in {"POST", "PUT", "PATCH"}:
+                row["required_experiment_fields"].append(
+                    "stored_api alternative: actual writing-source canary, same fixture, normal/attack GET JSON readbacks and native viewer observations without fill/typing; finding.record xss_consumption binds content versions and writer/viewer identities")
             row.update(manual_followup_action="finding.record", positive_machine_adapter=False,
                        analyst_binding_supported=True, proof_channels=["analyst_runtime"],
-                       hypothesis_note_zh="XSS 可用绑定本义务的人工运行时证明闭环：正常与攻击输入对照、实际消费页面、真实交互及同身份浏览器信号。静态反射、存储或无弹窗访问不能否定整类 XSS。")
+                        hypothesis_note_zh="XSS 绑定实际源输入：GET 用同身份精确消费文档；存储 API 到 SPA 用写入源、内容版本回读及正常/攻击 native viewer 的 xss_consumption。搜索定位词或孤立弹窗不能关闭其他源输入；静态反射或无弹窗不否定整类。",
+                        runtime_binding_modes=["direct_document"] + (["stored_api"] if operation["method"] in {"POST", "PUT", "PATCH"} else []))
             if not row["missing_prerequisites"]:
                 row.update(queue_status="review", suggested_action="http.preflight",
                            help_input={"name": "http.preflight"})

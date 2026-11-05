@@ -338,12 +338,10 @@ def _inventory(project, evaluated):
             for decision in valid_decisions)
         (proof_resolved_candidates if resolved else unresolved_candidates).append(candidate)
     page_coverage = browser.coverage(project)
-    bad_pages = {item["page_id"] for item in page_coverage["unvisited"]}
     bad_functions = {item["function_id"] for item in page_coverage["untriggered"]}
-    used_visits = set()
+    validated_browser_adoptions = browser.validated_adoptions(project)
+    used_visits = {entry["page_visit_id"] for entry in validated_browser_adoptions}
     for page in project.list("page"):
-        if page["id"] not in bad_pages:
-            used_visits.add(page.get("page_visit_id", page.get("visit_id")))
         for function in page.get("functions", []):
             if function["id"] not in bad_functions:
                 used_visits.add(function.get("page_visit_id", function.get("visit_id")))
@@ -351,12 +349,13 @@ def _inventory(project, evaluated):
         used_visits.add((decision.get("runtime") or {}).get("visit_id"))
         used_visits.add((decision.get("proof") or {}).get("visit_id"))
     orphan_visits = []
+    browser_origins, _ = browser._adoption_history(project)
     for visit in project.list("page_visit"):
         if visit["id"] in used_visits:
             continue
         row = dict(visit)
         try:
-            browser._verified_visit(project, visit["id"], visit["url"])
+            browser._verified_visit(project, visit["id"], visit["url"], origin_events=browser_origins)
             row["adopt_ready"] = True
         except (EngineError, OSError, ValueError, TypeError, KeyError) as exc:
             row.update(adopt_ready=False, review_reason_code=getattr(exc, "code", "page_evidence_invalid"))
@@ -377,6 +376,7 @@ def _inventory(project, evaluated):
             "unlinked_analyst": unlinked_analyst, "unrecorded": unrecorded,
             "candidates": unresolved_candidates, "proof_resolved_candidates": proof_resolved_candidates,
             "page_coverage": page_coverage, "orphan_visits": orphan_visits, "pending_runs": pending_runs,
+            "validated_browser_adoptions": validated_browser_adoptions,
             "partial_tools": partial_tools, "applicability_reviews": applicability_reviews,
             "scope_reductions": scope_reductions,
             "consumer_requirements": consumer_requirements,

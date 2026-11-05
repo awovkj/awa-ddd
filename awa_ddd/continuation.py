@@ -12,6 +12,7 @@ ALL_FAMILIES = ("access_control", "sql_injection", "xss", "ssrf", "xxe", "path_t
                 "business_logic", "generic")
 MIN_FRONTIER_ROUNDS = 2
 MAX_PARAMETER_PROGRESS_KEYS = 50000
+MAX_SEMANTIC_PROGRESS_FACTS = 12000
 STOP_REASONS = {"completed"}
 REJECTED_STOP_REASONS = {"blocked", "budget_exhausted", "user_stop", "authorization_boundary"}
 STOP_POLICY = "exhaustion_only"
@@ -449,6 +450,148 @@ def _valid_frontier(project, checkpoint, inventory, cache=None):
         return False
 
 
+def _semantic_projection(project, inventory, rows):
+    """Separate evidence-backed closure and concrete preparation from receipts.
+
+    The original PR stays a state fingerprint for compatible readers. These
+    private, bounded hashes track achievements; caller disposition, administrative
+    review prose and failed/inconclusive decisions cannot mint an achievement.
+    """
+    from . import engine
+
+    security, preparation = set(), set()
+
+    def fact(target, kind, value):
+        target.add(_digest("SF", {"kind": kind, "value": value}))
+
+    for decision in inventory["valid_decisions"]:
+        oracle = decision.get("oracle") or {}
+        if decision.get("outcome") in {"confirmed", "refuted"} and oracle.get("type") != "analyst_review":
+            fact(security, "decision", {key: decision.get(key) for key in
+                 ("obligation_id", "operation_id", "outcome", "oracle", "proof")})
+    for finding in inventory["current_findings"]:
+        decision = inventory["decisions"].get(finding.get("decision_id"), {})
+        # A real unbound runtime finding retains its observed browser proof, but
+        # an opaque analyst narrative is not typed security closure.
+        if (decision.get("oracle") or {}).get("type") != "analyst_review" or decision.get("runtime"):
+            fact(security, "finding", {key: decision.get(key) for key in
+                 ("obligation_id", "operation_id", "outcome", "oracle", "proof", "runtime")})
+
+    for operation in rows["operation"]:
+        fact(preparation, "operation", {key: operation.get(key) for key in
+             ("id", "url", "method", "protocol", "auth", "allowed_roles", "ownership", "state_scope", "content_type")})
+        for entry in operation.get("inputs", []):
+            fields = ("location", "selector", "schema_branch", "schema_type", "required", "consumer",
+                      "array_template", "schema_locator")
+            context = {"operation_id": operation["id"], **{key: entry.get(key) for key in fields}}
+            if str(entry.get("consumer") or "unknown").strip().lower() not in {"unknown", "other"}:
+                context["test_families"] = entry.get("test_families")
+            fact(preparation, "input", context)
+    for item in inventory["obligations"]:
+        fact(preparation, "hypothesis", {key: item.get(key) for key in
+             ("operation_id", "kind", "input_location", "input_selector", "schema_branch", "test_family",
+              "actor_id", "baseline_actor_id", "resource_id", "tenant_boundary")})
+
+    for session in rows["session"]:
+        try:
+            actor = engine.session_valid(project, session)
+        except (EngineError, OSError, ValueError, TypeError, KeyError):
+            continue
+        assertion = session.get("verification_assertion") or {}
+        # Another attestation ID is traffic, not a new principal or capability.
+        # session_valid has checked nonempty role/tenant declarations against
+        # the original server profile, including its supported selector fallback.
+        # An empty tenant with only a caller-supplied pointer proves no membership.
+        fact(preparation, "verified_identity", {"id": session["id"], "generation": session.get("generation"),
+             "actor_signature": engine.actor_signature(actor), "credential_signature": session.get("credential_signature"),
+             "roles_verified": bool(actor.get("roles")) or bool(assertion.get("roles_selector")),
+             "tenant_verified": bool(actor.get("tenant_id"))})
+    referenced_resources = {item.get("resource_id") for item in inventory["obligations"]}
+    for resource in rows["resource"]:
+        if resource["id"] in referenced_resources:
+            fact(preparation, "fixture", {"id": resource["id"], "signature": engine.resource_signature(resource)})
+
+    coverage = inventory["page_coverage"]
+    bad_pages = {item["page_id"] for item in coverage["unvisited"]}
+    bad_functions = {item["function_id"] for item in coverage["untriggered"]}
+    for page in rows["page"]:
+        if page["id"] not in bad_pages:
+            fact(preparation, "visited_page", {"id": page["id"], "url": page["url"]})
+        for function in page.get("functions", []):
+            if function["id"] not in bad_functions:
+                fact(preparation, "triggered_function", {"page_id": page["id"],
+                     **{key: function.get(key) for key in ("id", "trigger", "apis")}})
+    for relation in inventory.get("validated_browser_adoptions", []):
+        fact(preparation, "browser_adoption", {key: relation.get(key) for key in
+             ("page_id", "url", "page_visit_id", "sha256", "source", "actor_id", "session_id", "session_generation")})
+    for candidate in rows["candidate"]:
+        fact(preparation, "candidate_context", {key: candidate.get(key) for key in ("id", "kind", "operation_id")}
+             | {"input_binding": {key: (candidate.get("link") or {}).get(key)
+                                  for key in ("input_location", "input_selector", "schema_branch")}})
+
+    # The queue retains actual prerequisites under a caller-only blocked wrapper.
+    # Administrative blocked/open flags themselves are deliberately absent.
+    missing = {item["gap_id"]: sorted(set(item.get("missing_prerequisites", []))
+               - {"offline_obligation_blocker_reconciliation"}) for item in inventory["queue"]}
+    missing.update({identity: sorted(set(values)) for identity, values in
+                    inventory.get("review_prerequisites", {}).items()})
+    complete = len(security) + len(preparation) <= MAX_SEMANTIC_PROGRESS_FACTS \
+        and len(missing) <= MAX_SEMANTIC_PROGRESS_FACTS
+    return {"version": 1, "complete": complete,
+            "security_facts": sorted(security)[:MAX_SEMANTIC_PROGRESS_FACTS],
+            "preparation_facts": sorted(preparation)[:max(0, MAX_SEMANTIC_PROGRESS_FACTS - len(security))],
+            "missing_prerequisites": dict(sorted(missing.items())[:MAX_SEMANTIC_PROGRESS_FACTS])}
+
+
+def _semantic_progress(project, inventory, rows, checkpoints):
+    projection = _semantic_projection(project, inventory, rows)
+    previous = checkpoints[-1] if checkpoints else {}
+    prior = previous.get("semantic_progress")
+    keys = ("security_facts", "preparation_facts")
+    previous_id = previous.get("semantic_progress_id")
+    valid_id = isinstance(previous_id, str) and len(previous_id) == 67 and previous_id.startswith("PR-") \
+        and all(char in "0123456789abcdef" for char in previous_id[3:])
+    # A limited projection cannot establish a new achievement or resurrect a
+    # forgotten one. Finalization remains tied to the full current snapshot.
+    if not projection["complete"] or isinstance(prior, dict) and prior.get("complete") is False:
+        projection["complete"] = False
+        return previous_id if valid_id else _digest("PR", {"semantic_version": 1, "projection_limited": True}), projection, False
+    valid = isinstance(prior, dict) and type(prior.get("version")) is int and prior["version"] == 1 and prior.get("complete") is True \
+        and isinstance(prior.get("missing_prerequisites"), dict) \
+        and len(prior["missing_prerequisites"]) <= MAX_SEMANTIC_PROGRESS_FACTS \
+        and all(isinstance(identity, str) and isinstance(values, list) and len(values) <= 100
+                and all(isinstance(value, str) and len(value) <= 200 for value in values)
+                for identity, values in prior["missing_prerequisites"].items()) \
+        and all(isinstance(prior.get(key), list) and len(prior[key]) <= MAX_SEMANTIC_PROGRESS_FACTS
+                and all(isinstance(value, str) and len(value) == 67 and value.startswith("SF-")
+                        and all(char in "0123456789abcdef" for char in value[3:]) for value in prior[key])
+                for key in keys) \
+        and sum(len(prior[key]) for key in keys) <= MAX_SEMANTIC_PROGRESS_FACTS and valid_id
+    if not valid:
+        return _digest("PR", {"semantic_version": 1, "baseline": projection}), projection, False
+
+    added = {key: sorted(set(projection[key]) - set(prior[key])) for key in keys}
+    resolved = {identity: sorted(set(prior["missing_prerequisites"].get(identity, [])) - set(values))
+                for identity, values in projection["missing_prerequisites"].items()
+                if isinstance(prior["missing_prerequisites"].get(identity), list)}
+    resolved = {identity: values for identity, values in resolved.items() if values}
+    advanced = any(added.values()) or bool(resolved)
+    progress = _digest("PR", {"semantic_version": 1, "previous": previous["semantic_progress_id"],
+                       "added": added, "resolved_prerequisites": resolved}) if advanced else previous["semantic_progress_id"]
+    # Preserve seen achievements across metadata changes and reversals. Restoring
+    # a genuinely lost prerequisite is still a fresh improvement; caller prose
+    # does not alter the objective missing-prerequisite map above.
+    for key in keys:
+        projection[key] = sorted(set(prior[key]) | set(projection[key]))
+    if sum(len(projection[key]) for key in keys) > MAX_SEMANTIC_PROGRESS_FACTS:
+        projection["complete"] = False
+        projection["security_facts"] = projection["security_facts"][:MAX_SEMANTIC_PROGRESS_FACTS]
+        projection["preparation_facts"] = projection["preparation_facts"][:max(0,
+            MAX_SEMANTIC_PROGRESS_FACTS - len(projection["security_facts"]))]
+        return previous["semantic_progress_id"], projection, False
+    return progress, projection, advanced
+
+
 def _state(project, evaluated, inventory, completion):
     from .completeness import _checklist
     from .workflow import queue_inventory
@@ -504,9 +647,10 @@ def _state(project, evaluated, inventory, completion):
         "reviewed": [(row["checklist_id"], row["source_signature"], row["status"]) for row in inventory.get("reviewed_admin", [])],
         "blocked_reviews": sorted(inventory.get("blocked_reviews", {}))})
     checkpoints = project.list("checkpoint")
+    semantic_progress, _, _ = _semantic_progress(project, inventory, rows, checkpoints)
     no_progress = 0
     for row in reversed(checkpoints):
-        if row.get("progress_id") != progress:
+        if row.get("semantic_progress_id", row.get("progress_id")) != semantic_progress:
             break
         no_progress += 1
     no_progress = max(0, no_progress - 1)
@@ -516,7 +660,8 @@ def _state(project, evaluated, inventory, completion):
                 and row["frontier_review"].get("complete") is True
                 and _valid_frontier(project, row, inventory, cache)]
     unresolved = len(queue) + len(extras)
-    return {"snapshot_id": snapshot, "progress_id": progress, "ready_total": ready, "review_total": review,
+    return {"snapshot_id": snapshot, "progress_id": progress, "semantic_progress_id": semantic_progress,
+            "ready_total": ready, "review_total": review,
             "blocked_total": blocked, "actionable_total": ready + review, "unresolved_total": unresolved,
             "applicability_review_total": len(inventory.get("applicability_reviews", [])),
             "scope_reduction_review_total": len(inventory.get("scope_reductions", [])) + len(inventory.get("consumer_requirements", [])),
@@ -602,8 +747,9 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
             "applicability_review_total": state.get("applicability_review_total", 0),
             "scope_reduction_review_total": state.get("scope_reduction_review_total", 0),
             "state": status, "reason_code": reason, "next_action": next_action,
-            **{key: state[key] for key in ("snapshot_id", "progress_id", "checkpoint_id", "ready_total", "review_total",
-                "blocked_total", "actionable_total", "unresolved_total", "no_progress_rounds", "frontier_rounds")},
+            **{key: state[key] for key in ("snapshot_id", "progress_id", "semantic_progress_id", "checkpoint_id", "ready_total", "review_total",
+                "blocked_total", "actionable_total", "unresolved_total", "no_progress_rounds", "frontier_rounds")
+                if key != "semantic_progress_id" or key in state},
             "frontier_review_required": not frontier_ready,
             "finalization_id": finalization["id"] if finalization else None,
             "coverage_status": completion["status"], "registered_scope_only": True}
@@ -617,6 +763,8 @@ def checkpoint(project, args):
         evaluated, inventory = completeness.evaluate_with_inventory(project)
         current = evaluated["continuation"]
         previous = project.list("checkpoint")
+        _, semantic_projection, semantic_changed = _semantic_progress(project, inventory,
+            {kind: project.list(kind) for kind in STATE_KINDS}, previous)
         frontier = _frontier_review(project, args["frontier_review"], inventory) if "frontier_review" in args else None
         parameters = parameter_coverage.snapshot(project, evaluated, inventory=inventory)
         projection = parameter_coverage.progress(project, evaluated, inventory=inventory)
@@ -668,6 +816,8 @@ def checkpoint(project, args):
                  "observation_is_testing": False}
         record = {"id": project.id("CP"), "label": label, "created_at": now(),
                   "snapshot_id": current["snapshot_id"], "progress_id": current["progress_id"],
+                  "semantic_progress_id": current["semantic_progress_id"], "semantic_progress": semantic_projection,
+                  "semantic_progress_changed": semantic_changed,
                   "previous_checkpoint_id": previous[-1]["id"] if previous else None,
                   "progress_changed": bool(previous and previous[-1].get("progress_id") != current["progress_id"]),
                   "remaining": {key: current[key] for key in ("ready_total", "review_total", "blocked_total", "unresolved_total")},
@@ -676,7 +826,7 @@ def checkpoint(project, args):
         project.put("checkpoint", record, create_only=True)
         project.event("plan.checkpoint", {"checkpoint_id": record["id"], "progress_changed": record["progress_changed"]})
         updated = engine.evaluate_coverage(project)["continuation"]
-        public_record = {key: value for key, value in record.items() if key != "parameter_progress"}
+        public_record = {key: value for key, value in record.items() if key not in {"parameter_progress", "semantic_progress"}}
         from .publication import publish
         public = publish(project, "plan.checkpoint", {"checkpoint": public_record, "continuation": updated, "requests_sent": 0,
             "note": "Repeated calls or captures are not closure progress. Review existing evidence or change the bounded hypothesis; never auto-replay uncertain writes."})

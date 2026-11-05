@@ -152,7 +152,10 @@ def probe():
 _VISIT = r"""
 const [moduleRoot, specPath] = process.argv.slice(2);
 const fs = require('fs');
+const { createHash } = require('node:crypto');
 const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'));
+const BODY_DIGEST_BUDGET = 8 * 1024 * 1024;
+function digest(data) { return createHash('sha256').update(data).digest('hex'); }
 
 // The descriptors are produced by Python's scope normalizer. Reject ambiguous
 // encodings before WHATWG URL parsing can collapse dot segments or backslashes.
@@ -193,7 +196,7 @@ function sameOrigin(raw, base) {
 }
 
 (async () => {
-  const out = { url: spec.url, finalUrl: null, status: null,
+  const out = { url: spec.url, finalUrl: null, status: null, started_at: new Date().toISOString(),
                 headless: spec.headless !== false, console: [], dialogs: [],
                 network: [], blocked_requests: [], actions: [] };
   let browser, context, page, actionIndex = null;
@@ -227,7 +230,8 @@ function sameOrigin(raw, base) {
       if (out.console.length < 50) out.console.push({ type: m.type(), text: String(m.text()).slice(0, 300) });
     });
     p.on('dialog', async d => {
-      if (out.dialogs.length < 50) out.dialogs.push({ type: d.type(), message: String(d.message()).slice(0, 300), action_index: actionIndex });
+      if (out.dialogs.length < 50) out.dialogs.push({ type: d.type(), message: String(d.message()).slice(0, 300),
+                                                   action_index: actionIndex, document_url: p.url() });
       await d.dismiss().catch(() => {});
     });
     p.on('response', r => {
@@ -293,11 +297,33 @@ function sameOrigin(raw, base) {
           Object.assign(headers, spec.sessionHeaders || {});
         }
         entry.request_headers = headers;
+        if (typeof request.postDataBuffer === 'function') {
+          const body = request.postDataBuffer() || Buffer.alloc(0);
+          entry.request_body_sha256 = digest(body);
+          entry.request_body_bytes = body.length;
+        }
         // Playwright's route callback does not run on subsequent automatic
         // redirects. Fetch one response only; do not continue any redirect chain.
         const response = await route.fetch({ headers, maxRedirects: 0, maxRetries: 0, timeout: spec.timeout || 20000 });
         entry.status = response.status();
         entry.response_headers = response.headers();
+        if (['document', 'xhr', 'fetch'].includes(entry.type)) {
+          entry.response_body_complete = false;
+          const declared = entry.response_headers['content-length'];
+          const declaredBytes = typeof declared === 'string' && /^\d+$/.test(declared) ? Number(declared) : null;
+          // A known oversized body is never read for proof. Unknown lengths are
+          // checked after the actual response body arrives, before hashing it.
+          if (declaredBytes === null || declaredBytes <= BODY_DIGEST_BUDGET) {
+            try {
+              const body = await response.body();
+              entry.response_body_bytes = body.length;
+              if (body.length <= BODY_DIGEST_BUDGET) {
+                entry.response_body_sha256 = digest(body);
+                entry.response_body_complete = true;
+              }
+            } catch (_) { /* Fetch can still render; an unread body is not proof. */ }
+          }
+        }
         const location = entry.response_headers.location;
         if ([301, 302, 303, 307, 308].includes(entry.status) && location) {
           let target = null;
@@ -334,9 +360,16 @@ function sameOrigin(raw, base) {
         if (action.type === 'click') {
           await page.click(action.selector, { timeout: action.timeout || 5000 });
         } else if (action.type === 'fill') {
-          await page.fill(action.selector, String(action.value == null ? '' : action.value), { timeout: action.timeout || 5000 });
+          const value = String(action.value == null ? '' : action.value);
+          // The raw observation stays private. Public views learn and scrub
+          // fill values; neither this value nor its low-entropy digest is proof
+          // that a browser input belongs to a separate source experiment.
+          step.value = value;
+          step.value_sha256 = digest(Buffer.from(value, 'utf8'));
+          await page.fill(action.selector, value, { timeout: action.timeout || 5000 });
         } else if (action.type === 'press') {
-          await page.press(action.selector || 'body', action.key || 'Enter', { timeout: action.timeout || 5000 });
+          step.key = action.key || 'Enter';
+          await page.press(action.selector || 'body', step.key, { timeout: action.timeout || 5000 });
         } else if (action.type === 'wait') {
           await page.waitForTimeout(action.ms || 500);
         } else if (action.type === 'waitForSelector') {
@@ -388,6 +421,7 @@ function sameOrigin(raw, base) {
     }
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
+    out.completed_at = new Date().toISOString();
   }
   console.log(JSON.stringify(out));
 })();
@@ -687,7 +721,7 @@ def public_metadata(project, record, *, raw=None):
     def collect_locators(value):
         if isinstance(value, dict):
             for key, item in value.items():
-                if key in {"url", "finalUrl", "location"} and isinstance(item, str):
+                if key in {"url", "finalUrl", "location", "document_url"} and isinstance(item, str):
                     urls.append((value, key))
                 collect_locators(item)
         elif isinstance(value, list):
@@ -701,12 +735,12 @@ def public_metadata(project, record, *, raw=None):
 
     schema_keys = {"id", "kind", "url", "finalUrl", "status", "signals", "hasApp", "forms", "inputs", "buttons", "links",
                    "textLength", "selectorCount", "title", "console", "dialogs", "actions", "source_meta", "type", "message",
-                   "text", "action", "selector", "index", "action_index", "ok", "error", "blocked", "reason", "location",
+                   "text", "action", "selector", "index", "action_index", "ok", "error", "blocked", "reason", "location", "document_url",
                    "method", "blocked_requests", "write_requests", "write_authorized", "navigation_trail", "network_count",
                    "observation_status", "complete", "source", "trust", "machine_authenticated", "scope_enforced", "note",
                    "artifact_path", "sha256", "created_at", "started_at", "finished_at", "completed_at", "session_id", "session_generation",
                    "actor_id", "operation_id", "obligation_id", "resource_id", "page_id", "function_id", "page_visit_id", "visit_id",
-                   "run_id", "planned_page_visit_id", "page_ids", "functions", "pages", "pages_visited", "functions_triggered",
+                   "run_id", "planned_page_visit_id", "page_ids", "page_adoptions", "functions", "pages", "pages_visited", "functions_triggered",
                    "unvisited", "untriggered", "name", "trigger", "apis", "triggered", "trigger_status", "visited", "visit_status",
                    "blocked_reason", "page_adoption", "page_adoption_error", "next_action", "run_status", "error_code", "effect",
                    "allow_write", "target_origin", "action_count", "dispatch_attempted", "request_signature", "credential_signature",
@@ -724,7 +758,7 @@ def public_metadata(project, record, *, raw=None):
             declared = value.get("name")
             result = {}
             for key, item in value.items():
-                if key == "redaction_context_sha256":
+                if key in {"redaction_context_sha256", "value_sha256"}:
                     continue
                 structural = field == "signals" and key in _STRUCTURAL_SIGNALS and (
                     key == "hasApp" and type(item) is bool or key != "hasApp" and type(item) is int and item >= 0)
@@ -765,7 +799,7 @@ def public_metadata(project, record, *, raw=None):
                 public_key = safe_key(key)
                 if public_key not in sanitized:
                     continue
-                if key in {"url", "finalUrl", "location"} and isinstance(item, str):
+                if key in {"url", "finalUrl", "location", "document_url"} and isinstance(item, str):
                     sanitized[public_key] = locator(item)
                     if sanitized[public_key] != item:
                         sanitized[public_key + "_redacted"] = True
@@ -880,7 +914,7 @@ def public_metadata(project, record, *, raw=None):
                         sanitized[public_key] = item
                     else:
                         sanitized[public_key] = "[browser content omitted: redaction context unavailable]"
-                        if key in {"url", "finalUrl", "location"}:
+                        if key in {"url", "finalUrl", "location", "document_url"}:
                             sanitized[public_key + "_redacted"] = True
                             sanitized["locator_requires_binding"] = True
                             sanitized["native_input_requires_binding"] = True
@@ -929,7 +963,7 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
                  + ("Imported MCP output is an external observation, not machine-authenticated execution."
                     if source == "imported_mcp" else "All requests were subject to browser scope and method guards.")),
     }
-    for key in ("error", "scope_error", "headless", "afterActions", "network_truncated", "source_meta"):
+    for key in ("error", "scope_error", "headless", "afterActions", "network_truncated", "source_meta", "started_at", "completed_at"):
         if key in raw:
             record[key] = raw[key]
     if not succeeded:
@@ -954,7 +988,10 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
         project.event("browser.imported_mcp" if source == "imported_mcp" else "browser.visited",
                       {"visit_id": visit_id, "url": record["url"], "status": record["status"],
                        "observation_status": record["observation_status"], "source": source,
-                       "artifact_path": path, "sha256": digest})
+                       "artifact_path": path, "sha256": digest,
+                       "actor_id": record["actor_id"], "session_id": record["session_id"],
+                       "session_generation": record["session_generation"],
+                       **{key: record[key] for key in ("started_at", "completed_at") if key in record}})
     if source == "local_playwright" and succeeded:
         try:
             adopted = adopt_visit(project, {"page_visit_id": visit_id})
@@ -1179,18 +1216,29 @@ def adopt_visit(project, args):
     with project.transaction():
         visit_record = project.get("page_visit", identity)
         _, raw = _verified_visit(project, identity, visit_record["url"])
+        origins, _ = _adoption_history(project)
+        if not _adoption_origin_matches(visit_record, origins.get(identity)):
+            raise EngineError("page_evidence_invalid", "Browser provenance differs from the original recorded observation")
         trail = _navigation_trail(raw)
         if args.get("url") is not None:
             selected = require_scope(project.config, args["url"])
             trail = [entry for entry in trail if entry["url"] == selected]
             if not trail:
                 raise EngineError("page_visit_binding", "The selected page was not reached by this browser observation")
-        page_ids = []
+        adopted_pages = {entry["page_id"] for entry in validated_adoptions(project, visits=[visit_record])}
+        existing_pages = {normalize_url(page["url"]): page for page in project.list("page")}
+        page_ids, changed = [], False
         for entry in trail:
-            page = register_page(project, {"url": entry["url"], "source": visit_record["source"]})
-            mark(project, {"page_id": page["id"], "target": "page", "status": "visited", "page_visit_id": identity})
+            page = existing_pages.get(entry["url"])
+            if page is None:
+                page = register_page(project, {"url": entry["url"], "source": visit_record["source"]})
+            if page["id"] not in adopted_pages:
+                mark(project, {"page_id": page["id"], "target": "page", "status": "visited", "page_visit_id": identity})
+                changed = True
             page_ids.append(page["id"])
-        project.event("page.visit_adopted", {"page_visit_id": identity, "page_ids": page_ids, "source": visit_record["source"]})
+        if changed:
+            project.event("page.visit_adopted", {"page_visit_id": identity, "page_ids": page_ids,
+                                                 "source": visit_record["source"], "sha256": visit_record["sha256"]})
     return {"page_visit_id": identity, "page_ids": page_ids, "pages_adopted": len(page_ids), "functions_marked": 0,
             "requests_sent": 0, "source": visit_record["source"],
             "limitation": "Only observed pages are marked; functions still require real interactions. Imported MCP provenance is unchanged, and no HTTP security obligation is completed."}
@@ -1230,7 +1278,7 @@ def _visit_reference(args):
     return identity
 
 
-def _verified_visit(project, identity, page_url):
+def _verified_visit(project, identity, page_url, *, origin_events=None):
     visit_record = project.get("page_visit", identity)
     if visit_record.get("kind") != "page_visit" or visit_record.get("source") not in {"local_playwright", "imported_mcp"}:
         raise EngineError("page_evidence_invalid", "A recorded browser observation is required")
@@ -1251,10 +1299,18 @@ def _verified_visit(project, identity, page_url):
         default = [] if key in {"actions", "blocked_requests", "write_requests"} else None
         if visit_record.get(key, default) != raw.get(key, default):
             raise EngineError("page_evidence_invalid", "Page visit metadata differs from the original observation")
+    for key in ("started_at", "completed_at"):
+        if key in visit_record or key in raw:
+            if visit_record.get(key) != raw.get(key):
+                raise EngineError("page_evidence_invalid", "Page visit timing differs from the original observation")
     if "navigation_trail" in visit_record and visit_record.get("navigation_trail") != _navigation_trail(raw):
         raise EngineError("page_evidence_invalid", "Page visit navigation trail differs from the original observation")
     if not visit_record.get("complete") or visit_record.get("observation_status") != "visited" or not _successful(project, raw):
         raise EngineError("page_visit_incomplete", "A successful, unblocked page observation is required")
+    if origin_events is None:
+        origin_events, _ = _adoption_history(project)
+    if not _adoption_origin_matches(visit_record, origin_events.get(identity)):
+        raise EngineError("page_evidence_invalid", "Browser provenance differs from the original recorded observation")
     _network(raw)
     return visit_record, raw
 
@@ -1277,9 +1333,123 @@ def _verified_action(raw, index=None):
     return index
 
 
+def _adoption_reference(visit, page):
+    """A rendering archive binds one original visit to one exact registered page."""
+    return {"page_id": page["id"], "url": normalize_url(page["url"]), "page_visit_id": visit["id"],
+            **{key: visit.get(key) for key in ("sha256", "artifact_path", "source", "actor_id",
+                                               "session_id", "session_generation")}}
+
+
+def _adoption_history(project):
+    """Read old adoption receipts without migrating or trusting mutable visited flags.
+
+    Old receipts lack a digest, but their original browser event records it. A
+    later explicit page blocker invalidates prior associations until that exact
+    visit is adopted again; visiting the page with another run is insufficient.
+    """
+    with project._lock:
+        events = project.connection.execute(
+            "SELECT type,document FROM events WHERE type IN "
+            "('browser.visited','browser.imported_mcp','page.marked','page.visit_adopted') ORDER BY seq").fetchall()
+    origins, associations = {}, {}
+    for row in events:
+        try:
+            event = json.loads(row[1])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if row[0] in {"browser.visited", "browser.imported_mcp"}:
+            identity = event.get("visit_id")
+            source = "local_playwright" if row[0] == "browser.visited" else "imported_mcp"
+            if isinstance(identity, str) and event.get("source") == source:
+                origins.setdefault(identity, event)
+        elif row[0] == "page.marked" and event.get("target") == "page":
+            page_id, identity = event.get("page_id"), event.get("visit_id")
+            if not isinstance(page_id, str):
+                continue
+            if event.get("status") == "BLOCKED":
+                associations[page_id] = {}
+            elif event.get("status") == "visited" and isinstance(identity, str):
+                associations.setdefault(page_id, {})[identity] = event
+        elif row[0] == "page.visit_adopted":
+            identity, page_ids = event.get("page_visit_id"), event.get("page_ids")
+            if not isinstance(identity, str) or not isinstance(page_ids, list) \
+                    or event.get("source") != (origins.get(identity) or {}).get("source"):
+                continue
+            for page_id in page_ids:
+                if isinstance(page_id, str):
+                    associations.setdefault(page_id, {})[identity] = event
+    return origins, associations
+
+
+def _adoption_origin_matches(visit, event):
+    if not isinstance(event, dict) or any(event.get(key) != visit.get(key)
+            for key in ("source", "url", "sha256", "artifact_path")):
+        return False
+    # New receipts freeze identity too. Legacy receipts remain rendering-only
+    # provenance and never manufacture authenticated HTTP or XSS proof.
+    return all(key not in event or event[key] == visit.get(key)
+               for key in ("actor_id", "session_id", "session_generation", "started_at", "completed_at"))
+
+
+def validated_adoptions(project, *, pages=None, visits=None):
+    """Return independently revalidated archives for all adopted observations.
+
+    Latest page/function pointers remain display and interaction references.
+    Every prior adopted visit is retained separately and must still match its
+    original source, artifact, identity context and current page/scope policy.
+    """
+    pages = project.list("page") if pages is None else pages
+    visits = project.list("page_visit") if visits is None else visits
+    page_map = {page["id"]: page for page in pages}
+    origins, associations = _adoption_history(project)
+    result = []
+    for visit in visits:
+        identity = visit["id"]
+        if not _adoption_origin_matches(visit, origins.get(identity)):
+            continue
+        if "page_adoptions" in visit:
+            references = visit["page_adoptions"]
+        else:
+            # Compatibility for an untouched old project is a read-only
+            # projection from actual adoption events and the original digest.
+            references = [_adoption_reference(visit, page) for page in pages
+                          if identity in associations.get(page["id"], {})]
+        if not isinstance(references, list) or not references:
+            continue
+        accepted = []
+        for reference in references:
+            try:
+                if not isinstance(reference, dict):
+                    raise EngineError("page_evidence_invalid", "Invalid browser adoption reference")
+                page = page_map[reference["page_id"]]
+                receipt = associations.get(page["id"], {}).get(identity)
+                if page.get("visited") is not True or page.get("visit_status") != "visited" \
+                        or receipt is None or reference != _adoption_reference(visit, page) \
+                        or receipt.get("sha256", visit["sha256"]) != visit["sha256"]:
+                    raise EngineError("page_evidence_invalid", "Browser adoption is no longer current")
+                _verified_visit(project, identity, page["url"], origin_events=origins)
+                if reference not in accepted:
+                    accepted.append(reference)
+            except (EngineError, OSError, ValueError, TypeError, KeyError):
+                # A partial archive cannot hide an observation that still has
+                # a blocked, changed or missing adopted page to reconcile.
+                accepted = []
+                break
+        result.extend(accepted)
+    return result
+
+
 def mark(project, args):
     """Bind coverage to digested rendering evidence; preserve explicit BLOCKED gaps."""
+    with project.transaction():
+        return _mark(project, args)
+
+
+def _mark(project, args):
     page = project.get("page", args["page_id"])
+    original_page = canonical(page)
     target, status = args.get("target"), args.get("status")
     if target not in {"page", "function"}:
         raise EngineError("target", "target must be 'page' or 'function'")
@@ -1296,10 +1466,30 @@ def mark(project, args):
     if status != "BLOCKED":
         identity = _visit_reference(args)
         visit_record, raw = _verified_visit(project, identity, page["url"])
+        archive_changed = False
         if target == "function":
             entry["action_index"] = _verified_action(raw, args.get("action_index"))
             entry["triggered"], entry["trigger_status"] = True, "triggered"
         else:
+            origins, _ = _adoption_history(project)
+            if not _adoption_origin_matches(visit_record, origins.get(identity)):
+                raise EngineError("page_evidence_invalid", "Browser provenance differs from the original recorded observation")
+            valid = validated_adoptions(project, visits=[visit_record])
+            reference = _adoption_reference(visit_record, page)
+            archive_changed = reference not in valid
+            references = visit_record.get("page_adoptions", valid)
+            if not isinstance(references, list):
+                references = []
+            references = list(references)
+            index = next((index for index, item in enumerate(references)
+                          if isinstance(item, dict) and item.get("page_id") == page["id"]), None)
+            if index is None:
+                references.append(reference)
+            else:
+                references[index] = reference
+            if visit_record.get("page_adoptions") != references:
+                visit_record["page_adoptions"] = references
+                project.put("page_visit", visit_record)
             entry["visited"], entry["visit_status"] = True, "visited"
         entry["visit_id"] = identity
         entry["page_visit_id"] = identity
@@ -1312,6 +1502,7 @@ def mark(project, args):
             entry.pop("arrival_action_index", None)
         entry.pop("blocked_reason", None)
     else:
+        archive_changed = False
         entry["blocked_reason"] = reason.strip()
         if target == "page":
             entry["visited"], entry["visit_status"] = False, "BLOCKED"
@@ -1320,9 +1511,11 @@ def mark(project, args):
         for key in ("visit_id", "page_visit_id", "visit_sha256", "action_index",
                     "arrival", "arrival_action_index"):
             entry.pop(key, None)
-    project.put("page", page)
-    project.event("page.marked", {"page_id": page["id"], "target": target, "status": status,
-                                 "function_id": args.get("function_id"), "visit_id": entry.get("visit_id")})
+    if canonical(page) != original_page or archive_changed:
+        project.put("page", page)
+        project.event("page.marked", {"page_id": page["id"], "target": target, "status": status,
+                                     "function_id": args.get("function_id"), "visit_id": entry.get("visit_id"),
+                                     **({"sha256": visit_record["sha256"]} if status != "BLOCKED" else {})})
     return entry
 
 

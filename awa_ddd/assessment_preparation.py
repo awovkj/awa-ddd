@@ -204,11 +204,9 @@ def _prepare_item(project, item, inventory, observations, allowed_ids, source_fi
         row.update(preparation_state="needs_consumer", suggested_action="surface.declare_consumer",
                    positive_machine_adapter=False, suggested_test_families=suggested_families(entry or {}, operation),
                    hints_only=True, input_template={"operation_id": item["operation_id"],
-                       "input_location": item["input_location"], "input_selector": item["input_selector"]},
+                       "input_location": item["input_location"], "input_selector": item["input_selector"], "schema_branch": item.get("schema_branch")},
                    required_experiment_fields=["consumer", "test_families"],
                    note_zh="先从真实功能追踪消费点，再独立选择测试族；提示不自动声明 sink 或建立漏洞证明。")
-        if item.get("schema_branch") is not None:
-            row["input_template"]["schema_branch"] = item["schema_branch"]
         return row
     setup_actions = {"auth_review": "surface.register", "identity_setup": "identity.actor",
                      "ownership_setup": "identity.resource"}
@@ -238,8 +236,13 @@ def _prepare_item(project, item, inventory, observations, allowed_ids, source_fi
                    runtime_binding_supported=True, help_input={"name": "finding.record"},
                    required_experiment_fields=["title", "category", "impact", "remediation", "obligation_id", "reviewer", "reason",
                        "normal/attack controls in actual order", "runtime_visit_id", "consumer_url", "runtime_marker"],
-                   note_zh="需要真实应用触发、同身份且可绑定消费页面的 Playwright 运行时。静态反射、无弹窗访问或未绑定 MCP 输出不能完成本义务。")
+                   note_zh="绑定实际源输入：GET 直接消费须同身份精确文档；存储 API 到 SPA 用写入源、JSON 回读内容版本和正常/攻击 native viewer 的 xss_consumption。搜索定位词和页面弹窗不能替代源输入证明。")
         row["assessment_template"] = {"mode": "analyst", "obligation_id": item["id"], "evidence_ids": candidates}
+        row["runtime_binding_modes"] = ["direct_document"]
+        if operation["method"] in {"POST", "PUT", "PATCH"}:
+            row["runtime_binding_modes"].append("stored_api")
+            row["required_experiment_fields"].append(
+                "For stored_api: xss_consumption, writer-normal/writer-attack/reader-normal/reader-attack evidence IDs; exact JSON content/fixture selectors, successful write assertion and original native normal/attack viewer visits. Readbacks and visits execute between their respective writes; a locator is not the source.")
     elif item["kind"] == "input_test" and family not in _POSITIVE_INPUT_FAMILIES:
         row.update(positive_machine_adapter=False,
                    note_zh="当前没有本假设的通用正向机器证明；有限否定与人工发现保留具体边界，不替代完整安全测试。")

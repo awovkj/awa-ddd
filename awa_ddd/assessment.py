@@ -898,6 +898,9 @@ def _bound_xss_proof(project, decision):
             or decision.get("operation_id") != operation["id"] \
             or decision.get("operation_signature") != operation_signature(operation):
         raise EngineError("analyst_obligation", "The reviewed runtime proof must match the current exact operation and declared input")
+    if "consumption" in (decision.get("runtime") or {}):
+        from .xss_consumption import bound_proof
+        return bound_proof(project, decision, item, operation)
     observations = _observations(project, decision.get("evidence_ids"), item)
     if len(observations) != 2:
         raise EngineError("xss_input_binding", "Use exactly two independent captures in normal-baseline, attack order")
@@ -942,7 +945,9 @@ def _bound_xss_proof(project, decision):
     if operation["method"] == "GET" and (
             normalize_url(attack[1]["request"]["url"]) != consumer
             or base64.b64decode(attack[1]["request"]["body_base64"], validate=True)):
-        raise EngineError("xss_runtime_binding", "Read-only XSS closure requires the exact body-free captured attack URL as its consumer document")
+        raise EngineError("xss_runtime_binding", "Read-only XSS closure requires the exact body-free captured attack URL as its consumer document; stored API content needs its actual writing source and xss_consumption controls",
+                          {"reason_code": "consumption_chain_required", "next_action": "assessment.prepare",
+                           "obligation_id": item["id"], "operation_id": operation["id"]})
     # Current dialog records have action indices but no page URL. Multi-page trails
     # cannot prove which document emitted a dialog and remain explicitly unbound.
     if any(entry["url"] != consumer for entry in _navigation_trail(raw)):
@@ -1350,6 +1355,9 @@ def record_finding(project,args):
         raise EngineError("finding_fields", "limitations must be an array of strings")
     mode = args.get("mode", "machine")
     requested_obligation = args.get("obligation_id")
+    if args.get("xss_consumption") is not None and (requested_obligation is None or mode != "analyst"
+                                                  or not is_xss_category(args["category"])):
+        raise EngineError("analyst_obligation", "xss_consumption requires a current source XSS obligation and analyst runtime review")
     if requested_obligation is not None and (not isinstance(requested_obligation, str) or not requested_obligation
             or mode != "analyst" or not is_xss_category(args["category"])):
         raise EngineError("analyst_obligation", "obligation_id is only supported for an explicitly reviewed XSS runtime finding")
@@ -1429,6 +1437,9 @@ def record_finding(project,args):
         if is_xss_category(args["category"]):
             decision["runtime"] = {"visit_id": args.get("runtime_visit_id"),
                                    "consumer_url": args.get("consumer_url"), "marker": args.get("runtime_marker")}
+            if args.get("xss_consumption") is not None:
+                from .xss_consumption import specification
+                decision["runtime"]["consumption"] = specification(args["xss_consumption"])
             if requested_obligation is not None:
                 bound_item = project.get("obligation", requested_obligation)
                 decision.update(obligation_id=bound_item["id"], operation_id=bound_item["operation_id"],

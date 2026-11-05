@@ -1,5 +1,6 @@
 /** Public, cancellation-aware agent/turn-stopping integration; never sends target traffic. */
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { createHash } from 'node:crypto';
 import { compactContinuation, invokeEngine, resolveConfig } from './bridge.mjs';
 
 export const name = 'awa-ddd-host-continuation';
@@ -13,7 +14,7 @@ export const ARM_ACTIONS = Object.freeze([...EXECUTION_ARM_ACTIONS, 'assessment.
 const ARM_SET = new Set(ARM_ACTIONS);
 const ACTIVITY_SET = new Set([...ARM_ACTIONS.filter(action => !['plan.build', 'plan.next'].includes(action)),
   'candidate.inspect', 'candidate.link', 'candidate.reopen', 'surface.inspect', 'surface.declare_consumer',
-  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'page.mark', 'run.inspect']);
+  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'page.mark', 'run.inspect', 'plan.disposition']);
 const OFFLINE_TASKS = new Set(['evidence.inspect', 'assessment.prepare', 'assessment.evaluate', 'finding.record',
   'finding.bind', 'page.adopt', 'page.mark', 'plan.review', 'plan.disposition', 'run.inspect', 'run.recover',
   'candidate.inspect', 'candidate.link', 'candidate.reopen', 'surface.inspect', 'surface.declare_consumer',
@@ -29,10 +30,9 @@ const ACTIVITY_LIMIT = 50000;
 
 function workKey(current) {
   const value = current.continuation;
-  // Captures, checkpoint IDs and no_progress counters are not closure progress.
-  // Older compatible engines without progress_id fall back to their snapshot.
-  const progress = typeof value.progress_id === 'string' && value.progress_id
-    ? value.progress_id : value.snapshot_id;
+  // A state PR includes caller dispositions. New engines additionally distinguish
+  // actual closure/preparation; compatible engines retain their original key.
+  const progress = value.semantic_progress_id || value.progress_id || value.snapshot_id;
   return JSON.stringify([progress, current.kind, value.frontier_rounds,
     value.frontier_review_required, value.can_finalize, value.coverage_status]);
 }
@@ -100,8 +100,10 @@ function taskFrom(row, offlineOnly) {
   if (typeof identity !== 'string' || !identity || identity.length > 200) return undefined;
   const task = { id: identity, action, input_template: input, offline: OFFLINE_TASKS.has(action) };
   for (const field of ['kind', 'operation_id', 'obligation_id', 'input_location', 'input_selector', 'schema_branch',
-    'hypothesis_family', 'evidence_ids', 'missing_prerequisites', 'required_experiment_fields',
-    'assessment_followup_action', 'assessment_followup_input', 'browser_testing', 'preparation_actions']) {
+    'hypothesis_family', 'hypothesis_note_zh', 'runtime_binding_modes', 'evidence_ids', 'missing_prerequisites', 'required_experiment_fields',
+    'assessment_followup_action', 'assessment_followup_input', 'browser_testing', 'preparation_actions',
+    'actor_id', 'baseline_actor_id', 'session_id', 'session_generation', 'resource_id', 'resource_signature',
+    'operation_signature', 'input_signature', 'source_signature', 'decision_id', 'proof_decision_id', 'scope_epoch']) {
     if (row[field] !== undefined) task[field] = row[field];
   }
   if (offlineOnly) {
@@ -120,14 +122,59 @@ function taskFrom(row, offlineOnly) {
       task.browser_testing = { ...browser, offline_review_only: true, invoke_now: false, call_needed: false };
     }
   }
-  task.key = JSON.stringify([identity, action, input]);
+  task.key = canonical([identity, action, input]);
+  task.context = taskContext(row, input);
+  task.entity = obligation || input.page_visit_id || row.page_visit_id || input.evidence_id || row.evidence_id
+    || input.candidate_id || row.candidate_id || input.finding_id || row.finding_id || input.run_id || row.run_id || identity;
+  task.attempt_key = canonical([task.entity, action, task.context]);
   return task;
+}
+
+function canonical(value) {
+  return JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+}
+
+function taskContext(row, input) {
+  // No global PR/checkpoint, disposition, prose or attempt counters: another
+  // task's progress cannot erase this task's failed material/context history.
+  const context = {};
+  for (const field of ['operation_id', 'obligation_id', 'input_location', 'input_selector', 'schema_branch',
+    'hypothesis_family', 'actor_id', 'baseline_actor_id', 'session_id', 'session_generation', 'resource_id',
+    'resource_signature', 'operation_signature', 'input_signature', 'source_signature', 'scope_epoch',
+    'evidence_ids', 'control_candidate_evidence_ids', 'decision_id', 'proof_decision_id']) {
+    if (row[field] !== undefined) context[field] = row[field];
+    else if (input[field] !== undefined) context[field] = input[field];
+  }
+  context.missing_prerequisites = [...new Set(row.missing_prerequisites || [])]
+    .filter(value => value !== 'offline_obligation_blocker_reconciliation').sort();
+  const browser = row.browser_testing;
+  if (browser && !row.blocker_reconciliation_required) {
+    context.browser = {};
+    for (const field of ['requirement', 'existing_visit_id', 'existing_observation', 'consumer_locator', 'required_input_fields']) {
+      if (browser[field] !== undefined) context.browser[field] = browser[field];
+    }
+  }
+  return createHash('sha256').update(canonical(context)).digest('hex');
+}
+
+function activityReferences(action, input) {
+  const fields = action === 'assessment.evaluate' ? ['obligation_id']
+    : action === 'assessment.prepare' ? ['obligation_id', 'evidence_id', 'finding_id', 'operation_id']
+    : action.startsWith('candidate.') ? ['candidate_id']
+    : action.startsWith('finding.') ? ['finding_id', 'decision_id', 'obligation_id']
+    : action.startsWith('page.') ? ['page_visit_id', 'page_id']
+    : action.startsWith('run.') ? ['run_id']
+    : action === 'plan.review' ? ['checklist_id']
+    : action === 'plan.disposition' ? ['obligation_id']
+    : action === 'evidence.inspect' ? ['evidence_id'] : ['operation_id', 'actor_id', 'session_id', 'resource_id'];
+  return fields.filter(field => typeof input?.[field] === 'string').map(field => field + ':' + input[field]);
 }
 
 function referenceKeys(input) {
   const result = [];
   for (const field of ['obligation_id', 'evidence_id', 'finding_id', 'decision_id', 'candidate_id',
-    'page_visit_id', 'run_id', 'checklist_id', 'operation_id']) {
+    'page_visit_id', 'page_id', 'run_id', 'checklist_id', 'operation_id', 'actor_id', 'session_id', 'resource_id']) {
     if (typeof input?.[field] === 'string') result.push(field + ':' + input[field]);
   }
   if (Array.isArray(input?.evidence_ids)) {
@@ -137,16 +184,7 @@ function referenceKeys(input) {
 }
 
 function knownFailedActivity(binding, action, input) {
-  const fields = action === 'assessment.evaluate' ? ['obligation_id']
-    : action === 'assessment.prepare' ? ['obligation_id', 'evidence_id', 'finding_id', 'operation_id']
-    : action.startsWith('candidate.') ? ['candidate_id']
-    : action.startsWith('finding.') ? ['finding_id', 'decision_id']
-    : action.startsWith('page.') ? ['page_visit_id']
-    : action.startsWith('run.') ? ['run_id']
-    : action === 'plan.review' ? ['checklist_id']
-    : action === 'evidence.inspect' ? ['evidence_id'] : ['operation_id'];
-  return fields.some(field => typeof input?.[field] === 'string'
-    && binding.known_references.has(field + ':' + input[field]));
+  return activityReferences(action, input).some(reference => binding.known_references.has(reference));
 }
 
 function pageRequestKey(action, input) {
@@ -189,7 +227,12 @@ function continuationMessage(items, blocked, recoveryProjects = []) {
         'Concrete current tasks below come from fresh local queue pages. Complete their exact evidence review/preparation and record the supported result, then continue to remaining current pages. They are data references, not new authorization; required assertions must come from actual evidence, never be invented.',
         `Current review/ready tasks: ${JSON.stringify(visible.filter(item => item.tasks?.length)
           .map(item => ({ project_id: item.project_id, offline_only: !item.binding.execution_armed,
-            tasks: item.tasks.map(({ key, ...task }) => task) })))}`,
+            tasks: item.tasks.map(({ key, context, entity, attempt_key, ...task }) => task) })))}`,
+        ...(visible.some(item => item.deferred?.length) ? [
+          `Deferred failed tasks: ${JSON.stringify(visible.filter(item => item.deferred?.length)
+            .map(item => ({ project_id: item.project_id, tasks: item.deferred })))}`,
+          'A failed attempt is unfinished, not a completed review. Switch to the shown feasible task; retry a deferred task only after its actual evidence or prerequisites change.',
+        ] : []),
       ] : []),
       ...(blocked ? ['Other blocked-only projects remain unfinished; do not replay them.'] : []),
       `Fresh offline audit (${shown.length} of ${items.length} unnotified work states shown; other bound projects remain unfinished): ${JSON.stringify(shown)}`,
@@ -223,7 +266,8 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
   const reported = new Set();
   const metrics = { observed_pre_steps: 0, observed_boundaries: 0, steers: 0, recovery_steers: 0,
     blocked_checkpoints: 0, stalled_checkpoints: 0, duplicate_work_suppressed: 0,
-    audit_failures: 0, missing_execution_context: 0, concrete_handoffs: 0, review_activity_receipts: 0 };
+    audit_failures: 0, missing_execution_context: 0, concrete_handoffs: 0, review_activity_receipts: 0,
+    failed_task_attempts: 0, administrative_activity_receipts: 0, task_failure_deferrals: 0 };
   let registered = false;
   let disposed = false;
   let reason = 'not_attached';
@@ -338,7 +382,8 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     if (ticket.arm && (settled || uncertain) && !ticket.state.projects.has(ticket.project_id)) ticket.state.projects.set(ticket.project_id,
       { blocked_snapshot: null, recovery_notified: false, observed_key: null,
         notified_keys: new Set(), stalled_keys: new Set(), execution_armed: EXECUTION_ARM_SET.has(invocation.action),
-        activities: new Set(), activity_version: 0, task_states: new Map(), known_references: new Set(),
+        activities: new Set(), activity_version: 0, scan_version: 0, task_states: new Map(), known_references: new Set(),
+        task_records: new Map(), reference_tasks: new Map(), attempted_tasks: new Set(), failed_attempts: new Map(),
         pending_pages: new Map() });
     const binding = ticket.state.projects.get(ticket.project_id);
     if (!binding) return;
@@ -347,13 +392,49 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     const pageProgress = binding.pending_pages.get(pageKey);
     const recoveredPage = settled && typeof pageProgress === 'string' && pageProgress === binding.observed_key;
     if (recoveredPage) binding.pending_pages.delete(pageKey);
-    if (recoveredPage || ACTIVITY_SET.has(invocation.action) && (settled || uncertain
-      || event.phase === 'failure' && knownFailedActivity(binding, invocation.action, invocation.input))) {
-      const key = JSON.stringify([invocation.action, invocation.input || {}, ...(recoveredPage ? [pageProgress] : [])]);
+    const failed = event.phase === 'failure' || event.phase === 'success' && event.ok === false;
+    const knownFailure = failed && knownFailedActivity(binding, invocation.action, invocation.input);
+    if (recoveredPage || ACTIVITY_SET.has(invocation.action) && (settled || uncertain || knownFailure)) {
+      const matched = new Map();
+      for (const reference of activityReferences(invocation.action, invocation.input)) {
+        for (const key of binding.reference_tasks.get(reference) || []) {
+          const record = binding.task_records.get(key);
+          if (record && (record.task.action === invocation.action
+            || record.task.assessment_followup_action === invocation.action)) matched.set(key, record);
+        }
+      }
+      const contexts = [...new Set([...matched.values()].map(record => record.task.context))].sort();
+      const key = canonical([failed ? 'failure' : 'receipt', invocation.action, invocation.input || {}, contexts,
+        ...(recoveredPage ? [pageProgress] : [])]);
       if (!binding.activities.has(key) && binding.activities.size < ACTIVITY_LIMIT) {
         binding.activities.add(key);
-        binding.activity_version++;
-        metrics.review_activity_receipts++;
+        binding.scan_version++;
+        if (failed) {
+          // A failure permits inspecting another current page once, never proof
+          // completion. Its evidence/context history survives every global PR.
+          metrics.failed_task_attempts++;
+          const code = typeof event.failure_code === 'string' && /^[A-Za-z0-9_:-]{1,80}$/.test(event.failure_code)
+            ? event.failure_code : uncertain ? 'dispatch_uncertain' : 'tool_failure';
+          for (const record of matched.values()) {
+            const attempt = canonical([record.task.entity, invocation.action, record.task.context]);
+            if (binding.failed_attempts.size < ACTIVITY_LIMIT) binding.failed_attempts.set(attempt, code);
+            if (record.task.action === invocation.action) {
+              binding.attempted_tasks.add(record.task.attempt_key);
+              record.status = 'failed';
+              record.failure_code = code;
+            }
+          }
+        } else {
+          binding.activity_version++;
+          if (['plan.disposition', 'plan.review'].includes(invocation.action)) metrics.administrative_activity_receipts++;
+          else metrics.review_activity_receipts++;
+          for (const record of matched.values()) {
+            if (record.task.action === invocation.action) {
+              binding.attempted_tasks.add(record.task.attempt_key);
+              record.status = 'attempted';
+            }
+          }
+        }
       }
     }
   }
@@ -362,10 +443,11 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     const previous = binding.task_states.get(key) || {
       queue_offset: 0, review_offset: 0, last_activity: -1, attempted: false, issued: false, shown: new Set(),
     };
-    if (previous.attempted && binding.activity_version <= previous.last_activity) return undefined;
+    if (previous.attempted && binding.scan_version <= previous.last_activity) return undefined;
     const next = { ...previous, shown: new Set(previous.shown), attempted: true,
-      last_activity: binding.activity_version };
+      last_activity: binding.scan_version };
     const candidates = [];
+    const deferred = [];
     const pageRecoveries = [];
     for (const [action, field, cursor] of [['plan.next', 'work_items', 'queue_offset'], ['plan.audit', 'checklist', 'review_offset']]) {
       for (let page = 0; page < TASK_PAGE_READ_LIMIT; page++) {
@@ -394,9 +476,25 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           const task = taskFrom(row, !binding.execution_armed);
           if (!task) continue;
           for (const reference of [...referenceKeys(task), ...referenceKeys(task.input_template)]) {
-            if (binding.known_references.size < ACTIVITY_LIMIT) binding.known_references.add(reference);
+            if (binding.known_references.size < ACTIVITY_LIMIT) {
+              binding.known_references.add(reference);
+              if (!binding.reference_tasks.has(reference)) binding.reference_tasks.set(reference, new Set());
+              if (binding.reference_tasks.get(reference).size < TASK_PAGE_LIMIT * TASK_PAGE_READ_LIMIT) {
+                binding.reference_tasks.get(reference).add(task.key);
+              }
+            }
           }
-          if (!next.shown.has(task.key)) candidates.push(task);
+          if (binding.task_records.size < ACTIVITY_LIMIT || binding.task_records.has(task.key)) {
+            const record = binding.task_records.get(task.key);
+            if (!record || record.task.context !== task.context) binding.task_records.set(task.key, { task, status: 'available' });
+          }
+          const failure = binding.failed_attempts.get(task.attempt_key);
+          if (failure) {
+            if (deferred.length < TASK_PAGE_LIMIT && !deferred.some(item => item.id === task.entity && item.action === task.action)) {
+              deferred.push({ id: task.entity, action: task.action, failure_code: failure });
+            }
+            metrics.task_failure_deferrals++;
+          } else if (!binding.attempted_tasks.has(task.attempt_key)) candidates.push(task);
         }
         const total = data[action === 'plan.next' ? 'queue_total' : 'checklist_total'];
         const following = Number.isSafeInteger(total) && Number.isSafeInteger(data.next_offset)
@@ -423,7 +521,7 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
       binding.task_states.set(key, next);
       return undefined;
     }
-    return { project_id, ...current, binding, key, tasks, task_state: next };
+    return { project_id, ...current, binding, key, tasks, deferred, task_state: next };
   }
 
   function includeFreshCheckpoint(state, project_id, binding, envelope, work) {
@@ -435,7 +533,6 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     if (!binding.notified_keys.has(key)) {
       binding.observed_key = key;
       binding.pending_pages.clear();
-      binding.known_references.clear();
       binding.recovery_notified = false;
       work.push({ project_id, ...updated, binding, key });
     }
@@ -480,7 +577,6 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           if (!binding.notified_keys.has(key)) binding.recovery_notified = false;
           binding.observed_key = key;
           binding.pending_pages.clear();
-          binding.known_references.clear();
         }
         if (current.kind === 'blocked') {
           blocked++;
@@ -544,15 +640,19 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
         if (item.binding.observed_key !== item.key) {
           item.binding.observed_key = item.key;
           item.binding.pending_pages.clear();
-          item.binding.known_references.clear();
         }
         item.binding.notified_keys.add(item.key);
         if (item.tasks) {
           for (const task of item.tasks) {
             item.task_state.shown.add(task.key);
             if (task.pagination_recovery) item.binding.pending_pages.set(task.key, item.key);
+            else {
+              item.binding.attempted_tasks.add(task.attempt_key);
+              const record = item.binding.task_records.get(task.key);
+              if (record) record.status = 'issued';
+            }
           }
-          item.task_state.last_activity = item.binding.activity_version;
+          item.task_state.last_activity = item.binding.scan_version;
           item.task_state.issued = true;
           item.binding.task_states.set(item.key, item.task_state);
           metrics.concrete_handoffs++;

@@ -158,8 +158,12 @@ def register_operation(project, hint):
         if "test_families" not in normalized and "test_families" in inputs.get(key, {}):
             normalized["test_families"] = inputs[key]["test_families"]
         inputs[key] = normalized
+    declared_query_selectors = {entry["selector"] for entry in inputs.values() if entry["location"] == "query"}
     for key in parse_qs(parsed.query, keep_blank_values=True):
-        inputs.setdefault(canonical(["query",key,None]), {"name":key,"location":"query","selector":key,"source":"declared","consumer":"unknown"})
+        # A URL value does not declare another schema branch. Keep every saved
+        # branch, but only fill inputs the caller has not declared at all.
+        if key not in declared_query_selectors:
+            inputs[canonical(["query",key,None])] = {"name":key,"location":"query","selector":key,"source":"declared","consumer":"unknown"}
     if len(inputs) > 4096:
         raise EngineError("input_budget", "Too many inputs in one operation")
     auth = hint.get("auth", existing.get("auth", "unknown"))
@@ -1305,13 +1309,16 @@ def declare_consumer(project, args):
     Declaring the consumer re-plans; the stale input_review is superseded automatically.
     """
     operation = project.get("operation", args["operation_id"])
+    _validate_operation_inputs(operation)
     location = args["input_location"]
     selector = args["input_selector"]
-    consumer = str(args["consumer"]).strip()
-    if location not in {"query", "path", "header", "cookie", "body", "graphql"}:
-        raise EngineError("input", "Input requires a supported location")
-    if not selector or not consumer:
-        raise EngineError("input", "consumer and input_selector are required")
+    selected = {"name": "selected input", "location": location, "selector": selector}
+    if "schema_branch" in args:
+        selected["schema_branch"] = args["schema_branch"]
+    _validate_input_identity(selected, operation["id"])
+    if not isinstance(args["consumer"], str) or not args["consumer"].strip():
+        raise EngineError("consumer", "consumer must be a nonempty concrete sink string")
+    consumer = args["consumer"].strip()
     if consumer.lower() in {"unknown", "other"}:
         raise EngineError("consumer", "Declare a concrete consumer name, not a placeholder")
     families = normalize_test_families(args["test_families"]) if "test_families" in args else None
@@ -1321,7 +1328,9 @@ def declare_consumer(project, args):
     if not matches:
         raise EngineError("input", "No registered input matches that location and selector")
     if len(matches) != 1:
-        raise EngineError("input_ambiguous", "Select an exact schema_branch when multiple inputs share a selector")
+        raise EngineError("input_ambiguous", "Select an exact schema_branch when multiple inputs share a selector; use null for the unbranched input",
+                          {"operation_id": operation["id"], "next_action": "surface.inspect",
+                           "help_action": "action.help", "help_input": {"name": "surface.declare_consumer"}})
     updated = matches[0]
     updated["consumer"] = consumer
     if families is not None:

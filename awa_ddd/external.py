@@ -30,21 +30,44 @@ def _timeout(args, default=30):
     return float(value)
 
 
-def _executable(value, name):
-    if not isinstance(value, str) or not Path(value).is_absolute() or not Path(value).is_file():
-        raise EngineError("tool_path", name + " must be an existing absolute local file")
-    path = Path(value).resolve()
-    if name == "sqlmap_path" and path.name.lower() != "sqlmap.py":
-        raise EngineError("tool_path", "sqlmap_path must identify sqlmap.py")
-    if name == "yak_path" and path.name.lower() not in {"yak", "yak.exe"}:
-        raise EngineError("tool_path", "yak_path must identify the Yak engine executable")
+def _executable(value, name, *, configured=False, configured_backend=None):
+    from .runtime import execution_backend, tool_path_reason
+    backend = execution_backend()
+    reason = "backend_mismatch" if configured_backend is not None and configured_backend != backend \
+        else tool_path_reason(value, name)
+    path = None
+    if reason is None:
+        try:
+            path = Path(value).resolve()
+        except (OSError, ValueError, RuntimeError):
+            reason = "file_missing"
+        if path is not None and (name == "sqlmap_path" and path.name.lower() != "sqlmap.py"
+                                 or name == "yak_path" and path.name.lower() not in {"yak", "yak.exe"}):
+            reason = "wrong_filename"
+    if reason:
+        messages = {
+            "not_configured": "No local executable path is configured; inspect runtime.probe and explicitly probe an existing path for this backend.",
+            "backend_mismatch": "The executable path or saved probe belongs to another execution backend; use a verified path for the current backend.",
+            "overescaped_path": "The executable path has repeated Windows separators or an overescaped UNC prefix; copy a verified runtime.probe template without adding escapes.",
+            "not_absolute": "The executable path must be absolute in the current execution backend.",
+            "file_missing": "The selected local executable file does not exist; this does not establish that the tool is absent from every installation location.",
+            "wrong_filename": "The executable path must identify sqlmap.py or the Yak engine filename required by this adapter.",
+            "invalid_path": "The executable path must be a bounded string without surrounding whitespace or control characters.",
+        }
+        raise EngineError("tool_path", messages[reason],
+                          {"reason_code": reason, "execution_backend": backend, "path_field": name,
+                           "configured": configured, "next_action": "runtime.probe", "input_template": {"backend": "all"},
+                           "help_action": "action.help", "help_input": {"name": "tool.probe"}})
     return path
 
 
 def _configured_executable(project, args, adapter):
     key = "sqlmap_path" if adapter == "sqlmap" else "yak_path"
     configured = project.get("tool_config", adapter, required=False) or {}
-    return _executable(args.get(key, configured.get("executable")), key)
+    if key in args:
+        return _executable(args[key], key)
+    return _executable(configured.get("executable"), key, configured=bool(configured.get("executable")),
+                       configured_backend=configured.get("execution_backend"))
 
 
 def _process_options():
@@ -382,8 +405,9 @@ def probe(project, args):
         document["error_type"] = type(exc).__name__
     result = _finish(project, run, document, files)
     if run.get("available"):
+        from .runtime import execution_backend
         project.put("tool_config", {"id": adapter, "executable": str(executable),
-                                   "probe_run_id": run["id"], "configured_at": now()})
+                                   "execution_backend": execution_backend(), "probe_run_id": run["id"], "configured_at": now()})
     return result
 
 
