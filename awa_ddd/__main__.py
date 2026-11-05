@@ -175,6 +175,9 @@ def _project_dispatch(project, action, args):
     if action=="plan.next":
         from .workflow import next_work
         return next_work(project,args)
+    if action=="plan.why":
+        from .workflow import explain_obligation
+        return explain_obligation(project,args)
     if action=="plan.audit":
         from .completeness import audit
         return audit(project,args)
@@ -226,6 +229,9 @@ def _project_dispatch(project, action, args):
     if action=="assessment.prepare":
         from .assessment_preparation import prepare
         return prepare(project,args)
+    if action=="assessment.batch":
+        from .batch import assessment_batch
+        return assessment_batch(project,args)
     if action=="assessment.evaluate":
         from .assessment import evaluate
         from .oracle_contracts import recover
@@ -313,10 +319,10 @@ def _project_dispatch(project, action, args):
         if project.config.get("assessment_model") == "v2":
             from .reporting import build_v2_report
             return build_v2_report(project,args.get("output_dir"),stage=args.get("stage", "draft"),
-                                   campaign_id=args.get("campaign_id"))
+                                   campaign_id=args.get("campaign_id"), profile=args.get("profile", "full"))
         from .reporting import build_report
         return build_report(project,args.get("output_dir"), stage=args.get("stage", "draft"),
-                            finalization_id=args.get("finalization_id"))
+                            finalization_id=args.get("finalization_id"), profile=args.get("profile", "full"))
     if action=="project.import_pentest":
         from .importers import import_pentest
         result=import_pentest(project,args["source_path"])

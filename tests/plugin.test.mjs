@@ -70,7 +70,7 @@ test('every engine action appears in exactly one native tool enum', () => {
   const actions = GROUPS.flatMap(group => group.actions);
   assert.equal(actions.length, new Set(actions).size);
   assert.deepEqual([...actions].sort(), [...ACTIONS].sort());
-  assert.equal(actions.length, 63);
+  assert.equal(actions.length, 65);
 });
 
 test('actual dsh defineTool validates action enums before calling the Python bridge', async () => {

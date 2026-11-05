@@ -2,6 +2,7 @@
 from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 import base64
+import hashlib
 import json
 import re
 from urllib.parse import urlsplit, parse_qsl, unquote
@@ -144,13 +145,45 @@ def _json_oracle_result(project, item, operation, observations, oracle):
     kind = oracle.get("type")
     outcome, reason = "inconclusive", "Experiment did not establish the requested invariant"
     if kind == "baseline":
-        if item["kind"] != "baseline" or len(observations) != 1 or "expected" not in oracle:
-            raise EngineError("oracle_binding", "A baseline obligation needs one capture and an expected JSON value")
+        if item["kind"] != "baseline" or len(observations) != 1 \
+                or not any(key in oracle for key in ("expected", "expected_text", "expected_sha256")):
+            raise EngineError("oracle_binding", "A baseline obligation needs one capture and an expected JSON or raw value")
         if observations[0][0].get("actor_id") != item.get("actor_id"):
             raise EngineError("actor_binding", "Baseline used a different actor")
-        if 200 <= observations[0][1]["response"]["status"] < 300 \
-                and json_equal(_value(observations[0], oracle["selector"]), oracle["expected"]):
-            return "refuted", "Declared normal response assertion matched; this is a baseline, not a vulnerability absence claim"
+        if 200 <= observations[0][1]["response"]["status"] < 300:
+            # Static files (JS, images) are not JSON; allow an explicit raw
+            # baseline instead of requiring a synthetic JSON wrapper.
+            raw_selector = oracle.get("selector")
+            if raw_selector in {None, "", "@raw"} and (
+                    "expected_text" in oracle or "expected_sha256" in oracle):
+                try:
+                    body = base64.b64decode(observations[0][1]["response"]["body_base64"], validate=True)
+                except (KeyError, ValueError) as exc:
+                    raise EngineError("baseline_invalid", "Raw baseline response bytes are unavailable") from exc
+                if "expected_sha256" in oracle:
+                    digest = hashlib.sha256(body).hexdigest()
+                    matched = digest == str(oracle["expected_sha256"]).lower()
+                else:
+                    expected = oracle["expected_text"]
+                    try:
+                        matched = isinstance(expected, str) and body.decode("utf-8", errors="strict") == expected
+                    except UnicodeDecodeError:
+                        matched = False
+                if matched:
+                    return "refuted", "Declared normal raw response assertion matched; this is a baseline, not a vulnerability absence claim"
+            elif "expected" in oracle and json_equal(_value(observations[0], oracle["selector"]), oracle["expected"]):
+                return "refuted", "Declared normal response assertion matched; this is a baseline, not a vulnerability absence claim"
+    elif kind == "sql_boolean":
+        if item["kind"] != "input_test" or item.get("test_family") != "sql_injection" or len(observations) != 3:
+            raise EngineError("oracle_binding", "SQL boolean differential needs a SQL input test and normal/variant/sensitivity captures")
+        _same_identity(observations)
+        _input_controls(observations, item, operation)
+        values = [_value(observation, oracle.get("selector")) for observation in observations]
+        baseline, control = oracle.get("baseline_expected"), oracle.get("control_expected")
+        if not json_equal(baseline, control) and json_equal(values[0], baseline) \
+                and json_equal(values[1], control) and json_equal(values[2], baseline) \
+                and 200 <= observations[1][1]["response"]["status"] < 300:
+            return "confirmed", "The boolean SQL input changed the selected business observable while normal controls repeated"
     elif kind == "semantic_negative":
         if item["kind"] != "input_test" or len(observations) != 3:
             raise EngineError("oracle_binding", "Semantic refutation needs an input test and normal/variant/sensitivity captures")
@@ -455,9 +488,9 @@ def _oracle_family(item, operation, oracle):
     if item.get("kind") != "input_test":
         return
     kind, family = oracle.get("type"), item.get("test_family")
-    if _sql_input(item, operation) and kind not in {"sql_metadata", "error_channel"} \
+    if _sql_input(item, operation) and kind not in {"sql_metadata", "error_channel", "sql_boolean"} \
             and not (family == "xss" and kind == "analyst_runtime"):
-        raise EngineError("sql_metadata_required", "A declared SQL input requires metadata/error proof, not a generic observable")
+        raise EngineError("sql_metadata_required", "A declared SQL input requires metadata/error or boolean-differential proof, not a generic observable")
     if family is None:
         from .completeness import obligation_family
         if obligation_family(item, operation) == "xss":
@@ -472,7 +505,7 @@ def _oracle_family(item, operation, oracle):
         if kind != "analyst_runtime":
             raise EngineError("xss_runtime_required", "Static input observations cannot close an XSS runtime obligation; use a real application-triggered browser observation and reviewed finding")
         return
-    allowed = {"sql_injection": {"sql_metadata", "error_channel"},
+    allowed = {"sql_injection": {"sql_metadata", "error_channel", "sql_boolean"},
                "business_logic": {"semantic_negative", "state_invariant", "state_transition"},
                "generic": {"semantic_negative"},
                "xxe": {"semantic_negative", "extraction"}, "ssrf": {"semantic_negative", "extraction"},
@@ -1010,7 +1043,7 @@ def validate_confirmation(project, decision, category=None):
         if bound_item.get("test_family") and claimed_family and bound_item["test_family"] != claimed_family:
             code = "sql_metadata_required" if claimed_family == "sql_injection" else "xss_runtime_required" if claimed_family == "xss" else "oracle_family"
             raise EngineError(code, "The explicitly claimed finding family does not match its supporting input-test obligation")
-        if oracle.get("type") in {"baseline", "semantic_negative", "state_invariant"}:
+        if oracle.get("type") in {"baseline", "sql_boolean", "semantic_negative", "state_invariant"}:
             observations = _observations(project, decision["evidence_ids"], bound_item)
             outcome, reason = _json_oracle_result(project, bound_item, bound_operation, observations, oracle)
             if outcome != decision.get("outcome"):
@@ -1126,7 +1159,7 @@ def current_machine_proof(project, identity, category):
         # channel, even before explicit test_families were introduced.
         if family is None and _sql_input(item, operation):
             family = "sql_injection"
-        allowed = {"sql_injection": {"sql_metadata", "error_channel"},
+        allowed = {"sql_injection": {"sql_metadata", "error_channel", "sql_boolean"},
                    "xxe": {"extraction"}, "ssrf": {"extraction"}, "path_traversal": {"extraction"},
                    "business_logic": {"state_invariant", "state_transition"}}
         if kind not in allowed.get(family, set()):

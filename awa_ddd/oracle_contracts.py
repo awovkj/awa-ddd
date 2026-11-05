@@ -29,6 +29,16 @@ ORACLES = {
                         "Refutation is limited to this input and hypothesis; it does not refute siblings or an entire family.",
                         "This oracle cannot close SQL or XSS obligations."],
     },
+    "sql_boolean": {
+        "obligation_kinds": ["input_test"], "evidence_order": ["normal", "variant", "sensitivity"],
+        "required": ["type", "selector", "baseline_expected", "control_expected"],
+        "conditional": ["Explicit SQL obligations require test_family:sql_injection."],
+        "example": {"type": "sql_boolean", "test_family": "sql_injection", "selector": "/data/products",
+                    "baseline_expected": ["<normal result>"], "control_expected": ["<full result>"]},
+        "constraints": ["Read-only boolean differential: normal and sensitivity repeat the same business observable; the variant differs.",
+                        "Same identity and only the selected SQL input changes; three distinct input values are required.",
+                        "This is a bounded boolean proof, not table dump or all-table access."],
+    },
     "extraction": {
         "obligation_kinds": ["input_test"], "evidence_order": ["recovery", "negative"],
         "required": ["type", "selector", "expect"],

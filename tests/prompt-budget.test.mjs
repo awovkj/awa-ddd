@@ -28,7 +28,7 @@ test('always-present schemas and enabled policy fit the measured 25 KB context b
   assert.ok(size.stop <= 2200, JSON.stringify(size));
   assert.ok(size.mode <= 4000, JSON.stringify(size));
   assert.ok(size.schemas + size.stop + size.mode <= 25000, JSON.stringify(size));
-  assert.equal(ACTIONS.length, 63);
+  assert.equal(ACTIONS.length, 65);
   assert.deepEqual(definitions.flatMap(tool => tool.parameters.properties.action.enum).sort(), [...ACTIONS].sort());
   assert.match(modePrompt(), /\u5148 surface\.recon \u7edf\u7b79\u4fe1\u606f/);
 });

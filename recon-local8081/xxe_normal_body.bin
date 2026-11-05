@@ -1,0 +1,7 @@
+------AWA9f3c1aBoundary
+Content-Disposition: form-data; name="file"; filename="awa-xxe.xml"
+Content-Type: text/xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<products><product><name>AWA-NORMAL-XML-9f3c1a</name><price>1.00</price><stock>1</stock></product></products>
+------AWA9f3c1aBoundary--

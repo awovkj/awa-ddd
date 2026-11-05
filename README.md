@@ -1,6 +1,8 @@
 # awa-ddd
 
-awa-ddd 2.0.1 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将攻击面宇宙、假设、冻结测试配方、durable 执行、证据与多维覆盖存入本地 SQLite。默认 `assessmentModel:v1` 保留原 10 组、63 个动作；`assessmentModel:v2` 注册 6 组 Campaign 工具（`awa_campaign/awa_recon/awa_test/awa_review/awa_report/awa_admin`），以“Universe → Hypothesis → TestRecipe → TestRun → Finding/CoverageClaim”驱动下一轮测试。模型沿用 dsh 运行时，不另接模型供应商。
+awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将攻击面宇宙、假设、冻结测试配方、durable 执行、证据与多维覆盖存入本地 SQLite。默认 `assessmentModel:v1` 保留原 10 组、63 个动作；`assessmentModel:v2` 注册 6 组 Campaign 工具（`awa_campaign/awa_recon/awa_test/awa_review/awa_report/awa_admin`），以“Universe → Hypothesis → TestRecipe → TestRun → Finding/CoverageClaim”驱动下一轮测试。模型沿用 dsh 运行时，不另接模型供应商。
+
+2.0.2 增加 `plan.next compact`、`plan.why`、`assessment.batch` 与 `coverage_policy=subject` actor 去重；修复浏览器 `action`/`text` 兼容并保留 25 KB prompt budget。详见 [2.0.2 优化第一批](docs/UPGRADE-20261105.md)。
 
 2.0.1 修复同页多次观察归档互相覆盖、query 的 default/null 重复及精确分支交接，新增 `semantic_progress_id` 区分真实闭环/前提改善与行政状态往返，保留任务失败上下文后推进下一可行页。存储 API 到 SPA 的 XSS 可以通过 `finding.record xss_consumption` 验证实际写入源、JSON 回读内容版本和 native 正常/攻击 viewer；`runtime.probe` 提供经检查的 sqlmap backend/路径模板。详见 [本轮升级与验证](docs/UPGRADE-20261104.md) 和 [原会话对照审计](docs/SESSION-20261104-460B14C4.md)。
 

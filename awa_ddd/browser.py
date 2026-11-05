@@ -39,7 +39,7 @@ VISIT_STATUSES = {"visited", "BLOCKED"}
 TRIGGER_STATUSES = {"triggered", "BLOCKED"}
 _SAFE_EXTRA_HEADERS = {"accept", "accept-language", "cache-control", "pragma", "dnt", "sec-gpc"}
 _INTERACTIONS = {"click", "fill", "press"}
-_ACTION_TYPES = _INTERACTIONS | {"wait", "waitForSelector"}
+_ACTION_TYPES = _INTERACTIONS | {"wait", "waitForSelector", "waitForDialog", "waitForURL"}
 _STRUCTURAL_SIGNALS = {"hasApp", "forms", "inputs", "buttons", "links", "textLength", "selectorCount"}
 _OBSERVATION_BUDGET = 4 * 1024 * 1024
 
@@ -374,6 +374,13 @@ function sameOrigin(raw, base) {
           await page.waitForTimeout(action.ms || 500);
         } else if (action.type === 'waitForSelector') {
           await page.waitForSelector(action.selector, { timeout: action.timeout || 5000 });
+        } else if (action.type === 'waitForDialog') {
+          const dialog = await page.waitForEvent('dialog', { timeout: action.timeout || 5000 });
+          step.dialog_type = dialog.type();
+          step.dialog_message = String(dialog.message()).slice(0, 300);
+        } else if (action.type === 'waitForURL') {
+          await page.waitForURL(action.value || action.text, { timeout: action.timeout || 5000 });
+          step.url = page.url();
         } else throw new Error('unknown_action');
         const settle = action.settleMs == null ? spec.actionSettleMs : action.settleMs;
         if (settle) await page.waitForTimeout(settle);
@@ -450,16 +457,23 @@ def _actions(args):
         raise EngineError("browser_actions", "actions must be an array of at most 50 steps")
     normalized = []
     for action in actions:
-        if not isinstance(action, dict) or action.get("type", "click") not in _ACTION_TYPES:
+        if not isinstance(action, dict):
             raise EngineError("browser_actions", "Unknown browser action type")
-        step = {**action, "type": action.get("type", "click")}
+        # `action` is a compatibility alias; the executor reads `type`.
+        action_type = action.get("type", action.get("action", "click"))
+        if action_type not in _ACTION_TYPES:
+            raise EngineError("browser_actions", "Unknown browser action type")
+        step = {**action, "type": action_type}
         if step["type"] in {"click", "fill", "waitForSelector"} and (
                 not isinstance(step.get("selector"), str) or not step["selector"].strip()):
             raise EngineError("browser_actions", "This action needs a selector")
+        if step["type"] == "waitForURL" and not isinstance(step.get("value", step.get("text")), str):
+            raise EngineError("browser_actions", "waitForURL needs a string URL or pattern")
         if step["type"] == "fill":
-            if step.get("value") is not None and not isinstance(step["value"], str):
+            value = step.get("value", step.get("text"))
+            if value is not None and not isinstance(value, str):
                 raise EngineError("browser_actions", "Fill values must be text or null")
-            step["value"] = step.get("value") or ""
+            step["value"] = value or ""
         for field, default, limit in (("timeout", 5000, 20000), ("ms", 500, 10000),
                                       ("settleMs", 0, 10000)):
             if field in step:

@@ -87,10 +87,19 @@ def atomic(function):
     return wrapped
 
 
+def _coverage_policy(value):
+    policy = value if value is not None else "subject"
+    if policy not in {"legacy", "subject"}:
+        raise EngineError("config", "coverage_policy must be legacy or subject")
+    return policy
+
+
 def create_project(workspace, args):
     config = validate_config({"project_id": args["project_id"], "target": args["target"],
         "scope": args.get("scope"), "exclude": args.get("exclude", []),
-        "allow_mutation": args.get("allow_mutation") is True, "created_at": now(), "schema_version":1})
+        "allow_mutation": args.get("allow_mutation") is True,
+        "coverage_policy": _coverage_policy(args.get("coverage_policy")),
+        "created_at": now(), "schema_version":1})
     with Project(workspace, args["project_id"], create=True) as project:
         if project.config:
             raise EngineError("project_exists", "Project already exists; resume it without reinitializing")
@@ -237,6 +246,11 @@ def update_project(project, args):
         if value != (config.get("exclude") or []):
             changes["exclude"] = {"from": config.get("exclude") or [], "to": value}
             config["exclude"] = value
+    if "coverage_policy" in args:
+        value = _coverage_policy(args["coverage_policy"])
+        if value != config.get("coverage_policy", "legacy"):
+            changes["coverage_policy"] = {"from": config.get("coverage_policy", "legacy"), "to": value}
+            config["coverage_policy"] = value
     if not changes:
         return {"project_id": project.project_id, "config": config, "changed": False}
     project.set_config(validate_config(config))
@@ -1095,6 +1109,58 @@ def _role_key(actor):
     return tuple(sorted(actor.get("roles") or []))
 
 
+def _canonical_actors(project, actors):
+    """Collapse duplicate ledger principals under coverage_policy=subject.
+
+    The same real account is often registered several times while role/tenant
+    evidence is being discovered (``alice`` / ``alice-r0`` / ``alice-n``).  Each
+    registration must remain auditable, but planning one baseline/access case
+    per alias is pure queue noise.  Group by subject, attach unknown-tenant
+    aliases to the unique known tenant, and prefer a locally verified session
+    as the representative.
+    """
+    if project.config.get("coverage_policy", "legacy") != "subject":
+        return list(actors)
+    sessions_by_actor = {}
+    for session in project.list("session"):
+        sessions_by_actor.setdefault(session.get("actor_id"), []).append(session)
+    verified = {actor_id for actor_id, sessions in sessions_by_actor.items()
+                if any(session.get("verification_evidence_id") for session in sessions)}
+
+    def credential_key(actor):
+        signatures = sorted({session.get("credential_signature") for session in sessions_by_actor.get(actor["id"], [])
+                             if session.get("credential_signature")})
+        # Accounts without a session are ledger aliases until a credential
+        # proves otherwise. Distinct credentials are always separate contexts.
+        return tuple(signatures) if signatures else ("unregistered",)
+
+    by_subject_credential = {}
+    for actor in actors:
+        subject = str(actor.get("subject") or "").strip().lower() or actor["id"]
+        by_subject_credential.setdefault((subject, credential_key(actor)), []).append(actor)
+    groups = {}
+    for (subject, credential), members in by_subject_credential.items():
+        tenants = {}
+        for actor in members:
+            tenants.setdefault(str(actor.get("tenant_id") or ""), []).append(actor)
+        unknown = tenants.pop("", [])
+        if len(tenants) == 1:
+            groups[(subject, credential, next(iter(tenants)))] = next(iter(tenants.values())) + unknown
+        else:
+            groups.update({(subject, credential, tenant): items for tenant, items in tenants.items()})
+            if unknown:
+                groups[(subject, credential, "")] = unknown
+    result = []
+    for key, members in groups.items():
+        members.sort(key=lambda actor: (
+            actor["id"] not in verified,
+            -len(actor.get("roles") or []),
+            actor.get("created_at") or "",
+            actor["id"]))
+        result.append(members[0])
+    return sorted(result, key=lambda actor: (actor.get("created_at") or "", actor["id"]))
+
+
 def _tenant_boundary(owner, actor):
     left, right = owner.get("tenant_id"), actor.get("tenant_id")
     if not left or not right:
@@ -1171,7 +1237,7 @@ def _case_identity(case):
 @atomic
 def build_plan(project):
     added = 0
-    actors = project.list("actor")
+    actors = _canonical_actors(project, project.list("actor"))
     resources = project.list("resource")
     owned_by_operation = {}
     obligations_by_operation = {}

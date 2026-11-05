@@ -200,6 +200,46 @@ def _verification_assurance(findings, candidates):
             "note_zh": "运行时证实仅指当前接受的具体 HTTP/状态/浏览器证明；人工复核单列，不能按提交标签冒充 typed 证明。代码与答案键候选本身不计为发现，分数不代表独立漏洞证据。"}
 
 
+def _executive_markdown(summary):
+    """Compact, decision-oriented report; uses only already-published summary data."""
+    lines = ["# awa-ddd 执行摘要", "",
+             "- 项目：" + str(summary.get("project_id") or ""),
+             "- 目标：" + str((summary.get("scope") or {}).get("target") or ""),
+             "- 生成时间（UTC）：" + str(summary.get("generated_at") or ""),
+             "- 评估阶段：" + str(summary.get("stage") or ""),
+             "", "## 风险总览", ""]
+    groups = (summary.get("finding_groups") or {}).get("by_severity") or []
+    total = sum(int(group.get("count", 0)) for group in groups)
+    lines += ["当前有效发现：" + str(total) + " 个。", "",
+              "| 级别 | 数量 |", "|---|---:|"]
+    labels = {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危", "info": "信息"}
+    for group in groups:
+        lines.append("| " + labels.get(group.get("severity"), str(group.get("severity"))) + " | " + str(group.get("count", 0)) + " |")
+    lines += ["", "## 重点发现", ""]
+    shown = 0
+    for group in groups:
+        for finding in (group.get("findings") or [])[:3]:
+            lines.append("- **" + labels.get(group.get("severity"), str(group.get("severity"))) + "** "
+                         + str(finding.get("title") or "") + "（" + str(finding.get("category") or "") + "）")
+            shown += 1
+            if shown >= 12:
+                break
+        if shown >= 12:
+            break
+    completion = summary.get("completion") or {}
+    continuation = summary.get("continuation") or {}
+    lines += ["", "## 覆盖状态", "",
+              "- 完成状态：" + str(completion.get("status") or "unknown"),
+              "- 已求值义务：" + str(summary.get("coverage", {}).get("evaluated", 0)) + " / " + str(summary.get("coverage", {}).get("total", 0)),
+              "- 仍未完成：ready=" + str(continuation.get("ready_total", 0))
+              + "，review=" + str(continuation.get("review_total", 0))
+              + "，blocked=" + str(continuation.get("blocked_total", 0)),
+              "", "## 说明", "",
+              "本摘要面向决策，详细证据、完整 HTTP 包与复现步骤见同批次完整报告或 technical 报告。",
+              "报告为阶段快照，不自动代表全量覆盖或完成授权。", ""]
+    return "\n".join(lines)
+
+
 def _finding_groups(findings):
     severity_order = ("critical", "high", "medium", "low", "info")
     current = [item for item in findings if item.get("current") is True]
@@ -683,10 +723,12 @@ def _publish_report(staging, destination, parent):
             time.sleep(delay)
 
 
-def build_report(project, output_dir=None, *, stage="draft", finalization_id=None):
+def build_report(project, output_dir=None, *, stage="draft", finalization_id=None, profile="full"):
     from .store import EngineError
     if not isinstance(stage, str) or stage not in {"draft", "final"}:
         raise EngineError("report_stage", "Report stage must be draft or final")
+    if profile not in {"full", "technical", "executive", "both", "repro"}:
+        raise EngineError("report_stage", "Report profile must be full, technical, executive, both or repro")
     if stage == "draft" and finalization_id is not None:
         raise EngineError("report_stage", "A finalization_id requires stage=final")
     # A concurrent importer must not change source counts between evaluation and
@@ -726,6 +768,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             "format_version": 5,
             "language": "zh-CN",
             "stage": stage,
+            "report_profile": profile,
             "delivery_status": delivery,
             "completion": evaluated.get("completion") or {},
             "continuation": continuation,
@@ -749,6 +792,9 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             "artifacts": [{"path": path, "sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)}
                           for path, data in sorted(reproduction["files"].items())],
         }
+        if profile == "executive":
+            summary["artifacts"] = []
+            summary["reproduction_metadata_only"] = True
         if stage == "final":
             # SQLite does not freeze artifact bytes. Recheck them after source
             # preparation; this is not a lock against later external changes.
@@ -761,7 +807,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         from .publication import publish_report_summary
         summary = publish_report_summary(project, summary, extra_secrets=reproduction["redactor"].values,
                                          files=reproduction["files"])
-    report_bytes = _render(summary).encode("utf-8")
+    report_bytes = (_executive_markdown(summary) if profile == "executive" else _render(summary)).encode("utf-8")
     digest = hashlib.sha256(report_bytes).hexdigest()
     summary["report_sha256"] = digest
     summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
@@ -772,7 +818,10 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
     staging = Path(tempfile.mkdtemp(prefix=".report-", dir=parent))
     written, directories = [], set()
     try:
-        material = {"report.md": report_bytes, "summary.json": summary_bytes, **reproduction["files"]}
+        material = {"report.md": report_bytes, "summary.json": summary_bytes,
+                    **({} if profile == "executive" else reproduction["files"])}
+        if profile == "both":
+            material["executive.md"] = _executive_markdown(summary).encode("utf-8")
         manifest = {"format_version": 1, "generated_at": summary["generated_at"], "project_id": summary["project_id"],
                     "stage": summary["stage"], "delivery_status": summary["delivery_status"],
                     "completion": summary["completion"], "continuation": summary["continuation"],
@@ -802,7 +851,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
                 path.rmdir()
             staging.rmdir()
     return {"stage": summary["stage"], "completion": summary["completion"], "continuation": summary["continuation"],
-            "delivery_status": summary["delivery_status"], "finalization": summary["finalization"],
+            "delivery_status": summary["delivery_status"], "finalization": summary["finalization"], "profile": profile,
             "verification_assurance": summary["verification_assurance"],
             "report": str(destination / "report.md"), "summary": str(destination / "summary.json"),
             "report_sha256": digest, "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),

@@ -133,7 +133,9 @@ def _render(project, campaign, data):
     return "\n".join(lines)
 
 
-def build_v2_report(project, output_dir=None, *, stage="draft", campaign_id=None):
+def build_v2_report(project, output_dir=None, *, stage="draft", campaign_id=None, profile="full"):
+    if profile not in {"full", "technical", "executive", "both", "repro"}:
+        raise EngineError("v2_report_stage", "profile must be full, technical, executive, both or repro")
     campaign = _campaign(project, campaign_id)
     data = coverage.compute(project, campaign["id"])
     findings = [row for row in Repository(project).list("finding", limit=None)[0] if row.get("current")]
@@ -163,6 +165,7 @@ def build_v2_report(project, output_dir=None, *, stage="draft", campaign_id=None
         "matrix_sha256": hashlib.sha256(matrix_bytes).hexdigest(),
         "campaign_id": campaign["id"],
         "stage": stage,
+        "profile": profile,
         "delivery": data["delivery"],
         "dimensions": data["dimensions"],
         "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
@@ -170,7 +173,7 @@ def build_v2_report(project, output_dir=None, *, stage="draft", campaign_id=None
     manifest_path.write_bytes(json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     return {"report": str(report_path), "matrix": str(matrix_path), "manifest": str(manifest_path),
             "report_sha256": manifest["report_sha256"], "matrix_sha256": manifest["matrix_sha256"],
-            "stage": stage, "delivery": data["delivery"], "dimensions": data["dimensions"],
+            "stage": stage, "profile": profile, "delivery": data["delivery"], "dimensions": data["dimensions"],
             "notice": "Draft output does not grant exhaustion authority." if stage == "draft" else "Final delivery is bound to the completed campaign."}
 
 

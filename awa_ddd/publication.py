@@ -18,7 +18,7 @@ _OPAQUE_LOCATORS = frozenset({_PRIVATE_LOCATOR, "[candidate locator omitted: pro
 _ERROR_CODES = frozenset((
     "access_policy action action_failed action_name action_reference actor_binding actor_changed actor_independence "
     "actor_subject analyst_evidence analyst_obligation analyst_review anonymous_cookie argument_missing arguments "
-    "assessment_not_started assessment_partial auth authorization_proof authorization_response baseline_identity "
+    "assessment_batch assessment_error assessment_not_started assessment_partial auth authorization_proof authorization_response baseline_identity "
     "baseline_invalid basis_missing blocked_reason body body_budget body_file browser_actions browser_arguments "
     "browser_budget browser_execution_blocked browser_failed browser_import browser_observation browser_redaction_context "
     "browser_unavailable browser_write_not_authorized budget candidate candidate_closure candidate_dismissed candidate_identity "

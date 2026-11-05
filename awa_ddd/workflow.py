@@ -746,11 +746,38 @@ def queue_inventory(project, evaluated, inventory=None):
     return rows
 
 
+def _compact_work_item(row):
+    fields = ("id", "gap_id", "obligation_id", "operation_id", "obligation_kind", "input_location",
+              "input_selector", "schema_branch", "test_family", "hypothesis_family", "queue_status", "status",
+              "suggested_action", "next_action", "actor_id", "baseline_actor_id", "session_id", "resource_id",
+              "decision_id", "method", "url")
+    result = {key: row[key] for key in fields if key in row}
+    for key in ("missing_prerequisites", "required_experiment_fields", "evidence_ids"):
+        values = row.get(key)
+        if isinstance(values, list) and values:
+            result[key] = values[:4]
+    template = row.get("input_template")
+    if isinstance(template, dict) and len(str(template)) <= 1200:
+        result["input_template"] = template
+    browser = row.get("browser_testing")
+    if isinstance(browser, dict):
+        result["browser_testing"] = {key: browser[key] for key in
+                                     ("requirement", "stage", "call_needed", "invoke_now", "execution_blocked")
+                                     if key in browser}
+    return result
+
+
+def _compact_followup(row):
+    fields = ("id", "kind", "action", "label_zh", "operation_id", "obligation_id", "candidate_id", "evidence_id")
+    return {key: row[key] for key in fields if key in row}
+
+
 def next_work(project, args):
     offset, limit = page_args(args, default=10, maximum=25)
     include_blocked = args.get("include_blocked", False)
-    if type(include_blocked) is not bool:
-        raise EngineError("arguments", "include_blocked must be a boolean")
+    compact = args.get("compact", False)
+    if type(include_blocked) is not bool or type(compact) is not bool:
+        raise EngineError("arguments", "include_blocked and compact must be booleans")
     from .completeness import evaluate_with_inventory, followups
     from .parameter_coverage import public_page as parameter_page
     evaluated, inventory = evaluate_with_inventory(project)
@@ -761,13 +788,25 @@ def next_work(project, args):
     if include_blocked:
         selected += blocked
     closure = followups(project, evaluated, min(limit, 10), inventory=inventory)
+    window = selected[offset:offset + limit]
+    if compact:
+        return {"continuation": evaluated["continuation"],
+                "work_items": [_compact_work_item(row) for row in window],
+                "review_followups": [_compact_followup(row) for row in closure.get("review_followups", [])[:5]],
+                "queue_total": len(selected), "ready_total": counts["ready"],
+                "review_total": counts["review"], "blocked_total": counts["blocked"],
+                "offset": offset, "limit": limit,
+                "next_offset": offset + limit if offset + limit < len(selected) else None,
+                "requests_sent": 0, "compact": True,
+                "next_action": "plan.next",
+                "limitation": "Compact readiness view only; it is not approval, execution or completed coverage."}
     from .browser_policy import summarize
     browser_summary = summarize([row["browser_testing"] for row in rows])
     followup_summary = closure.pop("browser_followup_summary")
     for key, count in followup_summary.items():
         browser_summary[key] += count
     return {"continuation": evaluated["continuation"],
-            "work_items": selected[offset:offset + limit], "queue_total": len(selected),
+            "work_items": window, "queue_total": len(selected),
             "ready_total": counts["ready"], "review_total": counts["review"], "blocked_total": counts["blocked"],
             "offset": offset, "limit": limit, "next_offset": offset + limit if offset + limit < len(selected) else None,
             "blocked_sample": blocked[:min(5, limit)], **closure,
@@ -778,6 +817,33 @@ def next_work(project, args):
             "queue_policy": "coverage_first", "queue_fairness": "family_and_operation_round_robin", "closure_action": "plan.audit",
             "browser_testing_summary": browser_summary,
             "limitation": "Readiness is not approval, execution, or completed coverage. Fill the exact experiment fields and preflight every request; imported tool output remains untrusted."}
+
+
+def explain_obligation(project, args):
+    """Offline one-item diagnosis; no request and no decision."""
+    obligation = project.get("obligation", args["obligation_id"])
+    if obligation.get("superseded"):
+        return {"obligation_id": obligation["id"], "status": "superseded",
+                "superseded_at": obligation.get("superseded_at"),
+                "operation_id": obligation.get("operation_id"),
+                "next_action": "plan.next",
+                "help": "Historical planning identity; use the current replacement from plan.next."}
+    from .completeness import evaluate_with_inventory
+    evaluated, inventory = evaluate_with_inventory(project)
+    row = next((item for item in inventory["queue"] if item.get("obligation_id") == obligation["id"]), None)
+    if row is None:
+        return {"obligation_id": obligation["id"], "status": obligation.get("status"),
+                "operation_id": obligation.get("operation_id"), "queue_status": "unknown",
+                "reason": "No current queue projection; refresh plan.next.", "next_action": "plan.next"}
+    result = _compact_work_item(row)
+    result["reason_code"] = row.get("reason_code")
+    result["reason"] = row.get("reason")
+    result["missing_prerequisites"] = list(row.get("missing_prerequisites") or [])[:8]
+    result["preparation_actions"] = (row.get("preparation_actions") or [])[:3]
+    result["help_input"] = row.get("help_input")
+    result["requests_sent"] = 0
+    result["next_action"] = row.get("suggested_action") or "plan.next"
+    return result
 
 
 def findings_page(project, args):

@@ -471,6 +471,8 @@ def _sqlmap_target(project, args, timeout):
     body = _request_bytes(prepared["body"])
     if method == "GET" and body:
         raise EngineError("tool_input", "This GET sqlmap profile has no request body; use a supported POST profile instead")
+    if args.get("test_family") not in {None, "sql_injection"}:
+        raise EngineError("tool_input", "tool.sqlmap supports only the sql_injection family")
     location = args.get("input_location", "query" if method == "GET" else "body")
     selector = args.get("input_selector", args.get("parameter"))
     if args.get("input_selector") is not None and args.get("parameter") is not None and args["input_selector"] != args["parameter"]:
@@ -478,7 +480,9 @@ def _sqlmap_target(project, args, timeout):
     if location not in ({"query"} if method == "GET" else {"query", "body"}):
         raise EngineError("tool_input", "Select a query input for GET, or one query/body input for POST")
     registered = _input_policy(operation, location, selector)
-    if not isinstance(selector, str) or not registered or not any(is_sql_category(entry.get("consumer")) for entry in registered):
+    if not isinstance(selector, str) or not registered or not any(
+            is_sql_category(entry.get("consumer")) or "sql_injection" in (entry.get("test_families") or [])
+            for entry in registered):
         raise EngineError("tool_input", "Select one registered SQL input using its exact input_location and input_selector")
     query = parse_qsl(urlsplit(prepared["url"]).query, keep_blank_values=True)
     tool_parameter = selector
