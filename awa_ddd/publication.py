@@ -56,7 +56,8 @@ _ERROR_CODES = frozenset((
     "browser_observation_incomplete tool_probe_failed tool_process_failed mcp_start_failed tscanplus_failed tscanplus_probe_failed "
     "artifact_unreadable completed evidence_invalid execution_failed invalid invalid_operation missing_metadata no_injection multipart_framing "
     "finding_proof finding_proof_current finding_binding finding_binding_lifecycle finding_binding_channel finding_binding_source finding_binding_duplicate "
-    "page_adoption_failed timeout tool_lineage_invalid wsl_runtime sql_metadata_lineage"
+    "page_adoption_failed timeout tool_lineage_invalid wsl_runtime sql_metadata_lineage "
+    "already_preflighted report_redaction_failed"
 ).split())
 _ERROR_CODES = _ERROR_CODES | frozenset((
     "action_catalog capability_profile capability_provider known_case_entry known_case_group known_case_source "
@@ -142,15 +143,19 @@ class PublicationContext:
                 if value is not None:
                     _learn_header(self.redactor, name, value)
         for value in report_context(project)["secret_values"]:
-            _learn_private_value(self.redactor, value)
+            _learn_private_value(self.redactor, value, short_alias=False)
         from .reproduction import _PLACEHOLDER
         prepared = extra_secrets if isinstance(extra_secrets, dict) else {}
         for value in extra_secrets:
             if isinstance(value, str):
                 placeholder = prepared.get(value)
+                short = len(value) <= 3
                 if isinstance(placeholder, str) and _PLACEHOLDER.fullmatch(placeholder):
-                    self.redactor.values[value] = placeholder
-                _learn_private_value(self.redactor, value)
+                    if short:
+                        self.redactor.field_values[value] = placeholder
+                    else:
+                        self.redactor.values[value] = placeholder
+                _learn_private_value(self.redactor, value, short_alias=not short)
         self.minted = minted or {}
         self._records = {}
         self._generated = None
@@ -173,7 +178,7 @@ class PublicationContext:
 
         keys(value)
         for private in list(self.redactor.values):
-            _learn_private_value(self.redactor, private)
+            _learn_private_value(self.redactor, private, short_alias=False)
         self._literal_pattern()
 
     def _literal_pattern(self):
@@ -423,6 +428,7 @@ def _schemas():
         "matching_test_resource_or_declared_actor_state", "explicit_consumer_page_unblock_or_authorized_alternative",
         "offline_obligation_blocker_reconciliation", "declared_access_input_or_identity_prerequisite", "scoped_consumer_url",
         "consumer_url", "runtime_marker", "analyst_reviewer", "normal_baseline_capture", "selected_attack_capture", "exact_captured_attack_url",
+        "no_progress_frozen",
         "concrete_same_identity_consumer_url", "relevant_selectors_and_actions", "exact_scoped_consumer_url_with_bound_values",
         "actual_function_selectors_and_actions", "valid_scoped_page_url", "exact_scoped_page_url_with_bound_values")
     page = {**_fields("offset limit next_offset", _COUNT), "next_action": action}
@@ -765,7 +771,7 @@ def _schemas():
                 "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_required_values": _COUNT,
                 "control_review_blockers": _Many(_enum("roles_unverified", "actor_independence", "declared_access_policy")),
                 "decision_id": _handle("decision"), "outcome": _enum("confirmed", "refuted", "inconclusive"),
-                "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls"),
+                "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls", "frozen"),
                 "suggested_action": action, "assessment_action": action, "input_template": template, "help_input": {"name": action},
                 "assessment_template": template, "suggested_test_families": _Many(family),
                  "runtime_binding_modes": _Many(_enum("direct_document", "stored_api")),

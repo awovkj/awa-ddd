@@ -636,13 +636,27 @@ def _redaction_inputs(actions):
     return values, available
 
 
-def _learn_private_value(redactor, value):
+def _learn_private_value(redactor, value, *, short_alias=True):
+    """Learn a private browser-entered value.
+
+    ``short_alias=False`` keeps a one-to-three character private field in the
+    structured field scope only.  This prevents a short input value such as
+    ``x`` or ``a`` from becoming a global substring alias that corrupts report
+    prose (for example ``local`` -> ``locpl``).
+    """
+    if value is None or isinstance(value, (dict, list, bool)):
+        return
+    text = str(value)
+    if not text:
+        return
+    if len(text) <= 3 and not short_alias:
+        redactor.field_slot(text, "BROWSER_INPUT", allow_new=True)
+        return
     placeholder = redactor.slot(value, "BROWSER_INPUT")
-    if value:
-        for alias in {value, quote(value, safe=""), quote_plus(value),
-                      json.dumps(value, ensure_ascii=True)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}:
-            redactor.aliases[alias] = placeholder
-        redactor._pattern = None
+    for alias in {text, quote(text, safe=""), quote_plus(text),
+                  json.dumps(text, ensure_ascii=True)[1:-1], json.dumps(text, ensure_ascii=False)[1:-1]}:
+        redactor.aliases[alias] = placeholder
+    redactor._pattern = None
 
 
 def _private_redaction_context(values):

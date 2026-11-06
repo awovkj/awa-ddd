@@ -1,0 +1,1 @@
+import e from"./ForgotPasswordView-DpSBy6v-.js";import{G as r,e as t}from"./index-BgcBZbIS.js";const n={__name:"MerchantForgotPasswordView",setup(o){return(a,c)=>(t(),r(e,{"user-type":"merchant"}))}};export{n as default};

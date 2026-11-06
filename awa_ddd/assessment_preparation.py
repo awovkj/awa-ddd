@@ -1,7 +1,10 @@
 """Bounded offline proof preparation from the current ledger, without replay."""
 from __future__ import annotations
 
-from . import engine
+import hashlib
+import json
+
+from . import engine, loop_guard
 from .completeness import PROOF_CHANNELS, evaluate_with_inventory, obligation_family, suggested_families
 from .oracle_contracts import ORACLES
 from .store import EngineError
@@ -306,6 +309,20 @@ def prepare(project, args):
                                 priorities.get(item["kind"], 4), item["id"]))
     selected = items[offset:offset + limit]
     rows = [_prepare_item(project, item, inventory, observations, allowed_ids, finding) for item in selected]
+    if rows:
+        signature = hashlib.sha256(json.dumps([
+            {"obligation_id": row.get("obligation_id"),
+             "state": row.get("preparation_state"),
+             "evidence_ids": row.get("control_candidate_evidence_ids") or []}
+            for row in rows
+        ], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if loop_guard.repeat_seen(project, "assessment.prepare", signature):
+            for row in rows:
+                row["preparation_state"] = "frozen"
+                row["assessment_action"] = "plan.review"
+                row["suggested_action"] = "plan.review"
+                row["note_zh"] = ("This exact preparation set has been returned repeatedly without a state or evidence change; "
+                                  "frozen by loop guard. Reopen only after changing the prerequisite, identity, resource, or evidence.")
     reviewed_ids = list(dict.fromkeys(identity for row in rows for identity in row["control_candidate_evidence_ids"]))
     if key == "evidence_id":
         reviewed_ids = list(dict.fromkeys([identity, *reviewed_ids]))

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awa-ddd"
-version = "2.0.2"
+version = "2.1.0"
 description = "Evidence-driven security assessment engine for DeepSeek Harness: Universe, Hypothesis, Recipe and Campaign"
 readme = "README.md"
 requires-python = ">=3.10"

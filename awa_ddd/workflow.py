@@ -5,7 +5,7 @@ from collections import Counter, deque
 import re
 from urllib.parse import urlsplit, urlunsplit
 
-from . import engine
+from . import engine, loop_guard
 from .reporting import safe_metadata, safe_text, safe_url
 from .store import EngineError, now
 
@@ -171,6 +171,12 @@ def project_status(project, args):
 
 def capture_preflight(project, args):
     prepared = engine.preflight_capture(project, args)
+    if loop_guard.preflight_seen(project, prepared["request_signature"]):
+        raise EngineError(
+            "already_preflighted",
+            "An identical request signature was already preflighted; use http.capture once with this exact prepared request, or change the tested input/resource instead of repeating preflight.",
+            {"request_signature": prepared["request_signature"], "next_action": "http.capture"},
+        )
     session, resource, operation = (prepared[key] for key in ("session", "resource", "operation"))
     return {"ready": True, "requests_sent": 0, "operation_id": operation["id"], "method": operation["method"],
             "url": safe_url(prepared["url"]), "request_signature": prepared["request_signature"],
@@ -750,7 +756,7 @@ def _compact_work_item(row):
     fields = ("id", "gap_id", "obligation_id", "operation_id", "obligation_kind", "input_location",
               "input_selector", "schema_branch", "test_family", "hypothesis_family", "queue_status", "status",
               "suggested_action", "next_action", "actor_id", "baseline_actor_id", "session_id", "resource_id",
-              "decision_id", "method", "url")
+              "decision_id", "method", "url", "hypothesis_hint")
     result = {key: row[key] for key in fields if key in row}
     for key in ("missing_prerequisites", "required_experiment_fields", "evidence_ids"):
         values = row.get(key)
@@ -789,6 +795,21 @@ def next_work(project, args):
         selected += blocked
     closure = followups(project, evaluated, min(limit, 10), inventory=inventory)
     window = selected[offset:offset + limit]
+    # Anti-repeat guard: a page repeatedly rendered without any change becomes
+    # a bounded blocked sample instead of an endless loop.  The guard only sees
+    # the exact returned page, so normal sequential pagination is unaffected.
+    frozen_ids = loop_guard.observe_next_page(project, offset, limit, window)
+    if frozen_ids:
+        old_status = {row.get("obligation_id"): row.get("queue_status") for row in window
+                      if row.get("obligation_id") in frozen_ids}
+        frozen = loop_guard.mark_frozen(window, frozen_ids)
+        for obligation_id, status in old_status.items():
+            if status in counts:
+                counts[status] -= 1
+        counts["blocked"] += len(frozen)
+        selected = [row for row in selected if row.get("obligation_id") not in frozen_ids]
+        window = [row for row in window if row.get("obligation_id") not in frozen_ids]
+        blocked = [row for row in blocked if row.get("obligation_id") not in frozen_ids] + frozen
     if compact:
         return {"continuation": evaluated["continuation"],
                 "work_items": [_compact_work_item(row) for row in window],

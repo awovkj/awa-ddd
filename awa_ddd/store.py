@@ -91,6 +91,25 @@ class Project:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (canonical(config),))
 
+    def get_metadata(self, key, default=None):
+        """Read a small JSON metadata value without exposing project secrets."""
+        with self._lock:
+            row = self.connection.execute("SELECT value FROM metadata WHERE key=?", (str(key),)).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row[0])
+        except (TypeError, ValueError):
+            return default
+
+    def set_metadata(self, key, value):
+        """Persist a small JSON value used for local scheduling state."""
+        with self.transaction():
+            self.connection.execute(
+                "INSERT INTO metadata(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(key), canonical(value)))
+
     @contextmanager
     def transaction(self):
         """Compose entity/event writes atomically, including nested operations.

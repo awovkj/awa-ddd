@@ -70,6 +70,28 @@ def safe_url(value):
         return "[invalid URL]"
 
 
+def _report_redaction_selftest(project, text, *, check_routes=True):
+    """Fail closed when the redactor corrupts ordinary report prose.
+
+    The historical bug replaced single letters with `<AWA_...>` tokens, so
+    common route fragments became unreadable.  A report must not be published
+    if its own non-secret route vocabulary is not intact.
+    """
+    from .store import EngineError
+    if not check_routes:
+        return
+    # The old single-character replacement bug also destroyed ordinary route
+    # vocabulary. Only require terms that are present in registered operation
+    # URLs, so a legitimate redacted secret placeholder can never fail this.
+    operation_text = " ".join(str(item.get("url") or "") for item in project.list("operation")).lower()
+    expected = [term for term in ("http", "api", "login") if term in operation_text]
+    missing = [term for term in expected if term not in text.lower()]
+    if missing:
+        raise EngineError("report_redaction_failed",
+                          "Report redaction destroyed ordinary route vocabulary; refusing to publish a corrupted report",
+                          {"missing_terms": missing, "next_action": "report.build"})
+
+
 def safe_text(value, limit=4000, *, preserve_placeholders=False):
     if value is None:
         return ""
@@ -807,7 +829,14 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         from .publication import publish_report_summary
         summary = publish_report_summary(project, summary, extra_secrets=reproduction["redactor"].values,
                                          files=reproduction["files"])
-    report_bytes = (_executive_markdown(summary) if profile == "executive" else _render(summary)).encode("utf-8")
+    report_text = _executive_markdown(summary) if profile == "executive" else _render(summary)
+    _report_redaction_selftest(project, report_text)
+    report_bytes = report_text.encode("utf-8")
+    executive_bytes = None
+    if profile == "both":
+        executive_text = _executive_markdown(summary)
+        _report_redaction_selftest(project, executive_text, check_routes=False)
+        executive_bytes = executive_text.encode("utf-8")
     digest = hashlib.sha256(report_bytes).hexdigest()
     summary["report_sha256"] = digest
     summary_bytes = (json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8")
@@ -821,7 +850,7 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         material = {"report.md": report_bytes, "summary.json": summary_bytes,
                     **({} if profile == "executive" else reproduction["files"])}
         if profile == "both":
-            material["executive.md"] = _executive_markdown(summary).encode("utf-8")
+            material["executive.md"] = executive_bytes
         manifest = {"format_version": 1, "generated_at": summary["generated_at"], "project_id": summary["project_id"],
                     "stage": summary["stage"], "delivery_status": summary["delivery_status"],
                     "completion": summary["completion"], "continuation": summary["continuation"],

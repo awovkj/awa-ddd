@@ -41,6 +41,7 @@ awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 | 人工复核 | SQL proof 不放宽；XSS 可把精确正常/攻击输入、同身份真实消费页及运行时证明绑定具体义务，仍标为 analyst；无弹窗访问不否定整类 XSS |
 | 线索复核 | candidate.link 可显式绑定已有 proof_decision_ids 复核精确评估提示；普通 link、评分、方法猜测、同名代码 sink 不能收口；工件变化重新打开 |
 | 判据与交付 | 8 种精确 oracle 帮助与控制顺序；multipart/BOM 在 preflight 拒绝，文件名/内容独立绑定；completed 族仍需当前有效证据；review 不关闭安全义务，最终交付仅 strict completed |
+| 质量护栏 | `plan.next` / `assessment.prepare` 重复页签名冻结、`http.preflight` 24h 同签名去重、报告脱敏自检与普通词回归；详见 [质量护栏](docs/QUALITY_GUARDS.md) |
 | 公共输出 | 所有项目动作与错误共用私有凭据上下文脱敏；已知秘密不经 surface/preflight/步骤标签回流，真实控制字段按动作 schema 保留；已分派执行不因输出失败被回滚或自动重放 |
 | Windows / Kali | 文件式 UTF-8 调用避免 PowerShell 多层插值；可选 WSL 运行引擎及已适配工具，取消/超时终止本次 Linux 进程组 |
 

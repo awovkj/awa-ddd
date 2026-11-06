@@ -105,6 +105,11 @@ class Redactor:
         text = str(value)
         if not text or text in self.placeholders:
             return text
+        if text in self.values:
+            # A value promoted from a submitted field must not remain in the
+            # field-only map; otherwise later structured views can restore it.
+            self.field_values.pop(text, None)
+            return self.values[text]
         if text not in self.values:
             label = re.sub(r"[^A-Z0-9_]", "_", kind.upper())[:40] or "SECRET"
             self.values[text] = self.field_values.pop(text, None) or (
@@ -204,7 +209,7 @@ class Redactor:
         text = re.sub(r"\b(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]{16,}\b", "<AWA_TOKEN_REPLACE>", text)
         return text
 
-    def learn_text(self, text, *, field_only=False, preserve_field_scope=False):
+    def learn_text(self, text, *, field_only=False, preserve_field_scope=False, assignment_scan=True):
         def learn(value, kind="SECRET"):
             if field_only or preserve_field_scope and str(value) in self.field_values:
                 self.field_slot(value, kind, allow_new=field_only)
@@ -214,6 +219,8 @@ class Redactor:
         for pattern in (_CHINESE_VALUE, _ASSIGNED_VALUE):
             for match in pattern.finditer(str(text)):
                 learn(match.group(1))
+        if not assignment_scan:
+            return
         auth_fields = set()
         for match in _AUTH_ASSIGNMENT.finditer(str(text)):
             value, _ = _assignment_scalar(match.group("value"))
@@ -355,7 +362,16 @@ def _learn_body(redactor, data, content_type, *, field_only=False):
         text = data.decode("utf-8")
     except UnicodeError:
         return
-    redactor.learn_text(text, field_only=field_only)
+    structured = _json_media(text, content_type) or "form" in content_type.lower() \
+        or "multipart/" in content_type.lower() or "xml" in content_type.lower() \
+        or text.lstrip("\ufeff \t\r\n")[:1] in {"<"}
+    # JavaScript/HTML source can contain short variable names that look like
+    # secret assignments (`auth_token:y`, `phone:s`).  Do not turn those into
+    # global redaction aliases; structured bodies are parsed explicitly below.
+    media = content_type.lower()
+    non_structured_source = any(token in media for token in ("javascript", "ecmascript", "html"))
+    redactor.learn_text(text, field_only=field_only,
+                        assignment_scan=field_only or structured or not non_structured_source)
     if _json_media(text, content_type):
         from .inputs import json_document
         try:

