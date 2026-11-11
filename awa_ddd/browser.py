@@ -1037,6 +1037,8 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
 def visit(project, args):
     """Drive an isolated browser; guard every request before it reaches the network."""
     url = require_scope(project.config, args["url"])
+    from .assessment_mode import browser_policy
+    browser_policy(project, url, args)
     actions = _actions(args)
     timeout = _number(args, "timeout", 20, 60, minimum=1)
     settle_ms = _number(args, "settle_ms", 0, 10000)

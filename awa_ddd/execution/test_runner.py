@@ -239,6 +239,9 @@ def run(project, args):
     if recipe is None:
         fail("v2_run_recipe", "No recipe is available")
     assert_current(recipe, context(project, campaign, recipe))
+    from ..assessment_mode import capture_policy
+    capture_policy(project, _operation(project, recipe),
+                   {"effect": recipe.get("limits", {}).get("effect", "read_only")})
     from ..domain.hypothesis import transition as hypothesis_transition
     if hypothesis.get("status") == "unplanned":
         hypothesis_transition(hypothesis, "ready", reason="scheduler selected the hypothesis")
@@ -344,6 +347,11 @@ def run(project, args):
     run_row["outcome"] = evaluation.get("outcome")
     run_transition(run_row, "evaluated", note="oracle evaluated")
     repository.save("run", run_row)
+    if finding is not None:
+        from ..assessment_mode import record_stop
+        record_stop(project, operation_id=hypothesis["operation_id"], evidence_ids=evidence_ids,
+                    decision_id=run_row["id"], finding_id=finding["id"],
+                    oracle_type=recipe.get("oracle", {}).get("type"))
     return {"run": run_public(run_row), "outcome": evaluation["outcome"], "finding": finding,
             "coverage_delta": {"tested": 1 if evaluation["outcome"] in {"supported", "refuted", "inconclusive"} else 0,
                                "finding_created": bool(finding), "family": hypothesis["family"]}}

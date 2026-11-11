@@ -310,6 +310,8 @@ def probe(project, args):
 
 
 def request_run(project, args):
+    from .assessment_mode import require_action
+    require_action(project, "tool.tscanplus_request", args)
     from .external import _start, _finish, _timeout
     _arguments(args, REQUEST_ARGS)
     state, saved = _settings(project)

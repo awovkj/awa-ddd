@@ -80,6 +80,9 @@ def accept(project, args):
     if hypothesis["status"] not in {"supported"}:
         transition(hypothesis, "supported", reason="reviewed detection accepted")
     repository.save("hypothesis", hypothesis)
+    from ..assessment_mode import record_stop
+    record_stop(project, operation_id=hypothesis["operation_id"], evidence_ids=material_ids,
+                finding_id=finding["id"], oracle_type="analyst_review")
     return {"review": review_public(contract), "finding": finding,
             "machine_proof": False, "detection": True,
             "reviewer_independent": contract["reviewer"]["independent_human"]}

@@ -70,7 +70,7 @@ test('every engine action appears in exactly one native tool enum', () => {
   const actions = GROUPS.flatMap(group => group.actions);
   assert.equal(actions.length, new Set(actions).size);
   assert.deepEqual([...actions].sort(), [...ACTIONS].sort());
-  assert.equal(actions.length, 65);
+  assert.equal(actions.length, 67);
 });
 
 test('actual dsh defineTool validates action enums before calling the Python bridge', async () => {
@@ -312,7 +312,11 @@ print(json.dumps({"fields": sorted(QUERY_ARGS - {"project_id"}), "tables": sorte
     ['-X', 'utf8', '-B', '-c', script], { cwd: PACKAGE_ROOT, shell: false, windowsHide: true,
       timeout: 10000, encoding: 'utf8', maxBuffer: 64 * 1024 });
   const profile = JSON.parse(stdout);
-  assert.deepEqual(Object.keys(results.fields).sort(), profile.fields);
+  const adapterFields = value => {
+    assert.match(value.fields.required_assessment_mode, /transport guard/);
+    return Object.keys(value.fields).filter(field => field !== 'required_assessment_mode').sort();
+  };
+  assert.deepEqual(adapterFields(results), profile.fields);
   assert.equal(profile.tables.length, 9);
   assert.equal(profile.tables.includes('finding'), false);
   assert.doesNotMatch(results.fields.table, /\bfinding\b/);
@@ -320,10 +324,10 @@ print(json.dumps({"fields": sorted(QUERY_ARGS - {"project_id"}), "tables": sorte
   assert.match(results.fields.limit, /1\.\.100/);
   assert.match(results.fields.result_limit, /equal integers/);
   assert.match(results.fields.mcp_url, /exact recorded/);
-  assert.deepEqual(Object.keys(summary.fields).sort(), ['mcp_url', 'scanner_project', 'timeout']);
-  assert.deepEqual(Object.keys(routes.fields).sort(), ['limit', 'mcp_url', 'scanner_project', 'timeout']);
-  assert.deepEqual(Object.keys(summary.fields).sort(), profile.summary_fields);
-  assert.deepEqual(Object.keys(routes.fields).sort(), profile.route_fields);
+  assert.deepEqual(adapterFields(summary), ['mcp_url', 'scanner_project', 'timeout']);
+  assert.deepEqual(adapterFields(routes), ['limit', 'mcp_url', 'scanner_project', 'timeout']);
+  assert.deepEqual(adapterFields(summary), profile.summary_fields);
+  assert.deepEqual(adapterFields(routes), profile.route_fields);
   assert.match(summary.notes.join(' '), /remote prompt\/hint prose/);
   assert.match(routes.fields.limit, /local candidate/);
   assert.match(routes.notes.join(' '), /never execute them/);

@@ -7,7 +7,7 @@ from .store import EngineError
 
 
 GROUPS = {
-    "awa_project": ["project.create", "project.list", "project.status", "project.update", "project.import_pentest", "action.help"],
+    "awa_project": ["project.create", "project.list", "project.status", "project.update", "project.import_pentest", "integration.import", "integration.export", "action.help"],
     "awa_surface": ["surface.import", "surface.register", "surface.declare_consumer", "surface.list", "surface.inspect", "surface.batch", "surface.recon"],
     "awa_identity": ["identity.actor", "identity.session", "identity.verify", "identity.resource"],
     "awa_browser": ["browser.probe", "browser.visit", "browser.import_mcp", "page.register", "page.adopt", "page.function", "page.mark", "page.coverage"],
@@ -79,11 +79,16 @@ BROWSER_TESTING_NOTES = (
     "Prefer actual host Playwright MCP discovery/navigation/snapshots/necessary interactions and save real outputs with browser.import_mcp. Only native fallback probes locally first; local unavailability does not negate host MCP. Scope, identity, write authorization and test-resource boundaries remain unchanged. Imported MCP observations do not bind session/actor or replace authenticated XSS typed closure.",
 )
 CONTRACTS = {
-    "project.create": _entry(("project_id", "target"), {"scope": "array of authorized HTTP(S) URL prefixes; default target", "exclude": "excluded URL prefixes", "allow_mutation": "boolean; default false", "coverage_policy": "subject (default) | legacy; subject collapses duplicate ledger actors for the same real account and same credential context during planning"}),
+    "project.create": _entry(("project_id", "target"), {"scope": "array of authorized HTTP(S) URL prefixes; default target", "exclude": "excluded URL prefixes", "allow_mutation": "boolean; default false", "assessment_mode": "assessment (default) | src; immutable project execution policy; SRC denies writes/external active adapters/scenarios and stops the operation after direct proof", "coverage_policy": "subject (default) | legacy; subject collapses duplicate ledger actors for the same real account and same credential context during planning"}),
     "project.list": _entry(notes=("Local project names only. Does not create or inspect target traffic.",)),
     "project.status": _entry(fields={"offset": "entity page offset; default 0", "limit": "integer 1..100; default 10"}, notes=("Bounded overview. Use plan.next, surface.list and finding.list for inventory pages.",)),
-    "project.update": _entry(fields={"allow_mutation": "boolean", "exclude": "excluded prefixes", "coverage_policy": "legacy | subject; changes only future planning and never deletes historical evidence"}, notes=("Does not silently widen project scope.",)),
+    "project.update": _entry(fields={"allow_mutation": "boolean; cannot be true for SRC", "exclude": "excluded prefixes", "assessment_mode": "cannot change the persisted project mode", "coverage_policy": "legacy | subject; changes only future planning and never deletes historical evidence"}, notes=("Does not silently widen project scope or change assessment_mode.",)),
     "project.import_pentest": _entry(("source_path",), {"source_path": "absolute local historical project directory"}, notes=("Imported conclusions remain historical/unverified until independently supported.",)),
+    "integration.import": _entry(("exchange",), {"exchange": "bounded dsh-purge-awa/v1 JSON exchange: engagement, candidates and optional HTTP metadata; max 2 MiB and 200 rows per section"}, notes=(
+        "Zero target traffic. Every concrete URL is checked against receiving project scope/exclude before any write. Credentials and raw request/response bodies are discarded; imported status is a source claim, never machine proof.",
+        "Stable engagement/external candidate identities are idempotent. Changing their URL or method is a conflict; link exact operations independently before review.",)),
+    "integration.export": _entry(fields={"import_id": "optional exact prior import receipt", **PAGINATION}, notes=(
+        "Zero target traffic. Export current linked candidate decisions/findings as redacted metadata and evidence hashes. Only independently revalidated local machine proof is marked usable_for_confirmation; imported confirmations and analyst text cannot acquire this authority.",)),
     "action.help": _entry(fields={"name": "exact action name; omit for grouped catalog"}, notes=("Requires no project. This catalog is documentation, not an authorization or execution signal.",)),
     "surface.import": _entry(("path", "format"), {"path": "local UTF-8 input file", "format": "openapi | har | javascript | artex | sarif", "base_url": "explicit base URL for relative hints"}),
     "surface.register": _entry(fields={
@@ -270,7 +275,7 @@ V2_GROUPS = {
     "awa_report": ["report.matrix", "report.build", "report.compare"],
     "awa_admin": ["project.create", "project.list", "project.status", "project.update",
                   "identity.actor", "identity.session", "identity.verify", "identity.resource",
-                  "action.help"],
+                  "integration.import", "integration.export", "action.help"],
 }
 V2_ACTIONS = {name for names in V2_GROUPS.values() for name in names}
 GROUP_LOOKUP = {**GROUPS, **V2_GROUPS}
@@ -319,6 +324,8 @@ V2_CONTRACTS = {
 }
 CONTRACTS["report.build"]["fields"].update({"campaign_id": "2.0 campaign ID; defaults to the active campaign in v2 mode"})
 ALL_CONTRACTS = {**CONTRACTS, **V2_CONTRACTS}
+for _contract in ALL_CONTRACTS.values():
+    _contract["fields"].setdefault("required_assessment_mode", "optional transport guard assessment | src; must match immutable stored project mode before any action")
 
 
 

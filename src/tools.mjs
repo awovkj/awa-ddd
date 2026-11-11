@@ -1,6 +1,6 @@
 /** Grouped native tools. All actions dispatch through the same bounded bridge. */
 import { HarnessError } from '@deepseek-ai/dsh-llm';
-import { invokeEngine, resolveConfig, redactActionResult, safeErrorText, safeErrorDetails, compactContinuation, BridgeError, ENGINE_DISPATCH_UNCERTAIN } from './bridge.mjs';
+import { invokeEngine, resolveConfig, assessmentArguments, redactActionResult, safeErrorText, safeErrorDetails, compactContinuation, BridgeError, ENGINE_DISPATCH_UNCERTAIN } from './bridge.mjs';
 import { ACTION_GROUPS, V2_ACTION_GROUPS, READ_ACTIONS } from './actions.mjs';
 import { GUIDANCE } from './tool-guidance.mjs';
 
@@ -30,6 +30,8 @@ const DETAIL_HINTS = Object.freeze({
   'tool.tscanplus_results': 'Inspect saved result artifacts and candidate.list/inspect for ingested clues. Remote query_results has no offset pagination; never scan or execute route suggestions to recover omitted results.',
   'tool.tscanplus_summary': 'Inspect the saved result artifact for the bounded project summary. Counts are scanner database claims, not completed coverage or permission to execute suggested work.',
   'tool.tscanplus_routes': 'Inspect candidate.list/inspect and the saved redacted result artifact. The local limit is not remote pagination; route suggestions remain untrusted clues and are never executed.',
+  'integration.import': 'Offline import only: external confirmed/scanner claims remain unverified candidates. Re-import the same exchange idempotently; use returned import/candidate IDs for the next handoff.',
+  'integration.export': 'Follow next_offset with the same import_id to export the complete redacted review metadata. Only local typed proof can support a confirmed finding; imported claims are not proof.',
 });
 
 const PAGE_FIELDS = Object.freeze({
@@ -37,13 +39,14 @@ const PAGE_FIELDS = Object.freeze({
   'surface.list': ['operations'], 'surface.inspect': ['inputs'], 'surface.recon': ['items'], 'candidate.list': ['candidates'],
   'plan.build': ['obligation_items'], 'plan.list': ['gaps'], 'plan.next': ['work_items'],
   'plan.audit': ['checklist'], 'assessment.prepare': ['items'], 'finding.list': ['findings'], 'report.coverage': ['gaps'],
+  'integration.export': ['candidates'],
 });
 const PAGE_FILTERS = ['operation_id', 'obligation_id', 'finding_id', 'evidence_id', 'evidence_ids',
-  'run_id', 'name', 'method', 'auth', 'status', 'kind', 'mode', 'section', 'current', 'lifecycle_status', 'include_blocked'];
+  'run_id', 'name', 'method', 'auth', 'status', 'kind', 'mode', 'section', 'current', 'lifecycle_status', 'include_blocked', 'import_id'];
 const PARAMETER_FILTERS = ['any', 'untested', 'observed', 'needs_controls', 'tested', 'consumer_review'];
 // Python's canonical JSON is sorted by key. Alphabetical truncation used to keep
 // descriptions while dropping work_items and the action/identity/fixture gates.
-const ROOT_PRIORITY = ['continuation', 'work_items', 'checklist', 'completion', 'offset', 'limit', 'next_offset',
+const ROOT_PRIORITY = ['continuation', 'assessment_mode', 'required_assessment_mode', 'import_id', 'schema', 'requests_sent', 'work_items', 'checklist', 'completion', 'offset', 'limit', 'next_offset',
   'queue_total', 'checklist_total', 'ready_total', 'review_total', 'blocked_total', 'requests_sent',
   'browser_testing_summary', 'parameter_coverage_summary', 'review_followups', 'review_followup_total',
   'category_matrix', 'security_coverage', 'parameter_coverage', 'obligation_items', 'operations', 'inputs',
@@ -336,7 +339,7 @@ export function renderToolResult(args, value) {
 
 export const GROUPS = Object.freeze([{ name: 'awa_project',
     description: 'Create or inspect local evidence-driven assessments; legacy imports remain unverified, and credentials stay private.',
-    fields: 'action.help: name. project.create: project_id,target,scope,exclude,allow_mutation:false. project.list: no project_id. project.status: offset/limit,method_offset/method_limit. project.update: allow_mutation/exclude,never recreate. project.import_pentest: absolute read-only source_path.' },
+    fields: 'action.help: name. project.create: project_id,target,scope,exclude,assessment_mode:assessment|src,allow_mutation:false; SRC immutable,stop after direct proof. project.list: no project_id. project.status: offset/limit,method_offset/method_limit. project.update: allow_mutation/exclude,never change mode. project.import_pentest: absolute source_path. integration.import: exchange(schema:dsh-purge-awa/v1),offline scoped unverified candidates,idempotent. integration.export: import_id?,offset,limit,redacted proof refs.' },
   { name: 'awa_surface',
     description: 'Discover and register exact operations/inputs offline. Source declarations, scores and same-named JS sinks never prove runtime behavior.',
     fields: 'surface.recon: mode:prepare|aggregate,section:overview|technologies|functions|clues|collection,offset,limit:1..50. Prepare collection first. No target traffic or auto-registration. surface.import: path,format:openapi|javascript|har|artex|sarif|assessment_hints,base_url. surface.register/batch: exact ops;batch:1..50. Inputs need location/selector/consumer/test_families/schema_branch. surface.list: offset/limit,method/auth. surface.inspect: operation_id. surface.declare_consumer: operation_id,input_location,input_selector,consumer,test_families/schema_branch.' },
@@ -385,7 +388,7 @@ export const V2_GROUPS = Object.freeze([
     fields: 'report.matrix: campaign_id. report.build: output_dir,stage:draft|final,campaign_id; final only for completed exhaustion authority. report.compare: campaign_ids (up to two, like units only).' },
   { name: 'awa_admin',
     description: 'Low-frequency project, identity, resource and help operations. Private credentials never cross origins; labels alone do not verify identity.',
-    fields: 'project.create/list/status/update; identity.actor/session/verify/resource; action.help. Identity values must be server-verifiable; sessions bind exact actors and origins.' },
+    fields: 'project.create/list/status/update; assessment_mode:assessment|src at creation only,SRC allow_mutation:false. integration.import: exchange(schema:dsh-purge-awa/v1),offline scoped unverified candidates; integration.export: import_id?,offset,limit,redacted proof references. identity.actor/session/verify/resource; action.help. Identity values must be server-verifiable; sessions bind exact actors and origins.' },
 ].map(group => Object.freeze({ ...group, actions: V2_ACTION_GROUPS[group.name] })));
 
 export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, ownerSignal, options = {}) {
@@ -399,7 +402,7 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
     parameters: {
       action: { type: 'string', enum: group.actions, required: true, description: 'Exact group action. Help uses ' + helpGroup + ' action.help input:{name:"<action>"}.' },
       project_id: { type: 'string', description: 'Project ID; required except action.help,runtime.probe,project.list. Creation may supply input.project_id.' },
-      input: { type: 'object', additionalProperties: true, description: `Help: ${helpGroup} action.help input:{name:"<action>"} (no project_id). Put action-specific fields inside input, not at top level. ` + group.fields },
+      input: { type: 'object', additionalProperties: true, description: `Help: ${helpGroup} action.help input:{name:"<action>"} (no project_id). Action fields go inside input. ` + group.fields },
     },
     output: {
       schema: { type: 'object', additionalProperties: false, properties: {
@@ -419,7 +422,14 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
         if (args.project_id !== undefined && input.project_id !== undefined && args.project_id !== input.project_id) {
           throw new BridgeError('PROJECT_MISMATCH', 'project_id and input.project_id must identify the same assessment.');
         }
-        const payload = { ...input, ...(args.project_id !== undefined ? { project_id: args.project_id } : {}) };
+        const selectedMode = options?.assessmentModeFor?.(exec?.agent);
+        if (selectedMode !== undefined && !['assessment', 'src'].includes(selectedMode)) {
+          throw new BridgeError('INVALID_CONFIG', 'The session assessment mode could not be verified.');
+        }
+        const callSettings = selectedMode === 'src' && settings.assessmentMode !== 'src'
+          ? Object.freeze({ ...settings, assessmentMode: 'src' }) : settings;
+        const payload = assessmentArguments(callSettings, args.action,
+          { ...input, ...(args.project_id !== undefined ? { project_id: args.project_id } : {}) });
         const callerSignal = exec?.signal;
         const signal = ownerSignal && callerSignal ? AbortSignal.any([callerSignal, ownerSignal]) : ownerSignal ?? callerSignal;
         const references = {};
@@ -444,7 +454,7 @@ export function toolDefinitions(defineTool, config = {}, invoke = invokeEngine, 
         };
         await observe({ phase: 'start' });
         try {
-          const value = await invoke(settings, args.action, payload, { signal });
+          const value = await invoke(callSettings, args.action, payload, { signal });
           const failureCode = typeof value?.error?.code === 'string' && /^[A-Za-z0-9_:-]{1,80}$/.test(value.error.code)
             ? value.error.code : undefined;
           await observe({ phase: 'success', ok: value?.ok === true, ...(failureCode ? { failure_code: failureCode } : {}) });

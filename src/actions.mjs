@@ -1,6 +1,6 @@
 /** One native action catalog, shared by tool schemas and the process bridge. */
 export const ACTION_GROUPS = Object.freeze(Object.fromEntries(Object.entries({
-  awa_project: ['action.help', 'project.create', 'project.list', 'project.status', 'project.update', 'project.import_pentest'],
+  awa_project: ['action.help', 'project.create', 'project.list', 'project.status', 'project.update', 'project.import_pentest', 'integration.import', 'integration.export'],
   awa_surface: ['surface.import', 'surface.register', 'surface.list', 'surface.inspect', 'surface.batch', 'surface.declare_consumer', 'surface.recon'],
   awa_identity: ['identity.actor', 'identity.session', 'identity.verify', 'identity.resource'],
   awa_browser: ['browser.probe', 'browser.visit', 'browser.import_mcp', 'page.register', 'page.adopt', 'page.function', 'page.mark', 'page.coverage'],
@@ -19,7 +19,7 @@ export const V2_ACTION_GROUPS = Object.freeze(Object.fromEntries(Object.entries(
   awa_test: ['test.run', 'test.run_browser', 'test.run_scenario', 'test.run_external', 'test.record_external', 'test.inspect'],
   awa_review: ['review.evidence', 'review.finding', 'review.bind', 'review.disposition'],
   awa_report: ['report.matrix', 'report.build', 'report.compare'],
-  awa_admin: ['project.create', 'project.list', 'project.status', 'project.update', 'identity.actor', 'identity.session', 'identity.verify', 'identity.resource', 'action.help'],
+  awa_admin: ['project.create', 'project.list', 'project.status', 'project.update', 'identity.actor', 'identity.session', 'identity.verify', 'identity.resource', 'action.help', 'integration.import', 'integration.export'],
 }).map(([name, actions]) => [name, Object.freeze(actions)])));
 
 export const ACTIONS = Object.freeze(Object.values(ACTION_GROUPS).flat());
@@ -30,4 +30,4 @@ export const READ_ACTIONS = new Set(['action.help', 'runtime.probe', 'project.li
   'assessment.prepare', 'finding.list', 'evidence.inspect', 'report.coverage', 'candidate.list', 'candidate.inspect',
   'page.coverage', 'tool.inspect', 'tool.artifact',
   'campaign.status', 'campaign.next', 'recon.snapshot', 'recon.routes', 'recon.hypotheses', 'recon.capabilities',
-  'test.inspect', 'review.evidence', 'report.matrix', 'report.compare']);
+  'test.inspect', 'review.evidence', 'report.matrix', 'report.compare', 'integration.export']);

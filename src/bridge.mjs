@@ -79,7 +79,7 @@ export function safeErrorDetails(details) {
     if (!continuation || add('continuation', continuation)) break;
   }
   for (const key of ['next_action', 'checkpoint_action', 'run_id', 'operation_id', 'action', 'field', 'help_action',
-    'resource_id', 'evidence_id', 'obligation_id']) {
+    'resource_id', 'evidence_id', 'obligation_id', 'decision_id', 'finding_id', 'import_id', 'candidate_id']) {
     if (typeof safe[key] === 'string') add(key, safeErrorText(safe[key], 200));
   }
   const recoveryEnums = {
@@ -91,6 +91,8 @@ export function safeErrorDetails(details) {
     reason_code: ['not_configured', 'backend_mismatch', 'overescaped_path', 'not_absolute', 'file_missing',
       'wrong_filename', 'invalid_path', 'source_input_mismatch', 'consumption_chain_required'],
     execution_backend: ['native', 'wsl'],
+    assessment_mode: ['assessment', 'src'],
+    required_assessment_mode: ['assessment', 'src'],
     path_field: ['sqlmap_path', 'yak_path'],
   };
   for (const [key, values] of Object.entries(recoveryEnums)) {
@@ -106,6 +108,10 @@ export function safeErrorDetails(details) {
   }
   if (safe.stop_policy === 'exhaustion_only') add('stop_policy', safe.stop_policy);
   if (safe.requests_sent === 0) add('requests_sent', 0);
+  if (Array.isArray(safe.evidence_ids) && safe.evidence_ids.length <= 25
+    && safe.evidence_ids.every(value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/.test(value))) {
+    add('evidence_ids', [...safe.evidence_ids]);
+  }
   if (typeof safe.configured === 'boolean') add('configured', safe.configured);
   if (safe.input_template && ['all', 'native', 'wsl'].includes(safe.input_template.backend)) {
     add('input_template', { backend: safe.input_template.backend });
@@ -145,6 +151,7 @@ export function resolveConfig(config = {}) {
   const wslDistribution = config.wslDistribution ?? 'kali-linux';
   const wslPythonExecutable = config.wslPythonExecutable ?? 'python3';
   const assessmentModel = config.assessmentModel ?? 'v1';
+  const assessmentMode = config.assessmentMode ?? 'assessment';
   if (typeof workspace !== 'string' || !isAbsolute(workspace) || workspace.includes('\0')) {
     throw new BridgeError('INVALID_CONFIG', 'workspace must be an absolute local directory.');
   }
@@ -172,8 +179,45 @@ export function resolveConfig(config = {}) {
   if (!['v1', 'v2'].includes(assessmentModel)) {
     throw new BridgeError('INVALID_CONFIG', 'assessmentModel must be v1 or v2.');
   }
+  if (!['assessment', 'src'].includes(assessmentMode)) {
+    throw new BridgeError('INVALID_CONFIG', 'assessmentMode must be assessment or src.');
+  }
   return Object.freeze({ workspace: resolve(workspace), pythonExecutable, timeoutMs,
-    executionBackend, wslDistribution, wslPythonExecutable, assessmentModel });
+    executionBackend, wslDistribution, wslPythonExecutable, assessmentModel, assessmentMode });
+}
+
+/** SRC is a persisted project policy; this transport guard cannot downgrade it. */
+export function assessmentArguments(config, action, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    throw new BridgeError('INVALID_ARGUMENTS', 'Action arguments must be a JSON object.');
+  }
+  validateJson(args);
+  const mode = config.assessmentMode ?? 'assessment';
+  if (!['assessment', 'src'].includes(mode)) throw new BridgeError('INVALID_CONFIG', 'assessmentMode must be assessment or src.');
+  if (args.required_assessment_mode !== undefined && !['assessment', 'src'].includes(args.required_assessment_mode)) {
+    throw new BridgeError('INVALID_ARGUMENTS', 'required_assessment_mode must be assessment or src.');
+  }
+  if (mode === 'src' && args.required_assessment_mode !== undefined && args.required_assessment_mode !== 'src') {
+    throw new BridgeError('ASSESSMENT_MODE_MISMATCH', 'SRC transport cannot select an assessment project.');
+  }
+  let result = args;
+  if (action === 'project.create') {
+    const creationMode = args.assessment_mode ?? mode;
+    if (!['assessment', 'src'].includes(creationMode)) throw new BridgeError('INVALID_ARGUMENTS', 'assessment_mode must be assessment or src.');
+    if (mode === 'src' && creationMode !== 'src') {
+      throw new BridgeError('ASSESSMENT_MODE_MISMATCH', 'SRC creates an independent SRC project; its mode cannot be downgraded.');
+    }
+    if (creationMode === 'src') {
+      if (args.allow_mutation !== undefined && args.allow_mutation !== false) {
+        throw new BridgeError('SRC_MUTATION_FORBIDDEN', 'SRC projects require allow_mutation:false.');
+      }
+      result = { ...args, assessment_mode: 'src', allow_mutation: false };
+    }
+  }
+  if (mode === 'src' && (action === 'project.create' || args.project_id !== undefined)) {
+    result = { ...result, required_assessment_mode: 'src' };
+  }
+  return result;
 }
 
 /** Reject values JSON.stringify would silently change, omit or execute. */
@@ -322,7 +366,7 @@ export function redactActionResult(action, value) {
  */
 export function invokeEngine(config, action, args, { signal, spawnProcess = spawn } = {}) {
   const resolved = resolveConfig(config);
-  const input = validateRequest(action, args);
+  const input = validateRequest(action, assessmentArguments(resolved, action, args));
   if (signal?.aborted) return Promise.reject(new BridgeError('ABORTED_BEFORE_DISPATCH', 'Assessment action was cancelled before execution.'));
   return new Promise((fulfill, reject) => {
     let child;

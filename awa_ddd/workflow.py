@@ -152,6 +152,8 @@ def project_status(project, args):
     row.update(project_id=project.project_id, path=str(project.base), config=safe_metadata(project.config),
                candidates=candidates.get("unverified", 0), candidate_states=dict(candidates),
                gap_sample=safe_metadata(evaluated["gaps"][:5]), next_action="plan.next")
+    from .assessment_mode import status as mode_status
+    row["assessment_policy"] = mode_status(project)
     fields = {
         "actor": ("id", "label", "subject", "tenant_id", "roles", "security_revision"),
         "session": ("id", "actor_id", "generation", "verified_at", "expires_at", "verification_evidence_id"),
@@ -748,6 +750,8 @@ def queue_inventory(project, evaluated, inventory=None):
                            input_template={"name": "browser.import_mcp"})
             row["required_experiment_fields"] += policy["required_input_fields"]
             row["browser_handoff_note"] = "Use actual host Playwright tools first; this template is a bounded native fallback, not authorization. Fill the missing exact URL/interaction inputs before invocation."
+        from .assessment_mode import work_policy
+        row = work_policy(project, row, operations[operation_id])
         rows.append(_preparation_actions(_reconcile_declared_blocker(row, gap), operations[operation_id]))
     return rows
 
@@ -756,7 +760,7 @@ def _compact_work_item(row):
     fields = ("id", "gap_id", "obligation_id", "operation_id", "obligation_kind", "input_location",
               "input_selector", "schema_branch", "test_family", "hypothesis_family", "queue_status", "status",
               "suggested_action", "next_action", "actor_id", "baseline_actor_id", "session_id", "resource_id",
-              "decision_id", "method", "url", "hypothesis_hint")
+              "decision_id", "method", "url", "hypothesis_hint", "execution_blocked", "stop_reason")
     result = {key: row[key] for key in fields if key in row}
     for key in ("missing_prerequisites", "required_experiment_fields", "evidence_ids"):
         values = row.get(key)

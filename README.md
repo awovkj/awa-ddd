@@ -1,6 +1,12 @@
 # awa-ddd
 
-awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将攻击面宇宙、假设、冻结测试配方、durable 执行、证据与多维覆盖存入本地 SQLite。默认 `assessmentModel:v1` 保留原 10 组、63 个动作；`assessmentModel:v2` 注册 6 组 Campaign 工具（`awa_campaign/awa_recon/awa_test/awa_review/awa_report/awa_admin`），以“Universe → Hypothesis → TestRecipe → TestRun → Finding/CoverageClaim”驱动下一轮测试。模型沿用 dsh 运行时，不另接模型供应商。
+awa-ddd 2.2.0 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估插件。它将攻击面宇宙、假设、冻结测试配方、durable 执行、证据与多维覆盖存入本地 SQLite。默认 `assessmentModel:v1` 保留原 10 组、67 个动作；`assessmentModel:v2` 注册 6 组 Campaign 工具（`awa_campaign/awa_recon/awa_test/awa_review/awa_report/awa_admin`），以“Universe → Hypothesis → TestRecipe → TestRun → Finding/CoverageClaim”驱动下一轮测试。模型沿用 dsh 运行时，不另接模型供应商。
+
+2.2.0 本地升级新增固定 `assessment_mode:src`、`/src` 会话入口，以及版本化的 `integration.import/export` 证据交换契约。外部命中只成候选；直接证据按现有判据确认后保存停止记录，阻止同操作及路径模板变体继续请求；其他未测项保留覆盖分母。Node/Python 包和运行时版本统一为 2.2.0。详见 [SRC 模式](docs/SRC-MODE.md) 与 [内置评估和兼容交换](docs/INTEGRATION-DSH-PURGE.md)。本地源码及安装包供验收，尚未向外部服务发布。
+
+**dsh-purge 1.8.0 已将本项目的生产评估源码写入自己的 `lib/redteam/assessment-engine/`，随自身源码和发行包提供。** 使用 dsh-purge 红队或 SRC 时，直接调用其 `redteam_assessment_status/start/import/run/review` 原生工具及 `redteam_src_report`；引擎从 dsh-purge 自己的安装目录运行，每个 engagement 使用独立的 `<靶标目录>/assessment` 工作区和固定内部 `project_id:assessment`。无需另装 awa-ddd，也无需配置外部包路径、共享工作区或外部项目 binding。独立 awa-ddd 2.2.0 的工具、SRC 和交换契约继续供独立用户、其他调用者及旧资料使用。
+
+dsh-purge 的随包核心保留 MIT 许可、版权和逐文件 SHA-256 来源清单；源码维护仅由维护者在 **dsh-purge 仓库根目录**显式运行 `scripts/sync-assessment-engine.mjs --source PATH`，运行时直接使用已经写入的源码。离线 `--check` 不需要本项目的外部 checkout。独立临时安装验收分别覆盖内置核心、原生生命周期与本项目的交换契约，详见 [维护与验证来源](docs/INTEGRATION-DSH-PURGE.md#源码维护许可与来源)。
 
 2.0.2 增加 `plan.next compact`、`plan.why`、`assessment.batch` 与 `coverage_policy=subject` actor 去重；修复浏览器 `action`/`text` 兼容并保留 25 KB prompt budget。详见 [2.0.2 优化第一批](docs/UPGRADE-20261105.md)。
 
@@ -24,8 +30,9 @@ awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 | 能力 | 当前行为 |
 |---|---|
+| dsh-purge 内置评估 | 1.8.0 从自身随包核心运行红队/SRC 的原生评估工具；每靶标固定内部上下文，保留来源账本、当前机器证明复核与直接证据停止 |
 | 2.0 战役 | `assessmentModel:v2` 六组工具；Campaign 持久目标、Universe 快照、KnownCase 三轨、Hypothesis 稳定键、公平调度、五维覆盖矩阵；`partial_accepted` 与 exhausted authority 分离 |
-| 原生接入 | 63 个动作与 Python help catalog 一致；精简常驻说明，统一 awa_project action.help 按需查完整契约；UTF-8 stdin、固定 argv、取消与独立截止时间 |
+| 原生接入 | 67 个动作与 Python help catalog 一致；精简常驻说明，统一 awa_project action.help 按需查完整契约；UTF-8 stdin、固定 argv、取消与独立截止时间 |
 | 信息先行 | surface.recon 统筹当前授权站点、技术/框架提示、页面/API/功能/输入、歧义线索与收集缺口；零目标流量，复用信息基线、只补实际变化，不冒充全站发现或漏洞证明 |
 | 开局与续接 | progress/frontier 状态幂等交接；同 PR 先取具体 ready/review 小页，真实复核/准备回执后推进游标；raw/CP/队列读取不算闭环，零工具重复通知有界；页内截断须恢复 |
 | 项目与发现 | 多源离线 OpenAPI/JS AST/HAR/ARTEX/SARIF/assessment_hints 导入；JS 消费点反查仅为可能绑定，定义/评分只作选题，不成为漏洞证据 |
@@ -49,6 +56,8 @@ awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
 
 ## 使用
 
+以下插件配置和 `awa_*` 工具示例适用于**独立安装 awa-ddd 2.2.0**。dsh-purge 1.8.0 用户直接使用当前靶标的原生评估入口，按 [内置使用流程](docs/INTEGRATION-DSH-PURGE.md#dsh-purge-180-原生使用流程) 操作。独立插件和新版 dsh-purge 各自持有自己的项目数据；旧独立项目、路径设置及 binding 资料不自动成为新版 dsh-purge 的内部上下文。
+
 需要 Node.js 22.19+、Python 3.10+；本地浏览器还需可用 playwright-core 与 Chromium。dsh SDK 作为宿主 peer dependency 提供，插件不携带第二份 SDK。
 
 插件配置示例：
@@ -61,7 +70,10 @@ awa-ddd 2.0.2 是 DeepSeek Harness（dsh）的原生、证据驱动安全评估�
     executionBackend: native
     pythonExecutable: python
     timeoutMs: 120000
+    assessmentMode: src
 ```
+
+`assessmentMode:src` 用于发现任务；省略时继续默认 assessment。`/src [on|off|status]` 选择本会话的新项目偏好，已持久化项目模式不会随 off 降级。源码/报告维护不因此启动目标测试。SRC 目标执行只允许有界只读 HTTP 与浏览器观察，禁止目标写入、主动外部工具和场景执行；已有直接证据后仅离线复核与报告。
 
 默认评估目录为 `~/.dsh/awa-ddd-data`，位于插件包之外。工具统一接收 action、project_id、input；其余 action 字段（包括 limit/offset）必须放 input。帮助只在 **awa_project** 调用 `action.help`，不要发到其它组；它与 `runtime.probe` 无需 project_id。已有授权评估先看 `project.status` 和信息基线，收集后再 `plan.next`；源码/报告维护不进入目标评估流程。
 
@@ -210,7 +222,7 @@ WSL 不自动把 Windows `127.0.0.1` 改成网关，不能据此绕开 scope；W
 
 ## 构建与升级
 
-GitHub 仓库保存源码、测试、依赖锁文件和文档，不附带本机备份、验证日志或旧安装包。克隆/检出后，在项目根目录安装锁定依赖并重新验证、打包：
+本节构建的是独立 awa-ddd 插件。GitHub 仓库保存源码、测试、依赖锁文件和文档，不附带本机备份、验证日志或旧安装包。克隆/检出后，在项目根目录安装锁定依赖并重新验证、打包：
 
 开发 SDK 的旧 Zod 4.4.3 命中高危集合校验资源耗尽公告；根项目通过 `overrides.zod:4.6.6` 和锁文件固定修复版，SDK 仍使用原 peer/rc.3，不复制第二份实例。该根 override 只约束本项目安装/验证，不会替安装宿主升级其 SDK 依赖；桌面宿主若仍固定旧 Zod，须由宿主侧单独维护。本次不修改桌面 profile 或全局依赖。
 
@@ -225,7 +237,7 @@ npm run pack:check
 
 Windows PowerShell 可将 `npm` 换为 `npm.cmd`。`pack:check` 会自动创建已忽略的 `.validation` 临时目录，解包并检查当前源码生成的发行包；完成后生成 `.validation/package-check.json`。确认该记录的 `result` 为 `passed`，再从 `archive_path` 取得实际安装包路径，并核对 `archive_sha256`。不要猜时间戳目录或仅凭版本号选择旧包。
 
-安装时使用本次生成的包，在用户选择的 dsh profile 中安装并重载；不自动改写桌面配置或存量评估库。当前提供 63 个动作，Playwright/TscanPlus 保留既有授权与证明边界。本机历史备份、验收 fixture、日志和 tarball 不属于源码发行或 fresh clone 的运行/验证依赖；历史验收说明也不等于当前检查通过。
+安装时使用本次生成的包，在用户选择的 dsh profile 中安装并重载；不自动改写桌面配置或存量评估库。当前提供 67 个动作，Playwright/TscanPlus 保留既有授权与证明边界。本机历史备份、验收 fixture、日志和 tarball 不属于源码发行或 fresh clone 的运行/验证依赖；历史验收说明也不等于当前检查通过。
 
 需要手工 `npm pack` 时先完成上述验证，再把输出放入已忽略的 `dist` 新目录：
 

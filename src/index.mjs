@@ -6,6 +6,7 @@ import { toolDefinitions } from './tools.mjs';
 import { apply as applyMode, name as modeName } from './mode.mjs';
 import { apply as applyStopPolicy } from './stop-policy.mjs';
 import { createController as createHostContinuation } from './host-continuation.mjs';
+import { createController as createSrcMode } from './src-mode.mjs';
 
 export const name = 'awa-ddd';
 
@@ -26,6 +27,7 @@ export const Config = z.object({
   wslPythonExecutable: z.string().default('python3').description('Linux Python executable name or path for WSL, without shell arguments.'),
   timeoutMs: z.number().min(1000).max(600000).default(120000).description('Per-call engine timeout in milliseconds; cancellation is enforced by the bridge.'),
   assessmentModel: z.union(['v1', 'v2']).default('v1').description('Tool surface model: v1 legacy groups or v2 campaign/recon/test/review/report groups. Existing projects remain readable either way; v2 execution requires a campaign.'),
+  assessmentMode: z.union(['assessment', 'src']).default('assessment').description('Default project policy. SRC permits discovery with direct evidence and stops testing an operation after proof; it requires an independent immutable SRC project and cannot enable mutation.'),
   continuationGuard: z.boolean().default(true).description('Use the supported host turn-stopping hook for this agent\'s active assessment work. This never grants target authorization or overrides actual cancellation; engine finalization stays strict when disabled.'),
 });
 
@@ -33,6 +35,7 @@ export function apply(ctx, config = {}) {
   const lifecycle = new AbortController();
   ctx.effect(() => () => lifecycle.abort(new Error('awa-ddd plugin disposed')));
   let hostContinuation;
+  const srcMode = createSrcMode(config);
   if (config.continuationGuard !== false) {
     try {
       hostContinuation = createHostContinuation(config, { signal: lifecycle.signal,
@@ -48,7 +51,7 @@ export function apply(ctx, config = {}) {
 
   // 评估工具是核心能力，任何情况下都要先注册成功。
   for (const definition of toolDefinitions(defineTool, config, undefined, lifecycle.signal,
-    { observer: hostContinuation?.observe })) {
+    { observer: hostContinuation?.observe, assessmentModeFor: srcMode.modeForAgent })) {
     ctx.tools.register(definition);
   }
   hostContinuation?.attach(ctx);
@@ -60,9 +63,15 @@ export function apply(ctx, config = {}) {
     console.error(`[${name}] stop-policy prompt unavailable (engine gate unaffected): ${safeErrorText(error?.message ?? error, 300)}`);
   }
 
+  try {
+    srcMode.attach(ctx);
+  } catch (error) {
+    console.error(`[${name}] SRC preference unavailable (configured engine guard unaffected): ${safeErrorText(error?.message ?? error, 300)}`);
+  }
+
   // 渗透模式是可选的界面/提示能力：缺宿主服务或注册失败只记录，不影响工具。
   try {
-    applyMode(ctx);
+    applyMode(ctx, { suppressForAgent: srcMode.activeOfAgent });
   } catch (error) {
     console.error(`[${name}] penetration mode unavailable (assessment tools unaffected): ${safeErrorText(error?.message ?? error, 300)}`);
   }

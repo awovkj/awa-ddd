@@ -95,9 +95,16 @@ def _coverage_policy(value):
 
 
 def create_project(workspace, args):
+    from .assessment_mode import normalize_mode
+    selected_mode = normalize_mode(args.get("assessment_mode"))
+    if args.get("required_assessment_mode") is not None and normalize_mode(args["required_assessment_mode"]) != selected_mode:
+        raise EngineError("assessment_mode_mismatch", "Session and new project assessment modes must match")
+    if selected_mode == "src" and args.get("allow_mutation") is True:
+        raise EngineError("src_write_denied", "SRC projects cannot enable mutation")
     config = validate_config({"project_id": args["project_id"], "target": args["target"],
         "scope": args.get("scope"), "exclude": args.get("exclude", []),
         "allow_mutation": args.get("allow_mutation") is True,
+        "assessment_mode": selected_mode,
         "coverage_policy": _coverage_policy(args.get("coverage_policy")),
         "created_at": now(), "schema_version":1})
     with Project(workspace, args["project_id"], create=True) as project:
@@ -229,10 +236,15 @@ def update_project(project, args):
     """
     config = dict(project.config)
     changes = {}
+    from .assessment_mode import normalize_mode
+    if "assessment_mode" in args and normalize_mode(args["assessment_mode"]) != normalize_mode(config.get("assessment_mode")):
+        raise EngineError("assessment_mode_immutable", "Project assessment mode cannot be changed; create a separate project")
     if "allow_mutation" in args:
         value = args["allow_mutation"]
         if not isinstance(value, bool):
             raise EngineError("config", "allow_mutation must be a boolean")
+        if value and config.get("assessment_mode") == "src":
+            raise EngineError("src_write_denied", "SRC projects cannot enable mutation")
         if value != config.get("allow_mutation"):
             changes["allow_mutation"] = {"from": config.get("allow_mutation"), "to": value}
             config["allow_mutation"] = value
@@ -849,6 +861,8 @@ def preflight_capture(project, args, *, for_identity=False):
         raise EngineError("arguments", "Capture arguments must be an object")
     operation = project.get("operation",args["operation_id"])
     _validate_operation_inputs(operation)
+    from .assessment_mode import capture_policy, mode, SRC_MAX_RESPONSE, SRC_MAX_TIMEOUT
+    capture_policy(project, operation, args, existing=bool(args.get("idempotency_key")))
     url = require_scope(project.config,args.get("url") or operation["url"])
     params = bind_operation(operation,url,operation["method"])
     if "{" in url or "}" in url:
@@ -988,6 +1002,9 @@ def preflight_capture(project, args, *, for_identity=False):
         else:
             raise EngineError("run_uncertain", "Prior request is incomplete or failed; reconcile its resource state before retrying",
                               {"run_id": run_id, "operation_id": existing.get("operation_id"), "next_action": "run.inspect"})
+    capture_policy(project, operation, args, existing=bool(existing))
+    if mode(project) == "src":
+        timeout, max_bytes = min(timeout, SRC_MAX_TIMEOUT), min(max_bytes, SRC_MAX_RESPONSE)
     return {"operation": operation, "url": url, "params": params, "session": session,
             "actor": actor, "headers": headers, "body": body, "body_bytes": len(encoded_body),
             "resource": resource, "request_signature": signature, "run_id": run_id, "existing": existing,
@@ -1011,6 +1028,8 @@ def capture(project,args, *, for_identity=False):
            "effect":"read_only" if operation["method"] in {"GET","HEAD","OPTIONS"} else "test_resource_write"}
     project.claim(run)
     try:
+        from .assessment_mode import capture_policy
+        capture_policy(project, operation, args)
         artifact = request(url,operation["method"],headers,body,prepared["timeout"],prepared["max_bytes"])
         identity = project.id("E")
         path,digest = project.artifact(identity,artifact)

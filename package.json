@@ -1,7 +1,7 @@
 {
   "name": "awa-ddd",
-  "version": "2.1.0",
-  "description": "Evidence-driven security assessment tools for DeepSeek Harness, with a local Python and SQLite engine and an assumption-driven 2.0 campaign model.",
+  "version": "2.2.0",
+  "description": "Evidence-driven security assessment for DeepSeek Harness with discovery-only SRC policy and versioned redteam evidence exchange.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -85,7 +85,7 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "test:bridge": "node --test tests/bridge.test.mjs tests/plugin.test.mjs",
-    "check": "node --check src/index.mjs && node --check src/bridge.mjs && node --check src/actions.mjs && node --check src/host-continuation.mjs && node --check src/stop-policy.mjs && node --check src/tool-guidance.mjs && node --check src/parse-js.mjs && node --check src/tools.mjs && node --check src/mode.mjs && node --check src/client.js && node --check scripts/invoke-request.mjs && node --check scripts/check-package.mjs && npm test",
+    "check": "node --check src/index.mjs && node --check src/bridge.mjs && node --check src/actions.mjs && node --check src/host-continuation.mjs && node --check src/stop-policy.mjs && node --check src/tool-guidance.mjs && node --check src/parse-js.mjs && node --check src/tools.mjs && node --check src/mode.mjs && node --check src/src-mode.mjs && node --check src/client.js && node --check scripts/invoke-request.mjs && node --check scripts/check-package.mjs && npm test",
     "pack:check": "node scripts/check-package.mjs",
     "test:python": "python -X utf8 -B -m unittest discover -s tests -p \"test_*.py\"",
     "test:all": "npm test && npm run test:python"

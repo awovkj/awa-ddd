@@ -105,6 +105,17 @@ def candidates(project, campaign, universe):
     by_family = {}
     preparation = []
     for hypothesis in hypotheses:
+        from ..assessment_mode import mode as project_mode, stop_receipt
+        operation = project.get("operation", hypothesis.get("operation_id"), required=False)
+        stopped = stop_receipt(project, operation) if operation is not None else None
+        if project_mode(project) == "src" and operation is not None \
+                and (stopped or operation["method"] not in {"GET", "HEAD", "OPTIONS"}):
+            preparation.append({"hypothesis_id": hypothesis["id"], "family": hypothesis["family"],
+                                "operation_id": operation["id"], "reason": "stopped_at_evidence" if stopped else "src_write_denied",
+                                "next_action": "review.evidence" if stopped else "recon.snapshot",
+                                "automatic_execution_allowed": False,
+                                "detail": "SRC 保留直接证据与未测范围，不为补齐覆盖度而继续利用。"})
+            continue
         if hypothesis.get("status") not in {"ready", "unplanned"}:
             if requires_preparation(hypothesis):
                 preparation.append(_preparation_entry(hypothesis))

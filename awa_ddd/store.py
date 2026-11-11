@@ -82,14 +82,26 @@ class Project:
     def config(self):
         with self._lock:
             row = self.connection.execute("SELECT value FROM metadata WHERE key='config'").fetchone()
-        return json.loads(row[0]) if row else {}
+        config = json.loads(row[0]) if row else {}
+        if config:
+            config.setdefault("assessment_mode", "assessment")
+        return config
 
     def set_config(self, config):
         with self.transaction():
+            from .assessment_mode import normalize_mode
+            existing = self.config
+            proposed = dict(config)
+            selected = normalize_mode(proposed.get("assessment_mode", existing.get("assessment_mode")))
+            if existing and selected != normalize_mode(existing.get("assessment_mode")):
+                raise EngineError("assessment_mode_immutable", "Project assessment mode cannot be changed; create a separate project")
+            if selected == "src" and proposed.get("allow_mutation"):
+                raise EngineError("src_write_denied", "SRC projects cannot enable mutation")
+            proposed["assessment_mode"] = selected
             self.connection.execute(
                 "INSERT INTO metadata(key,value) VALUES('config',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (canonical(config),))
+                (canonical(proposed),))
 
     def get_metadata(self, key, default=None):
         """Read a small JSON metadata value without exposing project secrets."""
@@ -163,7 +175,7 @@ class Project:
         text = canonical(record)
         if len(text.encode("utf-8")) > 4 * 1024 * 1024:
             raise EngineError("record_budget", "Record exceeds storage budget")
-        if kind in {"evidence", "decision", "finding_revision", "checkpoint", "closure_review", "finalization"}:
+        if kind in {"evidence", "decision", "finding_revision", "checkpoint", "closure_review", "finalization", "src_stop", "integration_import"}:
             create_only = True
         stamp = now()
         sql = "INSERT INTO entities(kind,id,document,created_at,updated_at) VALUES(?,?,?,?,?)"

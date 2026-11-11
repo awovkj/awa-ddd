@@ -12,13 +12,13 @@ function harness(provided = ['systemPrompt', 'sessionProjections', 'commands']) 
   const sections = [];
   const tools = [];
   const injected = [];
-  let projection;
-  let state;
+  const projections = new Map();
+  const states = new Map();
   const services = {
     systemPrompt: { section(section) { sections.push(section); } },
     sessionProjections: {
-      register(definition) { projection = definition; state = definition.init(); },
-      stateOf() { return state; },
+      register(definition) { projections.set(definition.key, definition); states.set(definition.key, definition.init()); },
+      stateOf(_session, key) { return states.get(key); },
     },
     commands: { register() {} },
   };
@@ -34,7 +34,9 @@ function harness(provided = ['systemPrompt', 'sessionProjections', 'commands']) 
   };
   return { sections, tools, injected, ctx,
     command(argument) {
-      state = projection.apply(state, { type: 'command/run', data: { name: 'penetration', args: argument } });
+      for (const [key, projection] of projections) {
+        states.set(key, projection.apply(states.get(key), { type: 'command/run', data: { name: 'penetration', args: argument } }));
+      }
     } };
 }
 

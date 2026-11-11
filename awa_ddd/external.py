@@ -571,6 +571,8 @@ def _sqlmap_diagnostic(run, text):
 
 
 def sqlmap_run(project, args):
+    from .assessment_mode import require_action
+    require_action(project, "tool.sqlmap", args)
     executable = _configured_executable(project, args, "sqlmap")
     timeout = _timeout(args, 90)
     operation, url, session, resource, snapshot, location, selector, parameter = _sqlmap_target(project, args, timeout)
@@ -691,6 +693,8 @@ def sqlmap_run(project, args):
 
 
 def yakit_replay(project, args):
+    from .assessment_mode import require_action
+    require_action(project, "tool.yakit_replay", args)
     executable = _configured_executable(project, args, "yakit")
     timeout = _timeout(args, 30)
     operation, url, session = _target(project, args)

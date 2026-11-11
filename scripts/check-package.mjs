@@ -264,11 +264,38 @@ print(json.dumps({kind: counts.get(kind, 0) for kind in ("run", "evidence", "dec
 `, workspace, projectId], options);
   const counts = JSON.parse(stdout);
   assert.deepEqual(counts, { run: 0, evidence: 0, decision: 0, finding: 0 });
+  const srcId = 'package-src';
+  const srcUrl = 'https://package-src.invalid/app';
+  const srcCall = (name, action, input = {}) => dispatch(name, action, input, srcId);
+  const srcCreated = await srcCall('awa_project', 'project.create', {
+    target: srcUrl, scope: [srcUrl], assessment_mode: 'src', allow_mutation: false,
+  });
+  assert.equal(srcCreated.config.assessment_mode, 'src');
+  const writeOperation = await srcCall('awa_surface', 'surface.register', {
+    operation: { url: srcUrl + '/write', method: 'POST', auth: 'public' },
+  });
+  await assert.rejects(srcCall('awa_execute', 'http.capture', {
+    operation_id: writeOperation.id, url: srcUrl + '/write', effect: 'read_only', idempotency_key: 'src-write-must-not-dispatch',
+  }), error => error.code === 'src_write_denied');
+  const exchange = { schema: 'dsh-purge-awa/v1', engagement: { id: 'package-source', mode: 'src' },
+    candidates: [{ external_id: 'vuln-1', url: srcUrl + '/candidate', method: 'GET',
+      title: 'Package scanner candidate', category: 'generic', source_status: 'confirmed' }] };
+  const imported = await srcCall('awa_project', 'integration.import', { exchange });
+  const reused = await srcCall('awa_project', 'integration.import', { exchange });
+  assert.equal(imported.counts.created, 1);
+  assert.equal(reused.counts.created, 0);
+  assert.deepEqual(reused.candidate_ids, imported.candidate_ids);
+  const exported = await srcCall('awa_project', 'integration.export', { import_id: imported.import_id });
+  assert.equal(exported.candidates[0].status, 'unverified');
+  assert.equal(exported.candidates[0].usable_for_confirmation, false);
+  assert.deepEqual(exported.candidates[0].decisions, []);
+  assert.equal((await srcCall('awa_project', 'project.status')).run_total, 0);
   return { oracle_discriminators: oracleKinds.length, assessment_hint_candidates: hints.candidate_total,
     client_sink_candidates: sinks.candidate_total, parameter_cells: matrix.summary.cell_total,
     typed_tested_parameters: matrix.summary.typed_tested_total, multipart_bom_error: 'multipart_framing',
     multipart_bom_repair: 'rewrite_utf8_without_bom', proof_preparation_operations: javascript.operation_ids.length + openapi.operation_ids.length,
-    finding_bind_unproven_rejected: true, requests_sent: 0, decisions_created: 0, automatic_execution_allowed: false, entity_counts: counts };
+    finding_bind_unproven_rejected: true, requests_sent: 0, decisions_created: 0, automatic_execution_allowed: false, entity_counts: counts,
+    src_write_rejected_before_dispatch: true, src_exchange_idempotent: true, src_external_confirmation_ignored: true };
 }
 
 try {
@@ -279,12 +306,12 @@ try {
   const files = new Set(packed.files.map(file => file.path));
   const required = ['package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'pyproject.toml',
     'src/index.mjs', 'src/bridge.mjs', 'src/tools.mjs', 'src/actions.mjs', 'src/tool-guidance.mjs',
-    'src/parse-js.mjs', 'src/mode.mjs', 'src/stop-policy.mjs', 'src/host-continuation.mjs', 'src/client.js',
+    'src/parse-js.mjs', 'src/mode.mjs', 'src/src-mode.mjs', 'src/stop-policy.mjs', 'src/host-continuation.mjs', 'src/client.js',
     'scripts/invoke-request.mjs', 'scripts/Invoke-AwaDdd.ps1', 'skills/awa-ddd/SKILL.md',
     'docs/UPGRADE-20261029.md', 'docs/UPGRADE-20261030-ASSESSMENT.md', 'docs/UPGRADE-20261031.md', 'docs/UPGRADE-20261101.md',
     'docs/UPGRADE-20261102.md', 'docs/UPGRADE-20261102-LEAN.md', 'docs/SESSION-20261102-ADAAE1EF.md',
     'docs/UPGRADE-20261103.md', 'docs/SESSION-20261103-CFF22367.md',
-    'docs/V2-ARCHITECTURE.md', 'docs/V2-MIGRATION.md', 'docs/V2-ACCEPTANCE.md',
+    'docs/V2-ARCHITECTURE.md', 'docs/V2-MIGRATION.md', 'docs/V2-ACCEPTANCE.md', 'docs/SRC-MODE.md', 'docs/INTEGRATION-DSH-PURGE.md',
     'docs/REPRODUCTION.md', 'examples/assessment-hints.json',
     'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md', 'docs/PLAYWRIGHT_TESTING.md',
     ...['__init__', '__main__', 'store', 'engine', 'scope', 'transport', 'assessment', 'scenario',
@@ -292,7 +319,7 @@ try {
       'mcp_http', 'tscanplus',
       'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction', 'publication',
       'parameter_coverage', 'oracle_contracts', 'assessment_hints', 'reconnaissance', 'recon_parsing',
-      'assessment_preparation', 'finding_binding', 'security_hypotheses', 'v2api'].map(module => `awa_ddd/${module}.py`),
+      'assessment_preparation', 'finding_binding', 'security_hypotheses', 'v2api', 'assessment_mode', 'integration'].map(module => `awa_ddd/${module}.py`),
     ...['__init__', 'universe', 'hypothesis', 'test_recipe', 'test_run', 'finding', 'coverage_claim', 'campaign',
       'known_case', 'gap', 'review', 'common', 'repository'].map(module => `awa_ddd/domain/${module}.py`),
     ...['__init__', 'scheduler', 'known_cases', 'route_parser', 'hypotheses', 'coverage', 'campaign', 'migration'].map(module => `awa_ddd/planning/${module}.py`),
@@ -445,7 +472,8 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(inventory.registration_is_testing, false);
     const reconHelp = await dispatch('awa_project', 'action.help', { name: 'surface.recon' }, null);
     assert.equal(reconHelp.group, 'awa_surface');
-    assert.deepEqual(Object.keys(reconHelp.fields).sort(), ['limit', 'mode', 'offset', 'section']);
+    assert.deepEqual(Object.keys(reconHelp.fields).sort(), ['limit', 'mode', 'offset', 'required_assessment_mode', 'section']);
+    assert.equal(typeof reconHelp.fields.required_assessment_mode, 'string');
     const reconPrepare = await dispatch('awa_surface', 'surface.recon', { mode: 'prepare', section: 'collection', limit: 1 });
     assert.equal(reconPrepare.requests_sent, 0);
     assert.equal(reconPrepare.baseline_id, null);

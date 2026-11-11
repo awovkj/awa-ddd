@@ -58,6 +58,8 @@ _ERROR_CODES = frozenset((
     "finding_proof finding_proof_current finding_binding finding_binding_lifecycle finding_binding_channel finding_binding_source finding_binding_duplicate "
     "page_adoption_failed timeout tool_lineage_invalid wsl_runtime sql_metadata_lineage "
     "already_preflighted report_redaction_failed"
+    " assessment_mode assessment_mode_mismatch assessment_mode_immutable src_write_denied src_action_denied stopped_at_evidence"
+    " integration_shape integration_budget integration_schema integration_locator integration_redaction integration_identity_conflict"
 ).split())
 _ERROR_CODES = _ERROR_CODES | frozenset((
     "action_catalog capability_profile capability_provider known_case_entry known_case_group known_case_source "
@@ -82,6 +84,7 @@ _HANDLE_PREFIXES = {"operation": {"O"}, "obligation": {"OB"}, "evidence": {"E"},
                     "finding": {"F"}, "finding_revision": {"FR"}, "candidate": {"C"}, "run": {"RUN", "SC"},
                     "page_visit": {"PV"}, "checkpoint": {"CP"}, "closure_review": {"CR"}, "finalization": {"FN"},
                     "recon_baseline": {"RC"}}
+_HANDLE_PREFIXES.update({"integration_import": {"IMP"}, "v2_run": {"RUN2"}, "v2_finding": {"FND"}})
 _LOCAL_ID_KINDS = {"actor", "session", "resource", "page", "function"}
 _LOCAL_PREFIXES = {"actor": "ACT", "session": "SES", "resource": "RES", "page": "PG", "function": "FN"}
 
@@ -255,6 +258,10 @@ class PublicationContext:
             return isinstance(value, str) and value in rule.values
         if rule.kind == "handle":
             return self.bound_handle(rule.values, value)
+        if rule.kind == "proof_handle":
+            return self.bound_handle("decision", value) or self.bound_handle("v2_run", value)
+        if rule.kind == "finding_handle":
+            return self.bound_handle("finding", value) or self.bound_handle("v2_finding", value)
         if rule.kind == "source_handle":
             from .continuation import SOURCE_KINDS
             return isinstance(row, dict) and isinstance(row.get("kind"), str) and row["kind"] in SOURCE_KINDS \
@@ -430,7 +437,8 @@ def _schemas():
         "consumer_url", "runtime_marker", "analyst_reviewer", "normal_baseline_capture", "selected_attack_capture", "exact_captured_attack_url",
         "no_progress_frozen",
         "concrete_same_identity_consumer_url", "relevant_selectors_and_actions", "exact_scoped_consumer_url_with_bound_values",
-        "actual_function_selectors_and_actions", "valid_scoped_page_url", "exact_scoped_page_url_with_bound_values")
+        "actual_function_selectors_and_actions", "valid_scoped_page_url", "exact_scoped_page_url_with_bound_values",
+        "stopped_at_evidence", "src_write_denied")
     page = {**_fields("offset limit next_offset", _COUNT), "next_action": action}
     pending_names = "open_obligations open_security_obligations unresolved_candidates unassessed_observations " \
                     "unlinked_analyst_findings unrecorded_confirmations orphan_browser_visits pages_unvisited " \
@@ -533,6 +541,7 @@ def _schemas():
     browser_counts = _fields("required_total assisted_total call_needed_total invoke_now_total blocked_total "
                              "native_unsupported_total followup_total task_total", _COUNT)
     work = {**gap, **_fields("url help_input required_experiment_fields hypothesis_hint browser_handoff_note"), "method": method,
+            "stop_reason": _enum("stopped_at_evidence", "src_write_denied"),
             "runtime_binding_modes": _Many(_enum("direct_document", "stored_api")),
             "parameter_coverage_id": _digest("PC"), "parameter_test_status": parameter_state,
             "selected_input_observation_count": _COUNT, "selected_input_variant_observed": _BOOL,
@@ -671,7 +680,7 @@ def _schemas():
         **_fields("can_claim_complete automatic_stop_allowed frontier_reviewed external_constraint_verified blocker_facts_verified", _BOOL), "remaining": remaining}
     result = {name: {} for name in CONTRACTS}
     config = {**_fields("project_id target created_at external_tools"), "scope": _Many(_TEXT), "exclude": _Many(_TEXT),
-              "allow_mutation": _BOOL, "schema_version": _COUNT}
+              "allow_mutation": _BOOL, "schema_version": _COUNT, "assessment_mode": _enum("assessment", "src")}
     from .security_hypotheses import SECURITY_PROPERTIES, MISSING_CONTEXT_CODES
 
     recon_mode, recon_section = _enum("prepare", "aggregate"), _enum("overview", "technologies", "functions", "clues", "collection", "hypotheses")
@@ -771,7 +780,8 @@ def _schemas():
                 "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_required_values": _COUNT,
                 "control_review_blockers": _Many(_enum("roles_unverified", "actor_independence", "declared_access_policy")),
                 "decision_id": _handle("decision"), "outcome": _enum("confirmed", "refuted", "inconclusive"),
-                "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls", "frozen"),
+                "preparation_state": _enum("proof_current", "proof_outside_selection", "needs_consumer", "needs_policy_or_identity", "inspect_existing", "needs_controls", "frozen", "stopped_at_evidence", "src_discovery_only"),
+                "execution_blocked": _BOOL, "stop_reason": _enum("stopped_at_evidence", "src_write_denied"),
                 "suggested_action": action, "assessment_action": action, "input_template": template, "help_input": {"name": action},
                 "assessment_template": template, "suggested_test_families": _Many(family),
                  "runtime_binding_modes": _Many(_enum("direct_document", "stored_api")),
@@ -839,7 +849,43 @@ def _schemas():
         "delivery": _TEXT, "denominators": _TEXT, "computed_by": _TEXT}
     result["tool.artifact"] = {**_fields("content name trust finding_status"), "run_id": _handle("run"),
                                 **_fields("offset limit total_chars next_offset", _COUNT), "usable_for_confirmation": _BOOL}
+    evidence_hash = {"evidence_id": _handle("evidence"), "sha256": _SHA256, "kind": _enum("http", "browser"),
+                     "trust": _enum("observed"), "complete": _BOOL}
+    proof_handle, finding_handle = _Rule("proof_handle"), _Rule("finding_handle")
+    mode_policy = {"assessment_mode": config["assessment_mode"],
+                   "stop_policy": _enum("stop_at_direct_evidence", "existing_assessment_policy"),
+                   "allow_mutation": _BOOL, "max_response_bytes": _COUNT,
+                   "stopped_operations": _Many({"operation_id": _handle("operation"), "decision_id": proof_handle,
+                                                 "evidence_ids": _Many(_handle("evidence"))})}
+    result["project.status"]["assessment_policy"] = mode_policy
+    exchange_source = {**_fields("provider engagement_id external_id"), "import_id": _handle("integration_import"),
+                       "sha256": _SHA256, "trust": _enum("unverified_external")}
+    exchange_decision = {**_fields("category oracle_type reason"), "decision_id": proof_handle,
+                         "outcome": _enum("confirmed", "refuted", "inconclusive"),
+                         "mode": _enum("machine", "analyst"), "proof_mode": _enum("machine", "analyst"),
+                         "evidence_ids": _Many(_handle("evidence")), "evidence_hashes": _Many(evidence_hash),
+                         **_fields("current validated usable_for_confirmation", _BOOL)}
+    exchange_finding = {**_fields("category title"), "finding_id": finding_handle, "decision_id": proof_handle,
+                        "mode": _enum("machine", "analyst"),
+                        "status": _enum("confirmed", "machine_confirmed", "reviewed_confirmed", "withdrawn", "rejected", "superseded"),
+                        "severity": _enum("info", "low", "medium", "high", "critical"),
+                        "evidence_ids": _Many(_handle("evidence")), **_fields("current usable_for_confirmation", _BOOL)}
+    exchange_common = {"schema": _enum("dsh-purge-awa/v1"), "project_id": _TEXT, "assessment_mode": config["assessment_mode"],
+                       "import_id": _handle("integration_import"), "requests_sent": _COUNT, "limitations": _Many(_TEXT)}
+    result["integration.import"] = {**exchange_common, "candidate_ids": _Many(_handle("candidate")),
+        "usable_for_confirmation": _Rule("false"),
+        "candidates": _Many({"external_id": _TEXT, "candidate_id": _handle("candidate"), "status": _enum("unverified"), "created": _BOOL}),
+        "counts": _fields("candidates created reused http_metadata", _COUNT)}
+    result["integration.export"] = {**exchange_common, **_fields("candidate_total offset limit next_offset", _COUNT),
+        "counts": _fields("candidates verified_candidates", _COUNT), "limited": _BOOL,
+        "candidates": _Many({**_fields("external_id engagement_id url title category source_status"),
+            "candidate_id": _handle("candidate"), "operation_id": _handle("operation"), "method": method,
+            "severity": _enum("info", "low", "medium", "high", "critical"), "status": _enum("unverified", "linked", "dismissed"),
+            "source": exchange_source, "decisions": _Many(exchange_decision), "findings": _Many(exchange_finding),
+            "usable_for_confirmation": _BOOL, "proofs_truncated": _BOOL})}
     error = {"code": _enum(*_ERROR_CODES), "message": _TEXT, "details": {**_fields("field step_id reason missing_prerequisites"), "action": action,
+        "assessment_mode": config["assessment_mode"], "required_assessment_mode": config["assessment_mode"],
+        "decision_id": proof_handle, "evidence_ids": _Many(_handle("evidence")),
         "next_action": action, "help_action": action, "help_input": {"name": action}, "continuation": continuation,
         "test_family": family, "framing_issue": _enum("utf8_bom", "invalid_multipart"),
         "reason_code": _enum("not_configured", "backend_mismatch", "overescaped_path", "not_absolute", "file_missing",
@@ -1201,7 +1247,7 @@ EXECUTION_ACTIONS = frozenset({"http.capture", "identity.verify", "scenario.run"
 OFFLINE_MUTATIONS = frozenset({"project.update", "project.import_pentest", "surface.register", "surface.batch", "surface.import",
     "surface.declare_consumer", "identity.actor", "identity.session", "identity.resource", "browser.import_mcp", "page.register",
     "page.adopt", "page.function", "page.mark", "plan.build", "plan.disposition", "plan.checkpoint", "plan.review", "plan.finalize",
-    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.bind", "finding.update"})
+    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.bind", "finding.update", "integration.import"})
 
 
 def _persisted_run(project, action, args, previous, result=None, error=None, *, claimed=()):
@@ -1315,6 +1361,10 @@ def invoke(project, action, args, handler):
 
     def execute():
         nonlocal result
+        from .contracts import _validate_json
+        from .assessment_mode import require_action
+        _validate_json(args)
+        require_action(project, action, args)
         validate_action_args(action, args)
         result = handler(project, action, args)
         try:

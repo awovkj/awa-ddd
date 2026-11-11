@@ -14,7 +14,7 @@ const defineTool = definition => definition;
 test('default surface remains the ten legacy groups', () => {
   const definitions = toolDefinitions(defineTool, config);
   assert.equal(definitions.length, 10);
-  assert.equal(GROUPS.flatMap(group => group.actions).length, 65);
+  assert.equal(GROUPS.flatMap(group => group.actions).length, 67);
 });
 
 test('v2 mode registers six groups and only v2 actions', () => {

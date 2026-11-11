@@ -309,6 +309,8 @@ def prepare(project, args):
                                 priorities.get(item["kind"], 4), item["id"]))
     selected = items[offset:offset + limit]
     rows = [_prepare_item(project, item, inventory, observations, allowed_ids, finding) for item in selected]
+    from .assessment_mode import work_policy
+    rows = [work_policy(project, row, inventory["operations"][row["operation_id"]]) for row in rows]
     if rows:
         signature = hashlib.sha256(json.dumps([
             {"obligation_id": row.get("obligation_id"),

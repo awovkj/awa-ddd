@@ -43,6 +43,14 @@ def _dispatch(workspace,action,args):
 
 
 def _project_dispatch(project, action, args):
+    from .assessment_mode import require_action
+    require_action(project, action, args)
+    if "required_assessment_mode" in args:
+        args = {key: value for key, value in args.items() if key != "required_assessment_mode"}
+    if action in {"integration.import", "integration.export"}:
+        from . import integration
+        return {"integration.import": integration.import_exchange,
+                "integration.export": integration.export_exchange}[action](project, args)
     if action.startswith("campaign."):
         from . import v2api
         handler = {

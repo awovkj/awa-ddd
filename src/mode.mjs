@@ -59,7 +59,7 @@ export const penetrationProjection = {
   },
 };
 
-export function apply(ctx) {
+export function apply(ctx, options = {}) {
   // Cordis 禁止在 `inject` 之外读取服务：直接访问 ctx.sessionProjections 会抛
   // "cannot get property ... without inject"，即使服务真的存在。因此必须用
   // ctx.inject([...], callback) 声明依赖 —— callback 只在全部服务就绪时才运行，
@@ -84,7 +84,7 @@ export function apply(ctx) {
       order: 400,
       text: context => {
         const session = context?.agent?.session;
-        return activeOf(session) ? SECTION_TEXT : '';
+        return activeOf(session) && options.suppressForAgent?.(context?.agent) !== true ? SECTION_TEXT : '';
       },
     });
 

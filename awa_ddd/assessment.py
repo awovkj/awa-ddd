@@ -1364,6 +1364,8 @@ def evaluate(project,args):
         project.put("decision",decision,create_only=True)
         project.put("obligation",item)
         project.event("assessment.decided",{"decision_id":decision["id"],"outcome":outcome,"obligation_id":item["id"]})
+        from .assessment_mode import record_decision
+        record_decision(project, decision)
     return decision
 
 
@@ -1512,4 +1514,13 @@ def record_finding(project,args):
         project.event("assessment.analyst_bound", {"obligation_id": bound_item["id"], "decision_id": decision["id"],
                                                  "finding_id": finding["id"], "test_family": "xss"})
     project.event("finding.recorded",{"finding_id":finding["id"],"decision_id":decision["id"]})
+    from .assessment_mode import mode as project_mode, record_stop
+    if project_mode(project) == "src":
+        operation_ids = {project.get("evidence", identity)["operation_id"] for identity in finding["evidence_ids"]}
+        if decision.get("operation_id"):
+            operation_ids = {decision["operation_id"]}
+        for operation_id in operation_ids:
+            record_stop(project, operation_id=operation_id, evidence_ids=finding["evidence_ids"],
+                        decision_id=decision["id"], finding_id=finding["id"],
+                        oracle_type=(decision.get("oracle") or {}).get("type"))
     return finding

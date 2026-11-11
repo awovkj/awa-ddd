@@ -229,6 +229,8 @@ def preflight(project, args):
 
 
 def run_scenario(project,args):
+    from .assessment_mode import require_action
+    require_action(project, "scenario.run", args)
     spec, steps, _ = _steps(args)
     identity=stable("SC",args["idempotency_key"]) if args.get("idempotency_key") else project.id("SC")
     signature=stable("SPEC",spec)

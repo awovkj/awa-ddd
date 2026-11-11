@@ -5,7 +5,9 @@ description: 使用 awa-ddd 在已有授权范围内进行证据驱动安全评�
 
 # awa-ddd
 
-awa-ddd 使用当前 dsh 模型与本地 SQLite 台账。默认 `assessmentModel:v1`（10 组、63 动作）；`v2` 注册 6 组 Campaign 工具。仅维护源码/报告时不启动目标评估；历史材料和新建项目不提供新测试授权。
+awa-ddd 使用当前 dsh 模型与本地 SQLite 台账。默认 `assessmentModel:v1`（10 组、67 动作）；`v2` 注册 6 组 Campaign 工具。源码/报告维护不启动目标评估；历史材料和新建项目不提供新测试授权。
+
+SRC 用创建时固定的 `assessment_mode:src`；`assessmentMode:src` 或 `/src` 选新项目偏好，off 不降级旧项目。只做有界直接证据发现，确认后停止同操作，未测分母保留。dsh-purge 用 `integration.import/export` 交换候选，来源 confirmed 不成 machine；精确绑定 operation/input 后复核当前证据。细节按需读 [SRC](../../docs/SRC-MODE.md) 与 [交换](../../docs/INTEGRATION-DSH-PURGE.md)。
 
 ## 2.0 战役入口
 
@@ -13,7 +15,7 @@ v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test
 
 ## 入口与按需帮助
 
-安全评估任务才使用此入口：已有项目先 `project.status` 和 `surface.recon prepare`，缺项目才 `project.create`。已有信息基线只补变化，再读小页 `plan.next`。所有动作字段必须在 `input` 中，顶层只放 `action/project_id/input`。**帮助统一调用 awa_project**，不要向其它工具组发送 `action.help`：
+安全评估任务才使用此入口：已有项目先 `project.status` 和 `surface.recon prepare`，缺项目才 `project.create`。已有信息基线只补变化，再读小页 `plan.next`。所有动作字段放 `input`，顶层只放 `action/project_id/input`。**帮助调用管理组：v1 awa_project，v2 awa_admin**；`action.help` 不发到其他组：
 
 ```json
 {"action":"action.help","input":{"name":"assessment.evaluate"}}
@@ -25,7 +27,7 @@ v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test
 {"action":"plan.next","project_id":"assessment","input":{"limit":3,"parameter_limit":3,"parameter_status":"untested"}}
 ```
 
-`parameter_coverage` 与主任务独立分页：主游标是 `offset/next_offset`，参数游标是 `parameter_offset/parameter_coverage.next_offset`。观察到字段、同上下文变体和 typed 已测是不同状态。`plan.build.obligations` 是整数，`obligation_items` 才是明细。
+主游标 `offset/next_offset` 与参数游标 `parameter_offset/parameter_coverage.next_offset` 独立。观察到字段不等于 typed 已测；`plan.build.obligations` 是计数，`obligation_items` 是明细。
 
 ## 信息先行
 
@@ -77,7 +79,7 @@ required 和 assisted 都要求实际 Playwright；assisted 不是可选建议�
 
 `plan.finalize` 仅 `reason:completed`：登记范围非空、有效求值覆盖、零 ready/review/blocked/unresolved、最新同快照 CP、两轮完整有效证据绑定的 discovery/全部 12 族/pages frontier。`can_finalize` 非完成；当前严格 FN 成功才使 `automatic_stop_allowed/can_claim_complete:true`，限登记范围。未完成存 CP 和 `report.build stage:draft`；`stage:final` 引当前严格 FN，变更使旧 FN 失效。交接/抑制提醒/取消非最终完成。
 
-渲染限 24 KiB。按 `render_recovery.combined_input/pages` 和原过滤恢复主/参数页后走游标；单项过大走 detail，不循环/跳过。`render_actionable:false` 不执行。报告给完整脱敏 HTTP 包供 Yakit/Burp；SQL 默认 sqlmap 取库名/用户，不可用列原因；生成不发包。
+渲染限 24 KiB；按 `render_recovery` 和原过滤恢复页，单项过大走 detail；`render_actionable:false` 不执行。报告给脱敏 HTTP；生成不发包。
 
 并行委派只交接同一 backend/workspace/project_id、scope、operation/obligation/input 与 session/resource 引用；返回 run/evidence/candidate/decision ID 和未满足前提，不复制凭据、不靠口头结论确认，不跨 native/WSL 并发共享 SQLite。
 

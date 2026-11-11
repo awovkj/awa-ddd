@@ -8,6 +8,7 @@ import { ACTIONS, PACKAGE_ROOT } from '../src/bridge.mjs';
 import { toolDefinitions } from '../src/tools.mjs';
 import { STOP_POLICY_TEXT } from '../src/stop-policy.mjs';
 import { apply as applyMode } from '../src/mode.mjs';
+import { SRC_POLICY_TEXT } from '../src/src-mode.mjs';
 
 const bytes = value => Buffer.byteLength(value, 'utf8');
 
@@ -28,7 +29,10 @@ test('always-present schemas and enabled policy fit the measured 25 KB context b
   assert.ok(size.stop <= 2200, JSON.stringify(size));
   assert.ok(size.mode <= 4000, JSON.stringify(size));
   assert.ok(size.schemas + size.stop + size.mode <= 25000, JSON.stringify(size));
-  assert.equal(ACTIONS.length, 65);
+  const srcSize = { schemas: size.schemas, stop: size.stop, mode: bytes(SRC_POLICY_TEXT) };
+  assert.ok(srcSize.mode <= 4000, JSON.stringify(srcSize));
+  assert.ok(srcSize.schemas + srcSize.stop + srcSize.mode <= 25000, JSON.stringify(srcSize));
+  assert.equal(ACTIONS.length, 67);
   assert.deepEqual(definitions.flatMap(tool => tool.parameters.properties.action.enum).sort(), [...ACTIONS].sort());
   assert.match(modePrompt(), /\u5148 surface\.recon \u7edf\u7b79\u4fe1\u606f/);
 });

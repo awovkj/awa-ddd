@@ -86,6 +86,9 @@ def lease(project, fixture_id, *, worker_id, ttl_seconds=300):
 
 
 def mutate(project, fixture_id, *, worker_id, intended_effect):
+    from ..assessment_mode import mode
+    if mode(project) == "src":
+        fail("src_write_denied", "SRC cannot mutate test fixtures")
     row = _get(project, fixture_id)
     if row["state"] != "leased" or (row.get("lease") or {}).get("worker_id") != worker_id:
         fail("v2_fixture_lease", "Mutation requires the active exclusive lease")
