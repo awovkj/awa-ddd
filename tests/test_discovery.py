@@ -2,10 +2,12 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from awa_ddd import discovery
 from awa_ddd.discovery import discover, MAX_BYTES
 
 
@@ -314,8 +316,49 @@ function custom(fetch){fetch('/not-native');}
             result = self.run_input("fetch('/ok')", "javascript")
         self.assertFalse(result["operations"])
         self.assertIn("javascript_ast_parser_unavailable", self.codes(result))
+        with patch("awa_ddd.discovery._javascript_helper", return_value=None):
+            result = self.run_input("fetch('/ok')", "javascript")
+        self.assertIn("javascript_ast_parser_unavailable", self.codes(result))
         result = self.run_input("const x = <unsupportedJSX/>", "javascript")
         self.assertIn("javascript_syntax_not_supported", self.codes(result))
+
+    def test_javascript_packaged_parser_and_acorn_are_self_contained(self):
+        packaged = discovery._javascript_helper()
+        self.assertIsNotNone(packaged)
+        self.assertEqual(
+            "js_parser",
+            packaged.parent.name,
+            "the installed package resource must be preferred over the checkout helper",
+        )
+        manifest = json.loads((packaged.parent / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual("awa-js-parser-resource/v1", manifest["schema"])
+        self.assertEqual("8.19.0", manifest["acorn"]["version"])
+        self.assertEqual("MIT", manifest["acorn"]["license"])
+        self.assertEqual("22.19.0", manifest["node"]["minimum_version"])
+        repository = Path(discovery.__file__).resolve().parents[1]
+        package_manifest = json.loads((repository / "package.json").read_text(encoding="utf-8"))
+        self.assertNotIn("acorn", package_manifest.get("dependencies", {}))
+        for relative, digest in (
+            (manifest["parser"]["path"], manifest["parser"]["sha256"]),
+            (manifest["acorn"]["module"], manifest["acorn"]["module_sha256"]),
+            (manifest["acorn"]["license_file"], manifest["acorn"]["license_sha256"]),
+            (manifest["acorn"]["package"], manifest["acorn"]["package_sha256"]),
+        ):
+            self.assertEqual(digest, hashlib.sha256((packaged.parent / relative).read_bytes()).hexdigest())
+        checkout = repository / "src" / "parse-js.mjs"
+        self.assertEqual(checkout.read_bytes(), packaged.read_bytes())
+
+        isolated = self.root / "installed" / "awa_ddd" / "resources" / "js_parser"
+        shutil.copytree(packaged.parent, isolated)
+        with patch("awa_ddd.discovery._javascript_helper",
+                   return_value=isolated / "parse-js.mjs"):
+            result = self.run_input(
+                "fetch('/offline', {method: 'POST', body: JSON.stringify({owner: user})});",
+                "javascript",
+            )
+        self.assertEqual(["https://app.invalid/offline"],
+                         [row["url"] for row in result["operations"]])
+        self.assertNotIn("javascript_ast_parser_unavailable", self.codes(result))
 
     def test_javascript_window_fetch_graphql_and_destructured_shadow(self):
         code = """window.fetch('/graphql',{method:'POST',body:JSON.stringify({operationName:'ReadOrder',query:'query omitted',variables:{id:secret}})});

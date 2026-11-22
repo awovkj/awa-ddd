@@ -13,6 +13,7 @@ from awa_ddd.assessment import record_finding
 from awa_ddd.__main__ import dispatch
 from awa_ddd.reporting import build_report
 from awa_ddd.store import EngineError, now
+from awa_test_support import record_observation
 import test_analyst_binding_20261030 as fixtures
 
 
@@ -86,7 +87,8 @@ class StoredConsumptionTests(unittest.TestCase):
         raw.update(changes)
         viewer = self.project.get("actor", visit["actor_id"])
         session = self.project.get("session", visit["session_id"])
-        return browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright", session=session, actor=viewer)
+        return record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
+                                  session=session, actor=viewer)
 
     def test_cross_principal_content_chain_closes_only_the_actual_source(self):
         operation, item, writers, reads, visits, _, viewer_session, args = self.prepared()

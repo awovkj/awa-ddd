@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 from ..domain.known_case import new_known_case
@@ -105,9 +106,18 @@ def import_known_cases(project, path, *, source_group=None, track="hint_assisted
         seen[key] = case["id"]
         repository.add("known_case", case, immutable=False)
         added.append(case["id"])
+    track_counts = Counter(case["track"] for case in loaded["cases"])
+    tracks = sorted(track_counts)
+    canonical_track = tracks[0] if len(tracks) == 1 else None
+    normalized_sha256 = __import__("hashlib").sha256(
+        canonical(loaded["cases"]).encode()).hexdigest()
     project.event("v2.known_cases_imported", {"source_group": loaded["source_group"],
-                                               "added": len(added), "duplicates": len(duplicates)})
-    return {"source_group": loaded["source_group"], "track": track, "added": len(added),
+                                               "added": len(added), "duplicates": len(duplicates),
+                                               "tracks": tracks})
+    return {"source_group": loaded["source_group"], "track": canonical_track,
+            "tracks": tracks, "track_counts": dict(sorted(track_counts.items())),
+            "added": len(added),
             "duplicates": duplicates, "case_ids": added,
             "total": repository.count("known_case"),
-            "sha256": __import__("hashlib").sha256(canonical(loaded["document"]).encode()).hexdigest()}
+            "sha256": __import__("hashlib").sha256(canonical(loaded["document"]).encode()).hexdigest(),
+            "normalized_sha256": normalized_sha256}

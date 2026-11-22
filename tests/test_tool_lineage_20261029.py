@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 from awa_ddd import engine, external
 from awa_ddd.assessment import evaluate, record_finding
 from awa_ddd.store import EngineError, Project, now
+from awa_test_support import guarded_sqlmap_result
 
 
 def observed(url, method, headers, body, timeout, max_bytes, *, response=None):
@@ -35,6 +36,10 @@ class ToolLineageTests(unittest.TestCase):
         self.addCleanup(self.project.close)
         self.executable = Path(self.tmp.name) / "sqlmap.py"
         self.executable.write_text("# A local mock fixture; never executed.\n", encoding="utf-8")
+        trusted = patch.dict("os.environ", {external.TRUSTED_SQLMAP_ENV: json.dumps({
+            "path": str(self.executable.resolve()), "sha256": ""})})
+        trusted.start()
+        self.addCleanup(trusted.stop)
         self.operation = engine.register_operation(self.project, {
             "url": self.base + "/items", "method": "GET", "auth": "public",
             "inputs": [{"name": "sort", "location": "query", "consumer": "sql_order_by"}],
@@ -59,17 +64,12 @@ class ToolLineageTests(unittest.TestCase):
         query = [("sort", "price"), *(extra_query or [])]
 
         def process(command, **options):
-            options["stdout"].write((text if text is not None else "identified the following injection point(s)\ncurrent database: 'audit_db'\n").encode("utf-8"))
-            Path(command[command.index("-t") + 1]).write_text(
-                "HTTP request [#1]:\nGET /items?sort=price HTTP/1.1\n\nHTTP response [#1]:\nHTTP/1.1 200 OK\n\n", encoding="utf-8")
-
-            class Process:
-                returncode = 0
-
-                def poll(self):
-                    return 0
-
-            return Process()
+            return guarded_sqlmap_result(
+                self.project,
+                command,
+                stdout_text=text if text is not None else "identified the following injection point(s)\ncurrent database: 'audit_db'\n",
+                traffic_text="HTTP request [#1]:\nGET /items?sort=price HTTP/1.1\n\nHTTP response [#1]:\nHTTP/1.1 200 OK\n\n",
+            )
 
         args = {"operation_id": self.operation["id"], "url": self.operation["url"] + "?" + urlencode(query),
                 "sqlmap_path": str(self.executable), "parameter": "sort", "effect": "read_only"}

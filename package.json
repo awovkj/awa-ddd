@@ -1,6 +1,6 @@
 {
   "name": "awa-ddd",
-  "version": "2.2.0",
+  "version": "2.4.0",
   "description": "Evidence-driven security assessment for DeepSeek Harness with discovery-only SRC policy and versioned redteam evidence exchange.",
   "type": "module",
   "license": "MIT",
@@ -18,17 +18,23 @@
     ".": "./src/index.mjs",
     "./bridge": "./src/bridge.mjs",
     "./client": "./src/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "src/**/*.mjs",
     "src/client.js",
     "awa_ddd/**/*.py",
+    "awa_ddd/resources/**",
     "skills",
+    "locale/*.json",
+    "icon.svg",
     "docs/**/*.md",
     "examples",
     "cordis.patch.yml",
     "pyproject.toml",
+    "setup.py",
     "README.md",
     "LICENSE",
     "!awa_ddd/tests_*.py",
@@ -80,7 +86,8 @@
     "!**/dist/**",
     "!**/.venv/**",
     "!**/.tox/**",
-    "!**/.nox/**"
+    "!**/.nox/**",
+    "awa_ddd/resources/js_parser/vendor/acorn/dist/acorn.mjs"
   ],
   "scripts": {
     "test": "node --test tests/*.test.mjs",
@@ -88,6 +95,7 @@
     "check": "node --check src/index.mjs && node --check src/bridge.mjs && node --check src/actions.mjs && node --check src/host-continuation.mjs && node --check src/stop-policy.mjs && node --check src/tool-guidance.mjs && node --check src/parse-js.mjs && node --check src/tools.mjs && node --check src/mode.mjs && node --check src/src-mode.mjs && node --check src/client.js && node --check scripts/invoke-request.mjs && node --check scripts/check-package.mjs && npm test",
     "pack:check": "node scripts/check-package.mjs",
     "test:python": "python -X utf8 -B -m unittest discover -s tests -p \"test_*.py\"",
+    "test:dist": "python -X utf8 -B scripts/verify-python-release.py --dist dist",
     "test:all": "npm test && npm run test:python"
   },
   "dsh": {
@@ -101,9 +109,6 @@
       ],
       "platform": "web"
     }
-  },
-  "dependencies": {
-    "acorn": "8.19.0"
   },
   "//peerDependencies": "SDK 必须由宿主提供，插件绝不能自带：@deepseek-ai/dsh-tools 持有模块级 Symbol（TOOL_RUNTIME_SCHEDULER），出现第二份实例会让宿主自己的 ctx.tools 查不到该 Symbol，进而 crash 整个会话创建。",
   "peerDependencies": {

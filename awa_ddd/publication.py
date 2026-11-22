@@ -4,89 +4,105 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from urllib.parse import unquote
 
+from .error_registry import ERROR_CODES as _ERROR_CODES
+from .error_registry import ERROR_DETAIL_FIELDS
 from .store import EngineError
 
 
 _PRIVATE_CONTENT = "[content omitted: project redaction context unavailable]"
 _PRIVATE_LOCATOR = "[locator omitted: protected project context]"
+_SCHEMA_MISMATCH = object()
 _OPAQUE_LOCATORS = frozenset({_PRIVATE_LOCATOR, "[candidate locator omitted: protected context]",
                             "[private URL omitted]", "[invalid URL]",
                             "[browser content omitted: redaction context unavailable]"})
-_ERROR_CODES = frozenset((
-    "access_policy action action_failed action_name action_reference actor_binding actor_changed actor_independence "
-    "actor_subject analyst_evidence analyst_obligation analyst_review anonymous_cookie argument_missing arguments "
-    "assessment_batch assessment_error assessment_not_started assessment_partial auth authorization_proof authorization_response baseline_identity "
-    "baseline_invalid basis_missing blocked_reason body body_budget body_file browser_actions browser_arguments "
-    "browser_budget browser_execution_blocked browser_failed browser_import browser_observation browser_redaction_context "
-    "browser_unavailable browser_write_not_authorized budget candidate candidate_closure candidate_dismissed candidate_identity "
-    "candidate_input candidate_linked candidate_reason candidate_scope candidate_status checkpoint_stale closure_review config "
-    "consumer continuation_arguments continue_required control_identity control_invalid control_request credential_changed "
-    "credential_context credential_header_names credential_override decision_missing deny_statuses disposition evidence_binding "
-    "evidence_changed evidence_incomplete evidence_missing exclusion family_proof finalization_policy finalization_required "
-    "finalization_stale finding_decision finding_fields finding_immutable finding_lifecycle finding_mode finding_replacement "
-    "frontier_categories frontier_evidence frontier_pages frontier_review frontier_review_required function_id function_missing "
-    "graphql_binding headers headers_file idempotency_conflict identity_assertion identity_selector_boundary identity_mismatch identity_origin "
-    "identity_response identity_stale identity_unverified immutable_record inconclusive independent_evidence input "
-    "input_adapter_blocked input_ambiguous input_binding input_budget input_selector input_schema_branch invalid_input json_assertion mcp_budget mcp_capability "
-    "mcp_closed mcp_error mcp_io mcp_protocol mcp_schema mcp_timeout media_binding method not_found numeric_invariant "
-    "obligation_superseded operation_binding operation_changed operation_effect operation_method operation_name oracle "
-    "oracle_binding oracle_family origin out_of_scope ownership page_adoption_required page_binding page_evidence_invalid "
-    "page_evidence_required page_status page_visit_binding page_visit_incomplete pagination path_escape path_link project_exists "
-    "project_id project_missing protected_selector protected_value protocol reconciliation_context reconciliation_evidence "
-    "record_budget record_id recovery_age remote_execution_unverified renew_missing renew_shape report_stage reproduction_binary "
-    "request resource_ambiguous resource_binding resource_changed resource_mismatch resource_owner resource_unbound response_encoding "
-    "response_json review_material roles roles_mismatch roles_unverified run_active run_uncertain runtime_arguments runtime_backend "
-    "runtime_distribution runtime_encoding runtime_output_budget runtime_path runtime_protocol runtime_timeout scenario_assertion "
-    "scenario_budget scenario_control scenario_extract scenario_failed scenario_preflight scenario_shape scenario_uncertain "
-    "scenario_variable schema_version scope selector sensitivity session_changed session_expired session_ttl severity "
-    "sql_behaviour_proof_required sql_evidence sql_metadata_binding sql_metadata_control sql_metadata_expression sql_metadata_predicate "
-    "sql_metadata_proof sql_metadata_reflection sql_metadata_required sql_metadata_tool sql_metadata_type sql_metadata_value state_action "
-    "state_action_success state_input state_oracle state_order state_proof state_readback state_scenario state_scope state_selector "
-    "step_id stop_policy stop_reason superseded surface_batch target tenant_mismatch test_families timestamp tool_adapter tool_artifact "
-    "tool_artifact_changed tool_artifact_unavailable tool_baseline_changed tool_context_changed tool_dbms tool_effect tool_headers_changed "
-    "tool_identity tool_input tool_input_changed tool_lineage_changed tool_lineage_missing tool_output_budget tool_path tool_profile_changed "
-    "tool_resource_binding tool_run tool_target tool_timeout tscanplus_argument_budget tscanplus_arguments tscanplus_artifact tscanplus_body "
-    "tscanplus_budget tscanplus_configuration tscanplus_context tscanplus_fixture tscanplus_idempotency tscanplus_namespace tscanplus_profile "
-    "tscanplus_project tscanplus_query tscanplus_result tscanplus_tool_error tscanplus_unconfigured unbound_url unsupported_oracle url variable "
-    "wsl_cleanup wsl_deadline wsl_input_budget wsl_io wsl_platform wsl_request xss_input_binding xss_runtime_binding xss_runtime_identity "
-    "xss_runtime_required engine_error publication_failed capture_failed execution_interrupted browser_timeout "
-    "browser_observation_incomplete tool_probe_failed tool_process_failed mcp_start_failed tscanplus_failed tscanplus_probe_failed "
-    "artifact_unreadable completed evidence_invalid execution_failed invalid invalid_operation missing_metadata no_injection multipart_framing "
-    "finding_proof finding_proof_current finding_binding finding_binding_lifecycle finding_binding_channel finding_binding_source finding_binding_duplicate "
-    "page_adoption_failed timeout tool_lineage_invalid wsl_runtime sql_metadata_lineage "
-    "already_preflighted report_redaction_failed"
-    " assessment_mode assessment_mode_mismatch assessment_mode_immutable src_write_denied src_action_denied stopped_at_evidence"
-    " integration_shape integration_budget integration_schema integration_locator integration_redaction integration_identity_conflict"
-).split())
-_ERROR_CODES = _ERROR_CODES | frozenset((
-    "action_catalog capability_profile capability_provider known_case_entry known_case_group known_case_source "
-    "known_case_track route_manifest v2_campaign_missing v2_migration_confirm v2_migration_exists v2_oracle "
-    "v2_report_compare v2_report_final v2_report_path v2_report_stage v2_campaign_state v2_campaign_model "
-    "v2_campaign_exists v2_campaign_not_exhausted v2_campaign_checkpoint v2_campaign_delivery v2_campaign_frozen "
-    "v2_repository_kind v2_repository_record v2_repository_immutable v2_read_only v2_migration_required "
-    "v2_hypothesis_identity v2_hypothesis_transition v2_hypothesis_applicability v2_recipe_controls v2_recipe_effect "
-    "v2_recipe_fixture v2_recipe_variable v2_recipe_override v2_recipe_stale v2_run_transition v2_run_claim "
-    "v2_run_recipe v2_run_verify v2_run_inspect v2_finding_proof v2_finding_review v2_finding_replacement "
-    "v2_review_mechanism v2_review_controls v2_review_observation v2_review_scope v2_review_material v2_review_run "
-    "v2_review_hypothesis v2_review_reviewer v2_review_cross_role v2_review_disposition v2_review_bind "
-    "v2_review_evidence v2_review_identity v2_recon_import v2_write_authorization v2_scheduler_lease v2_fixture_state v2_fixture_lease "
-    "v2_fixture_initial_state v2_oracle_missing v2_browser_marker v2_browser_visit v2_external_receipt v2_external "
-    "v2_coverage v2_campaign_not_ready v2_migration_ledger v2_delivery_reason v2_campaign_state_reason "
-    "v2_recipe_blocked v2_timestamp v2_observe_effect v2_accepted_by v2_campaign_target v2_explanation"
-).split())
 _LOCATOR_KEYS = {"url", "finalUrl", "path", "locator", "schema_locator", "source_locator", "selector",
                  "input_selector", "location", "consumer_url", "source_url", "consumer_locator",
                  "report", "summary", "manifest", "reproduction_dir", "target", "target_origin", "base_url"}
-_HANDLE_PREFIXES = {"operation": {"O"}, "obligation": {"OB"}, "evidence": {"E"}, "decision": {"D"},
-                    "finding": {"F"}, "finding_revision": {"FR"}, "candidate": {"C"}, "run": {"RUN", "SC"},
-                    "page_visit": {"PV"}, "checkpoint": {"CP"}, "closure_review": {"CR"}, "finalization": {"FN"},
-                    "recon_baseline": {"RC"}}
-_HANDLE_PREFIXES.update({"integration_import": {"IMP"}, "v2_run": {"RUN2"}, "v2_finding": {"FND"}})
+_V2_STORE_KINDS = {
+    "campaign": "v2_campaign",
+    "universe": "v2_universe",
+    "hypothesis": "v2_hypothesis",
+    "recipe": "v2_recipe",
+    "v2_run": "v2_run",
+    "review": "v2_review",
+    "applicability_receipt": "v2_applicability_receipt",
+    "proof_receipt": "v2_review_proof_receipt",
+    "review_proof_receipt": "v2_review_proof_receipt",
+    "frontier_receipt": "v2_frontier_receipt",
+    "completion_acceptance": "v2_completion_acceptance",
+    "v2_finding": "v2_finding",
+    "gap": "v2_gap",
+    "v2_checkpoint": "v2_checkpoint",
+    "migration": "v2_migration",
+    "fixture": "v2_fixture",
+}
+_HANDLE_PREFIXES = {
+    "operation": {"O"},
+    "obligation": {"OB"},
+    "evidence": {"E"},
+    "decision": {"D"},
+    "finding": {"F", "FND"},
+    "finding_revision": {"FR"},
+    "candidate": {"C"},
+    "run": {"RUN", "SC", "RUN2"},
+    "page_visit": {"PV"},
+    "checkpoint": {"CP", "CP2"},
+    "closure_review": {"CR"},
+    "finalization": {"FN"},
+    "recon_baseline": {"RC"},
+    "campaign": {"CAM"},
+    "universe": {"UNI"},
+    "hypothesis": {"HYP"},
+    "recipe": {"REC"},
+    "review": {"REV"},
+    "gap": {"GAP"},
+    "applicability_receipt": {"ARC"},
+    "proof_receipt": {"PRC"},
+    "migration": {"MIG"},
+    "fixture": {"FX"},
+}
+_HANDLE_PREFIXES.update({"integration_import": {"IMP"}, "v2_run": {"RUN2"}, "v2_finding": {"FND"},
+                         "review_proof_receipt": {"RPR"}})
+_HANDLE_PREFIXES.update({"discovery_source": {"DS"}, "discovery_snapshot": {"DSS"}, "discovery_item": {"DI"}})
+_HANDLE_PREFIXES.update({"storage_migration": {"SMIG"}, "execution_reconciliation": {"REC"},
+                         "execution_dispatch": {"DSP"}})
+_HANDLE_PREFIXES.update({"frontier_receipt": {"FRC"}, "completion_acceptance": {"CDA", "CA"}})
 _LOCAL_ID_KINDS = {"actor", "session", "resource", "page", "function"}
 _LOCAL_PREFIXES = {"actor": "ACT", "session": "SES", "resource": "RES", "page": "PG", "function": "FN"}
+
+
+def _record_store_kind(kind, identity):
+    """Choose the ledger from the actual versioned namespace in ``identity``."""
+    value = identity if isinstance(identity, str) else ""
+    if kind == "review_proof_receipt":
+        return (
+            "review_proof_receipt"
+            if re.fullmatch(r"RPR-[a-f0-9]{64}", value)
+            else "v2_review_proof_receipt"
+        )
+    if kind == "frontier_receipt":
+        return (
+            "frontier_receipt"
+            if re.fullmatch(r"FRC-[a-f0-9]{64}", value)
+            else "v2_frontier_receipt"
+        )
+    if kind == "completion_acceptance":
+        return (
+            "completion_acceptance"
+            if re.fullmatch(r"CA-[a-f0-9]{64}", value)
+            else "v2_completion_acceptance"
+        )
+    if kind == "checkpoint":
+        return "checkpoint" if value.startswith("CP-") else "v2_checkpoint"
+    if kind == "run":
+        return "v2_run" if value.startswith("RUN2-") else "run"
+    if kind == "finding":
+        return "v2_finding" if value.startswith("FND-") else "finding"
+    return _V2_STORE_KINDS.get(kind, kind)
 
 
 @dataclass(frozen=True)
@@ -100,12 +116,32 @@ class _Many:
     item: object
 
 
+@dataclass(frozen=True)
+class _Closed:
+    """An allowlisted object even when project redaction context is available."""
+
+    fields: dict
+    additional: object = None
+
+
+@dataclass(frozen=True)
+class _Tuple:
+    """A fixed-position array whose members retain their individual schemas."""
+
+    items: tuple
+
+
 _TEXT = _Rule("text")
+_TEXT_PAGE = _Rule("text_page")
 _COUNT = _Rule("count")
 _BOOL = _Rule("bool")
 _RATIO = _Rule("ratio")
 _NUMBER = _Rule("number")
 _SHA256 = _Rule("hex", 64)
+_IDENTITY_PATH = _Rule("identity_path")
+_IDENTIFIER = _Rule("identifier")
+_ARTIFACT = _Rule("artifact_handle")
+_NULLABLE_COUNT = _Rule("nullable_count")
 
 
 def _enum(*values):
@@ -118,6 +154,14 @@ def _handle(kind):
 
 def _digest(prefix, length=24):
     return _Rule("digest", (prefix, length))
+
+
+def _one_of(*rules):
+    return _Rule("one_of", tuple(rules))
+
+
+def _nullable(rule):
+    return _Rule("nullable", rule)
 
 
 def _fields(names, rule=_TEXT):
@@ -192,7 +236,7 @@ class PublicationContext:
         self.redactor._pattern = re.compile(_PLACEHOLDER.pattern + "|" + "|".join(
             re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))) if aliases else None
 
-    def _prose(self, text):
+    def _prose(self, text, limit=4000):
         if any(self.unavailable.values()):
             return _PRIVATE_CONTENT
         decoded = text
@@ -207,12 +251,15 @@ class PublicationContext:
             return "[content omitted: protected decoding context]"
         self.redactor.learn_text(text)
         self._literal_pattern()
-        return self.redactor.prose(text)
+        return self.redactor.prose(text, limit=limit)
 
     def _record(self, kind, identity):
-        if kind not in self._records:
-            self._records[kind] = {row["id"]: row for row in self.project.list(kind)}
-        return self._records[kind].get(identity)
+        store_kind = _record_store_kind(kind, identity)
+        if store_kind not in self._records:
+            self._records[store_kind] = {
+                row["id"]: row for row in self.project.list(store_kind)
+            }
+        return self._records[store_kind].get(identity)
 
     def bound_handle(self, kind, value):
         if not isinstance(value, str):
@@ -235,25 +282,186 @@ class PublicationContext:
             return generated and self._record(kind, value) is not None
         if kind == "gap":
             from .engine import _gap_id
+            if re.fullmatch(r"GAP-[a-f0-9]{24}", value) is not None:
+                return self._record("gap", value) is not None
             return any(_gap_id(row) == value for row in self.project.list("obligation"))
+        if kind == "run":
+            if re.fullmatch(r"RUN2-(?:EXT-)?[a-f0-9]{24}", value) is not None:
+                return self._record("v2_run", value) is not None
+        if kind == "finding" and re.fullmatch(r"FND-[a-f0-9]{24}", value) is not None:
+            return self._record("v2_finding", value) is not None
+        if kind == "checkpoint" and re.fullmatch(r"CP2-[a-f0-9]{24}", value) is not None:
+            return self._record("v2_checkpoint", value) is not None
+        if kind in {
+            "review_proof_receipt",
+            "frontier_receipt",
+            "completion_acceptance",
+        }:
+            if kind == "review_proof_receipt":
+                if re.fullmatch(r"RPR-[a-f0-9]{64}", value):
+                    return self._record(kind, value) is not None
+                if re.fullmatch(r"RPR-[a-f0-9]{24}", value):
+                    return self._record(kind, value) is not None
+                return False
+            if kind == "frontier_receipt":
+                if re.fullmatch(r"FRC-[a-f0-9]{64}", value):
+                    return self._record(kind, value) is not None
+                if re.fullmatch(r"FRC-[a-f0-9]{24}", value):
+                    return self._record(kind, value) is not None
+                return False
+            if re.fullmatch(r"CA-[a-f0-9]{64}", value):
+                return self._record(kind, value) is not None
+            if re.fullmatch(r"(?:CA|CDA)-[a-f0-9]{24}", value):
+                return self._record(kind, value) is not None
+            return False
+        if kind in {"storage_migration", "execution_reconciliation",
+                    "execution_dispatch"}:
+            prefix = {"storage_migration": "SMIG",
+                      "execution_reconciliation": "REC",
+                      "execution_dispatch": "DSP"}[kind]
+            return re.fullmatch(re.escape(prefix) + r"-[a-f0-9]{64}", value) is not None \
+                and self._record(kind, value) is not None
+        record_kind = {
+            "universe": "universe",
+            "campaign": "campaign",
+            "hypothesis": "hypothesis",
+            "recipe": "recipe",
+            "review": "review",
+            "applicability_receipt": "applicability_receipt",
+            "proof_receipt": "proof_receipt",
+            "frontier_receipt": "frontier_receipt",
+            "completion_acceptance": "completion_acceptance",
+            "v2_run": "v2_run",
+            "v2_finding": "v2_finding",
+        }.get(kind, kind)
         prefixes = _HANDLE_PREFIXES.get(kind, set())
         return any(re.fullmatch(re.escape(prefix) + r"-[a-f0-9]{24,32}", value) for prefix in prefixes) \
-            and self._record(kind, value) is not None
+            and self._record(record_kind, value) is not None
+
+    def _matches(self, value, schema, row=None, *, allow_unknown=False):
+        """Return whether ``value`` has the shape required by a restoration rule."""
+
+        if isinstance(schema, _Rule):
+            return self._typed(value, schema, row)
+        if isinstance(schema, _Closed):
+            if not isinstance(value, dict):
+                return False
+            fields = schema.fields
+            additional = schema.additional
+        elif isinstance(schema, dict):
+            if not isinstance(value, dict):
+                return False
+            fields = schema
+            additional = None
+        elif isinstance(schema, _Many):
+            return isinstance(value, list) and all(
+                self._matches(
+                    item,
+                    schema.item,
+                    item if isinstance(item, dict) else row,
+                    allow_unknown=allow_unknown,
+                )
+                for item in value
+            )
+        elif isinstance(schema, _Tuple):
+            return (
+                isinstance(value, list)
+                and len(value) == len(schema.items)
+                and all(
+                    self._matches(
+                        item,
+                        item_schema,
+                        item if isinstance(item, dict) else row,
+                        allow_unknown=allow_unknown,
+                    )
+                    for item, item_schema in zip(value, schema.items)
+                )
+            )
+        else:
+            return False
+        for key, item in value.items():
+            child = fields.get(key, additional)
+            if child is None:
+                if allow_unknown:
+                    continue
+                return False
+            if not self._matches(
+                    item,
+                    child,
+                    value,
+                    allow_unknown=allow_unknown):
+                return False
+        return True
+
+    def _resolve_schema(self, value, schema, row=None):
+        """Select a union/nullable branch before applying a closed allowlist."""
+
+        if not isinstance(schema, _Rule):
+            return schema
+        if schema.kind == "nullable":
+            if value is None:
+                return schema
+            return self._resolve_schema(value, schema.values, row)
+        if schema.kind != "one_of":
+            return schema
+        matches = [
+            option
+            for option in schema.values
+            if self._matches(value, option, row, allow_unknown=True)
+        ]
+        if len(matches) != 1:
+            return _SCHEMA_MISMATCH
+        return self._resolve_schema(value, matches[0], row)
 
     def _typed(self, value, rule, row=None):
         if rule.kind == "record_timestamp":
             return self._record_timestamp(value, rule.values, row)
+        if rule.kind == "nullable_count":
+            return value is None or (type(value) is int and value >= 0)
+        if rule.kind == "nullable":
+            return value is None or self._matches(value, rule.values, row)
+        if rule.kind == "one_of":
+            return any(
+                self._matches(value, option, row, allow_unknown=True)
+                for option in rule.values
+            )
+        if rule.kind == "0":
+            return type(value) is int and value == 0
         if value is None:
             return rule.kind not in {"count", "bool", "hex", "digest"}
         if rule.kind == "count":
             return type(value) is int and value >= 0
         if rule.kind == "bool":
             return type(value) is bool
+        if rule.kind in {"text", "text_page", "artifact_handle"}:
+            return isinstance(value, str)
         if rule.kind in {"true", "false"}:
             return value is (rule.kind == "true")
         if rule.kind in {"ratio", "number"}:
             return type(value) in {int, float} and (type(value) is int or math.isfinite(value)) \
                 and (0 <= value <= 1 if rule.kind == "ratio" else value >= 0)
+        if rule.kind == "text_or_string_list":
+            return isinstance(value, str) or (
+                isinstance(value, list)
+                and all(isinstance(item, str) for item in value)
+            )
+        if rule.kind == "identifier":
+            return isinstance(value, str) and re.fullmatch(
+                r"[A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+", value
+            ) is not None
+        if rule.kind == "json_value":
+            if value is None or isinstance(value, (str, bool, int)):
+                return True
+            if isinstance(value, float):
+                return math.isfinite(value)
+            if isinstance(value, list):
+                return all(self._typed(item, rule, row) for item in value)
+            return isinstance(value, dict) and all(
+                isinstance(key, str) and self._typed(item, rule, row)
+                for key, item in value.items()
+            )
+        if rule.kind == "any":
+            return True
         if rule.kind == "enum":
             return isinstance(value, str) and value in rule.values
         if rule.kind == "handle":
@@ -302,7 +510,47 @@ class PublicationContext:
                                     r"tools/RUN-[a-f0-9]{24,32}/(?:stdout\.log|stderr\.log|traffic\.log|mcp-exchanges\.json)", path):
                                 self._paths.add(path)
             return value in self._paths
+        if rule.kind == "identity_path":
+            if not isinstance(value, str) or not value or len(value) > 4096 \
+                    or any(ord(character) < 32 for character in value):
+                return False
+            if not (PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute()):
+                return False
+            # Identity paths are useful only when they are not also learned
+            # project secrets.  A collision is redacted rather than restored.
+            return not any(len(secret) >= 4 and secret in value for secret in self.redactor.values)
+        if rule.kind == "artifact_handle":
+            return isinstance(value, str) and self._artifact_handle(value) != _PRIVATE_LOCATOR
         return False
+
+    def _artifact_handle(self, value):
+        """Project managed project artifacts as stable handles instead of host paths."""
+        if not isinstance(value, str) or not value:
+            return _PRIVATE_LOCATOR
+        if value.startswith("artifact://"):
+            from .report_artifacts import managed_artifact_handle_valid
+
+            return value if managed_artifact_handle_valid(self.project, value) else _PRIVATE_LOCATOR
+        # A URL is a locator, never a project filesystem artifact.
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
+            return _PRIVATE_LOCATOR
+        try:
+            path = PureWindowsPath(value) if re.match(r"^[A-Za-z]:[\\/]", value) else PurePosixPath(value)
+            parts = [part for part in path.parts if part not in {"/", "\\"}]
+            marker = next((index for index, part in enumerate(parts) if part in {
+                "artifacts", "reports", "evidence", "browser", "tools", "materials",
+            }), None)
+            if marker is None or marker == len(parts) - 1:
+                return _PRIVATE_LOCATOR
+            from .report_artifacts import handle_for_path
+
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = self.project.base / candidate
+            handle = handle_for_path(self.project, candidate)
+            return handle or _PRIVATE_LOCATOR
+        except (TypeError, ValueError):
+            return _PRIVATE_LOCATOR
 
     def _record_timestamp(self, value, reference, row):
         if not isinstance(value, str) or not isinstance(row, dict) or re.fullmatch(
@@ -329,25 +577,121 @@ class PublicationContext:
             "kind", "actor_id", "session_id", "session_generation", "generation", "operation_id", "resource_id")
             if key in row and key not in keys)
 
-    def _restore(self, original, public, schema):
+    def _restore_value(self, original, public, schema, scrubbed=None, *, row=None):
+        """Restore only schema-typed control values after public redaction."""
+
+        if (
+            not isinstance(original, (dict, list))
+            and type(original) is type(public)
+            and original == public
+        ):
+            # Preserve the warm-read fast path: an unchanged scalar cannot
+            # expose a new byte, so no ledger validation is needed.
+            return public
+        additional = None
+        if isinstance(schema, _Closed):
+            additional = schema.additional
+            schema = schema.fields
+        if isinstance(schema, _Rule):
+            if schema.kind in {"nullable", "one_of"}:
+                if original is None:
+                    return public
+                selected = self._resolve_schema(original, schema, row)
+                if selected is _SCHEMA_MISMATCH or selected is schema:
+                    return public
+                return self._restore_value(
+                    original,
+                    public,
+                    selected,
+                    scrubbed,
+                    row=row,
+                )
+            if schema.kind in {"json_value", "any"}:
+                # These rules describe arbitrary containers. They may select a
+                # union branch, but their contents must retain the public scrub.
+                return public
+            if schema.kind == "text_page" and isinstance(scrubbed, str) and isinstance(public, str):
+                # The scrubber already applied the public redactor at the
+                # larger page limit. A second generic-text pass must not
+                # silently shorten a page and invalidate its offset contract.
+                return scrubbed
+            if schema.kind in {"text", "text_or_string_list", "artifact_handle"}:
+                return public
+            if self._matches(original, schema, row):
+                return original
+            return public
         if isinstance(schema, dict) and isinstance(original, dict) and isinstance(public, dict):
+            restored = dict(public)
             for key, rule in schema.items():
                 if key not in original or key not in public:
                     continue
-                if isinstance(rule, _Rule):
-                    if type(original[key]) is type(public[key]) and not isinstance(original[key], (dict, list)) and original[key] == public[key]:
+                restored[key] = self._restore_value(
+                    original[key],
+                    public[key],
+                    rule,
+                    scrubbed.get(key) if isinstance(scrubbed, dict) else None,
+                    row=original,
+                )
+            if additional is not None:
+                for key in original:
+                    if key in schema or key not in public:
                         continue
-                    if rule.kind != "text" and self._typed(original[key], rule, original):
-                        public[key] = original[key]
-                else:
-                    self._restore(original[key], public[key], rule)
-        elif isinstance(schema, _Many) and isinstance(original, list) and isinstance(public, list):
+                    restored[key] = self._restore_value(
+                        original[key],
+                        public[key],
+                        additional,
+                        scrubbed.get(key) if isinstance(scrubbed, dict) else None,
+                        row=original,
+                    )
+            return restored
+        if isinstance(schema, _Many) and isinstance(original, list) and isinstance(public, list):
+            restored = list(public)
             for index, (value, sanitized) in enumerate(zip(original, public)):
-                if isinstance(schema.item, _Rule):
-                    if schema.item.kind != "text" and self._typed(value, schema.item):
-                        public[index] = value
-                else:
-                    self._restore(value, sanitized, schema.item)
+                restored[index] = self._restore_value(
+                    value,
+                    sanitized,
+                    schema.item,
+                    scrubbed[index]
+                    if isinstance(scrubbed, list) and index < len(scrubbed)
+                    else None,
+                    row=value if isinstance(value, dict) else row,
+                )
+            return restored
+        if isinstance(schema, _Tuple) and isinstance(original, list) and isinstance(public, list):
+            restored = list(public)
+            for index, item_schema in enumerate(schema.items):
+                if index >= len(original) or index >= len(public):
+                    break
+                restored[index] = self._restore_value(
+                    original[index],
+                    public[index],
+                    item_schema,
+                    scrubbed[index]
+                    if isinstance(scrubbed, list) and index < len(scrubbed)
+                    else None,
+                    row=(
+                        original[index]
+                        if isinstance(original[index], dict)
+                        else row
+                    ),
+                )
+            return restored
+        return public
+
+    def _restore(self, original, public, schema, scrubbed=None):
+        restored = self._restore_value(
+            original,
+            public,
+            schema,
+            scrubbed,
+            row=original,
+        )
+        if isinstance(public, dict) and isinstance(restored, dict):
+            public.clear()
+            public.update(restored)
+        elif isinstance(public, list) and isinstance(restored, list):
+            public[:] = restored
+        return public
 
     def metadata(self, value, *, schema=None):
         from .reporting import _PRIVATE_KEYS, public_integrity_metadata, safe_metadata
@@ -359,7 +703,15 @@ class PublicationContext:
         missing = any(self.unavailable.values())
 
         def scrub(node, shape):
+            resolved = self._resolve_schema(node, shape)
+            if resolved is _SCHEMA_MISMATCH:
+                return _PRIVATE_CONTENT if node is not None else None
+            shape = resolved
             if isinstance(node, dict):
+                closed = isinstance(shape, _Closed)
+                additional = shape.additional if closed else None
+                if closed:
+                    shape = shape.fields
                 result = {}
                 protected = False
                 redacted_fields = set()
@@ -367,10 +719,10 @@ class PublicationContext:
                 for key, item in node.items():
                     if re.sub(r"[^a-z0-9]", "", str(key).lower()) in _PRIVATE_KEYS:
                         continue
-                    if missing and key not in known:
+                    if (missing or closed) and key not in known and additional is None:
                         continue
                     public_key = key if key in known else self._prose(str(key))
-                    result[public_key] = scrub(item, known.get(key))
+                    result[public_key] = scrub(item, known.get(key, additional))
                     opaque = key in known and isinstance(item, str) and item in _OPAQUE_LOCATORS and any(
                         node.get(flag) is True for flag in (key + "_redacted", "locator_requires_binding", "native_input_requires_binding"))
                     if opaque:
@@ -381,7 +733,8 @@ class PublicationContext:
                     changed_locator = key in _LOCATOR_KEYS and not control and isinstance(item, str) and result[public_key] != item
                     changed_shape = key in {"path_shape", "scope", "exclude", "navigation_trail"} \
                         and isinstance(item, list) and result[public_key] != item
-                    if changed_locator or changed_shape:
+                    artifact_control = isinstance(rule, _Rule) and rule.kind == "artifact_handle"
+                    if (changed_locator and not artifact_control) or changed_shape:
                         protected = True
                         redacted_fields.add(public_key + "_redacted")
                         if changed_locator:
@@ -393,9 +746,19 @@ class PublicationContext:
                     result.update(locator_requires_binding=True, native_input_requires_binding=True, requestable=False)
                 return result
             if isinstance(node, list):
+                if isinstance(shape, _Tuple):
+                    return [
+                        scrub(item, shape.items[index]
+                              if index < len(shape.items) else None)
+                        for index, item in enumerate(node)
+                    ]
                 child = shape.item if isinstance(shape, _Many) else None
                 return [scrub(item, child) for item in node]
             if isinstance(node, str):
+                if isinstance(shape, _Rule) and shape.kind == "artifact_handle":
+                    return self._artifact_handle(node)
+                if isinstance(shape, _Rule) and shape.kind == "text_page":
+                    return self._prose(node, limit=8000)
                 return self._prose(node)
             if missing and node is not None:
                 return _PRIVATE_CONTENT
@@ -410,8 +773,9 @@ class PublicationContext:
                     return numeric[node]
             return node
 
-        public = safe_metadata(scrub(original, schema), preserve_placeholders=set(self.redactor.values.values()))
-        self._restore(original, public, schema)
+        scrubbed = scrub(original, schema)
+        public = safe_metadata(scrubbed, preserve_placeholders=set(self.redactor.values.values()))
+        self._restore(original, public, schema, scrubbed=scrubbed)
         if missing and isinstance(public, dict):
             public["redaction_context_status"] = "unavailable"
             public["redaction_context_unavailable"] = {
@@ -422,6 +786,7 @@ class PublicationContext:
 
 def _schemas():
     from .contracts import CONTRACTS, ALL_CONTRACTS
+    from .domain.receipt import DEPENDENCY_KINDS
     from .engine import TEST_FAMILIES
 
     action = _enum(*ALL_CONTRACTS)
@@ -429,6 +794,41 @@ def _schemas():
     method = _enum("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
     auth = _enum("public", "authenticated", "restricted", "unknown")
     state = _enum("open", "blocked", "not_applicable", "evaluated")
+    json_value = _Rule("json_value")
+    selected_tool_schema = _one_of(_TEXT, _Closed({
+        "name": _TEXT,
+        "description": _nullable(_TEXT),
+        "inputSchema": json_value,
+        "annotations": json_value,
+    }))
+    capability_schema = _Closed({
+        "provider": _enum("playwright", "yakit", "tscanplus", "sqlmap"),
+        "installed": _BOOL, "configured": _BOOL, "catalog_verified": _BOOL,
+        "profile_supported": _BOOL, "authorized": _BOOL, "ready": _BOOL,
+        "unavailable_reasons": _Many(_TEXT),
+        "evidence": _Closed({"probe_run_id": _handle("run")}),
+        "profiles": _Many(_TEXT), "limitations": _Many(_TEXT),
+        "configuration": _Many(_TEXT),
+    })
+    capabilities_schema = _Closed({
+        "providers": _Many(capability_schema),
+        "policy": _TEXT,
+        "requests_sent": _Rule("0"),
+    })
+    count_map = _Closed({}, additional=_COUNT)
+    unknown_counts = _Closed({
+        **_fields(
+            "registered_operation_total page_total function_total "
+            "unknown_consumer_total unregistered_route_total "
+            "truncated_source_total",
+            _COUNT,
+        ),
+        "source_inventory_complete": _BOOL,
+        "source_inventory_summary": count_map,
+    }, additional=_COUNT)
+    source_counts = _Closed({
+        **_fields("obligations decisions findings operations", _COUNT),
+    }, additional=_COUNT)
     prerequisite = _enum("authorized_operation_scope", "exact_scoped_url_query_binding", "live_verified_session_for_actor",
         "verified_session_for_target_origin", "verified_allowed_baseline", "live_verified_owner_baseline", "server_verified_role_membership",
         "live_verified_allowed_session", "declared_access_policy", "concrete_url_with_bound_path_values", "project_allow_mutation",
@@ -439,11 +839,13 @@ def _schemas():
         "concrete_same_identity_consumer_url", "relevant_selectors_and_actions", "exact_scoped_consumer_url_with_bound_values",
         "actual_function_selectors_and_actions", "valid_scoped_page_url", "exact_scoped_page_url_with_bound_values",
         "stopped_at_evidence", "src_write_denied")
-    page = {**_fields("offset limit next_offset", _COUNT), "next_action": action}
+    page = {**_fields("offset limit next_offset", _COUNT), "cursor": _TEXT, "projection_revision": _COUNT,
+            "next_action": action}
     pending_names = "open_obligations open_security_obligations unresolved_candidates unassessed_observations " \
                     "unlinked_analyst_findings unrecorded_confirmations orphan_browser_visits pages_unvisited " \
                     "functions_untriggered unreconciled_runs failed_partial_tools applicability_review_total " \
-                    "scope_reduction_review_total limited_ownership_sampling"
+                    "scope_reduction_review_total limited_ownership_sampling unimported_source_items " \
+                    "source_conflict_total source_unresolved_total"
     completion = {**_fields(pending_names, _COUNT), "status": _enum("complete", "partial", "not_started"),
                   "registered_scope_only": _BOOL, **_fields("label_zh reasons_zh limitations_zh")}
     remaining = _fields("ready_total review_total blocked_total unresolved_total", _COUNT)
@@ -456,13 +858,44 @@ def _schemas():
         "reason_code": _enum("work_remaining", "blocked_preconditions", "coverage_incomplete", "frontier_review_required",
                              "registered_scope_exhausted", "no_closure_progress", "inventory_missing", "completed"),
         "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64), "semantic_progress_id": _digest("PR", 64),
-        "checkpoint_id": _handle("checkpoint"), "finalization_id": _handle("finalization")}
+        "checkpoint_id": _handle("checkpoint"), "finalization_id": _handle("finalization"),
+        "frontier_receipt_id": _handle("frontier_receipt"),
+        "partial_acceptance_id": _handle("completion_acceptance"),
+        "frontier_dependency_hash": _digest("FRD", 64)}
+    completion_decision = {
+        "schema": _enum("awa-completion/v1"), "model": _enum("v1", "v2"), "subject_id": _TEXT,
+        "state": _enum("complete_for_declared_scope", "partial_available", "partial_accepted", "blocked"),
+        "counts": _fields("ready review blocked unresolved effect_unknown", _COUNT),
+        **_fields("material_current source_complete frontier_current can_finalize can_claim_complete finalized "
+                  "partial_report_allowed registered_scope_only site_wide_discovery_allowed continue_required "
+                  "checkpoint_current checkpoint_stale", _BOOL),
+        "reason_codes": _Many(_enum(
+            "ready", "review", "blocked", "unresolved", "effect_unknown",
+            "declared_scope_missing", "coverage_incomplete", "frontier_review_required",
+            "material_not_current", "source_incomplete", "checkpoint_stale", "authorized_stop")),
+        "next_action": action, "id": _digest("CD", 64), "created_at": _TEXT,
+    }
+    continuation["completion_decision"] = completion_decision
+    campaign_completion_decision = _Closed(completion_decision)
+    continuation.update({
+        "effect_unknown_total": _COUNT,
+        "recoverable_total": _COUNT,
+        "frontier_receipt_ids": _Many(_handle("frontier_receipt")),
+        "latest_checkpoint_id": _handle("checkpoint"),
+        "next_step": action,
+    })
+    campaign_continuation = _Closed({
+        **continuation,
+        "completion_decision": campaign_completion_decision,
+        "coverage_status": _enum("complete", "partial", "exhausted", "not_started"),
+    })
     bucket = {**_fields("total evaluated open blocked not_applicable", _COUNT), "ratio": _RATIO}
     security = {**bucket, **_fields("operations_total operations_with_security_tests operations_complete operations_without_security_tests", _COUNT),
                 "by_family": _Many({**bucket, "test_family": family, "label_zh": _TEXT,
                                     "status": _enum("not_planned", "open", "blocked", "not_applicable", "completed", "review_required")}), "note_zh": _TEXT}
     surface_coverage = {**_fields("operations_total operations_tested inputs_total inputs_tested", _COUNT), "ratio": _RATIO, "note": _TEXT}
     methods = {"path_shape": _Many(_TEXT), "auth": auth, "operations": _Many(_handle("operation")), "note": _TEXT,
+               **_fields("operations_total operation_offset operation_limit operation_next_offset", _COUNT),
                **{name: _Many(method) for name in ("tested", "registered_methods", "observed_methods", "untested_registered_methods", "untested_siblings")}}
     binding = {"location": _enum("path", "query", "body"), "selector": _TEXT}
     resource = {**_fields("external_id tenant_id state request_binding created_at"), "request_binding": binding,
@@ -479,6 +912,68 @@ def _schemas():
                  "id": _handle("operation"), "method": method, "protocol": _enum("http", "graphql"), "auth": auth,
                  "ownership": _BOOL, "state_scope": _enum("actor"), "input_count": _COUNT,
                  "inputs_truncated": _BOOL, "inputs": _Many(input_row)}
+    source_format = _enum("openapi", "javascript", "har", "artex", "sarif", "assessment_hints", "actuator_mappings",
+                          "tscanplus_results", "tscanplus_routes")
+    source_status = _enum("any", "pending_import", "registered", "needs_binding", "conflict", "rejected", "candidate")
+    source_reason = _enum(*sorted(_ERROR_CODES), "invalid_pattern", "encoded_placeholder", "encoded_wildcard",
+        "wildcard_pattern", "regex_pattern", "partial_segment", "duplicate_variable",
+        *("actuator_mapping_" + suffix for suffix in ("invalid_pattern", "encoded_placeholder", "encoded_wildcard",
+            "wildcard_pattern", "regex_pattern", "partial_segment", "duplicate_variable", "missing_structured",
+            "invalid_method", "missing_method_and_pattern", "missing_method", "missing_pattern", "method_requires_binding")))
+    source_inventory = {**_fields("source_total snapshot_total source_item_total known_route_total registered_route_total "
+                                 "known_not_registered_total pending_import_total needs_binding_total conflict_total rejected_total "
+                                 "candidate_total unresolved_total historical_pending_total", _COUNT),
+        "completeness_level": _enum("source_inventory", "provider_inventory", "declared_only"),
+        "site_wide_discovery_allowed": _Rule("false")}
+    source_limitations = _Many(_fields("code locator message"))
+    provider_query_budget = {
+        **_fields("control_tool_calls target_requests result_limit timeout_seconds", _COUNT),
+    }
+    provider_receipt = {
+        "provider": _enum("tscanplus"), "profile_version": _COUNT,
+        "source_kind": _enum("results", "routes"), "source_sha256": _SHA256,
+        "server_version": _TEXT,
+        "protocol_version": _enum("2025-03-26"),
+        "catalog_sha256": _SHA256, "tool_schema_sha256": _SHA256, "input_sha256": _SHA256,
+        "tool_name": _TEXT,
+        "table": _enum("ipscan", "urlscan", "poccheck", "pwdcrack", "dirscan", "jsfinder", "subdomain", "cyber", "info"),
+        "instance_id": _TEXT,
+        **_fields("reported_count reported_total reported_matched returned_count processed_count unretrieved_count", _COUNT),
+        **_fields("truncated results_complete namespace_verified instance_verified remote_may_continue dispatch_attempted active_scan_started", _BOOL),
+        "remote_cursor": _enum(None), "query_budget": provider_query_budget,
+        "artifact_sha256": _SHA256, "captured_at": _TEXT,
+        "capture_run_id": _handle("run"),
+    }
+    provider_inventory = {
+        "provider": _enum("tscanplus"), "provider_profile_version": _COUNT,
+        "source_kind": _enum("results", "routes"),
+        "table": _enum("ipscan", "urlscan", "poccheck", "pwdcrack", "dirscan", "jsfinder", "subdomain", "cyber", "info"),
+        **_fields("result_total reported_count returned_count processed_count unretrieved_count", _COUNT),
+        **_fields("truncated results_complete namespace_verified instance_verified", _BOOL),
+        "remote_cursor": _enum(None), "control_tool_calls": _COUNT, "target_requests_sent": _COUNT,
+        "completeness": _enum("provider_inventory"), "site_wide_discovery_allowed": _Rule("false"),
+        "provider_receipt": provider_receipt, "capture_run_id": _handle("run"),
+    }
+    mapping_inventory = {**_fields("mapping_total handler_total route_total path_template_total unresolved_mapping_total", _COUNT),
+        "method_counts": {name: _COUNT for name in ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE")},
+        "completeness": _enum("source_inventory"), "site_wide_discovery_allowed": _Rule("false")}
+    snapshot_inventory = {**mapping_inventory, **provider_inventory}
+    snapshot_inventory["completeness"] = _enum("source_inventory", "provider_inventory")
+    source_item = {"source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+        "source_item_id": _handle("discovery_item"), "item_kind": _enum("operation", "candidate"), "status": source_status,
+        "operation_id": _handle("operation"), "candidate_id": _handle("candidate"),
+        **_fields("url operation_name content_type conflict_fields"), "method": _enum("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE"),
+        "protocol": _enum("http", "graphql"), "reason_code": source_reason,
+        **_fields("current_snapshot pending_import needs_binding path_template inputs_truncated", _BOOL),
+        "native_input_requires_binding": _Rule("true"), "requestable": _Rule("false"),
+        "input_count": _COUNT, "inputs": _Many(input_row),
+        "automatic_execution_allowed": _Rule("false"), "usable_for_confirmation": _Rule("false"),
+        "disposition": _enum("created", "updated", "reused", "candidate_created", "candidate_reused", "rejected", "not_applied")}
+    source_record = {"id": _handle("discovery_source"), "format": source_format, **_fields("path base_url"),
+        "latest_snapshot_id": _handle("discovery_snapshot"), **_record_timestamps("discovery_source", "created_at")}
+    source_snapshot = {"id": _handle("discovery_snapshot"), "source_id": _handle("discovery_source"), "format": source_format,
+        "sha256": _SHA256, "normalized_sha256": _SHA256, **_fields("parser_version byte_count", _COUNT), "inventory": snapshot_inventory,
+        "limitations": source_limitations, **_record_timestamps("discovery_snapshot", "created_at")}
     parameter_state = _enum("consumer_review", "tested", "observed_unassessed", "observation_limited", "needs_controls", "unobserved")
     parameter_identity = {**_fields("input_name input_selector schema_branch"), "id": _digest("PC"),
         "operation_id": _handle("operation"), "input_location": input_row["location"], "test_family": _enum("unclassified", "access_control", *TEST_FAMILIES)}
@@ -524,11 +1019,12 @@ def _schemas():
                 "resource_id": _handle("resource"), "actor_id": _handle("actor"), "page_visit_id": _handle("page_visit"),
                 "runtime_visit_id": _handle("page_visit"), "evidence_ids": _Many(_handle("evidence")),
                 "effect": _enum("read_only", "test_resource_write"), "input_location": input_row["location"],
-                "status": _enum("reopen", "open", "blocked", "not_applicable"), "mode": _enum("analyst", "machine"),
+                "status": _enum("reopen", "open", "blocked", "not_applicable"), "mode": _enum("analyst", "machine", "preview", "apply"),
                 "name": action, "allow_write": _BOOL, "timeout": _NUMBER, "max_bytes": _COUNT}
     template.update({"evidence_id": _handle("evidence"), "run_id": _handle("run"), "candidate_id": _handle("candidate"),
                      "finding_id": _handle("finding"), "decision_id": _handle("decision"), "checklist_id": _Rule("checklist"),
-                     "page_id": _handle("page"), "function_id": _handle("function"), "reason": _TEXT})
+                     "page_id": _handle("page"), "function_id": _handle("function"), "reason": _TEXT,
+                     "source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot")})
     browser_policy = {**_fields("reason_codes unsupported_by_native required_input_fields observation_requirements consumer_locator "
                                 "browser_handoff_note source limitation"),
         **_fields("must_call_playwright proof_requires_browser native_supported call_needed invoke_now execution_blocked hints_only usable_for_confirmation", _BOOL),
@@ -548,7 +1044,7 @@ def _schemas():
             "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_review_required": _BOOL,
             "controls_are_candidates_only": _Rule("true"), "preparation_actions": _Many(preparation), "session_continuity": session_continuity,
             "session_renewal_candidates": _Many(renewal_candidate),
-            **_fields("observation_total", _COUNT), **_fields("execution_blocked hints_only blocker_reconciliation_required scope_binding_review_required", _BOOL),
+            **_fields("observation_total", _COUNT), **_fields("repeat_advisory execution_blocked hints_only blocker_reconciliation_required scope_binding_review_required", _BOOL),
             "url_requires_binding": _Rule("true"), "scope_binding_followup_action": _enum("http.preflight"),
             "scope_binding_required_input_fields": _Many(_enum("url")),
             "scope_binding_followup_template": {"operation_id": _handle("operation")}, "scope_handoff_note": _TEXT,
@@ -559,16 +1055,20 @@ def _schemas():
             "evidence_ids": _Many(_handle("evidence")), "declared_test_families": _Many(family), "suggested_test_families": _Many(family)}
     checklist = {**work, **_fields("label_zh reason_zh detail_zh"),
                  "kind": _enum("obligation", "candidate", "unassessed_observation", "failed_partial_tool", "unreconciled_run",
-                               "orphan_browser_visit", "unlinked_analyst_finding", "unrecorded_confirmation", "unverified_applicability", "scope_reduction", "consumer_family_required"),
+                               "orphan_browser_visit", "unlinked_analyst_finding", "unrecorded_confirmation", "unverified_applicability", "scope_reduction", "consumer_family_required", "discovery_source"),
                  "id": _Rule("checklist"), "source_id": _Rule("source_handle"), "review_id": _handle("closure_review"),
                  "action": action, "required_action": action}
     checklist.update({"candidate_id": _handle("candidate"), "evidence_id": _handle("evidence"), "finding_id": _handle("finding"),
                       "decision_id": _handle("decision"), "run_id": _handle("run"), "page_visit_id": _handle("page_visit"),
                       "source_obligation_ids": _Many(_handle("obligation")), "administrative_review_allowed": _BOOL,
-                      "disposition_review_required": _BOOL})
+                      "disposition_review_required": _BOOL, "automatic_execution_allowed": _Rule("false"),
+                      "discovery_source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+                      **_fields("source_item_total unresolved_item_total missing_item_total", _COUNT)})
     common_coverage = {**page, **_fields("operations inputs obligations total evaluated open blocked not_applicable added gap_total "
-                                       "finding_total current_findings historical_findings obligation_total method_total method_offset method_next_offset", _COUNT),
+                                       "finding_total current_findings historical_findings obligation_total method_total method_offset method_next_offset "
+                                       "method_operation_offset method_operation_limit", _COUNT),
         "coverage_ratio": _RATIO, "continuation": continuation, "completion": completion, "security_coverage": security,
+        "source_inventory": source_inventory,
         "parameter_coverage_summary": parameter_summary, "parameter_coverage": parameter_page,
         "surface_coverage": surface_coverage, "gaps": _Many(gap), "gap_sample": _Many(gap), "method_coverage": _Many(methods),
         "obligation_items": _Many(gap), "coverage_by_kind": {name: bucket for name in
@@ -585,7 +1085,7 @@ def _schemas():
                  "steps": _Many(checkpoint_step), "errors": _Many(checkpoint_step), "limitation": _TEXT}
     run = {**_fields("started_at finished_at completed_at error error_code diagnostic limitation reason files partial_files executable "
                      "server_info tools tool_version metadata_candidates request_method input_selector input_location policy_snapshot "
-                     "scanner_project instance_id remote_run_id control_endpoint mcp_url selected_tool table declared_flags"),
+                     "scanner_project instance_id remote_run_id control_endpoint mcp_url table declared_flags"),
         "id": _handle("run"), "run_id": _handle("run"), "kind": _enum("http", "scenario", "browser", "external_tool"),
         "status": _enum("running", "interrupted", "succeeded", "failed"), "adapter": _enum("sqlmap", "yakit", "tscanplus"),
         "action": _enum("probe", "sqlmap", "yakit_replay", "http_request", "query_results", "project_summary", "route_candidates"),
@@ -596,15 +1096,31 @@ def _schemas():
         "evidence_id": _handle("evidence"), "evidence_ids": _Many(_handle("evidence")), "candidate_ids": _Many(_handle("candidate")),
         "checkpoints": _Many(checkpoint_step), "preflight": preflight, "next_action": action,
         "sha256": _SHA256, "artifact_path": _Rule("path"), "integrity": _enum("valid", "invalid", "incomplete", "invalid_or_stale"),
+        "catalog_sha256": _SHA256,
         **_fields("target_traffic_sent available dispatch_attempted results_complete remote_may_continue remote_stopped_verified "
-                  "namespace_cleared response_truncated unretrieved_results namespace_verified instance_verified usable_for_confirmation", _BOOL),
+                  "namespace_cleared response_truncated unretrieved_results namespace_verified instance_verified usable_for_confirmation "
+                  "catalog_complete catalog_continuation_received", _BOOL),
         **_fields("tool_count returned_rows result_limit candidate_count new_candidates duplicate_candidates out_of_scope_rows unmapped_rows imported_candidates "
-                  "candidate_total import_limit processed_rows omitted_candidates unsupported_rows asset_count", _COUNT)}
+                  "candidate_total import_limit processed_rows omitted_candidates unsupported_rows asset_count catalog_pages "
+                  "catalog_returned_count", _COUNT)}
     run.update(_fields("traffic_requests traffic_responses total_rows reported_count reported_total reported_matched"))
+    run["selected_tool"] = selected_tool_schema
+    run.update({
+        "dispatch_id": _handle("execution_dispatch"), "reconciliation_id": _handle("execution_reconciliation"),
+        "dispatch_run_id": _handle("run"), "dispatch_budget_name": _TEXT, "guard_budget_name": _TEXT,
+        "dispatch_budget_unit": _enum("request", "provider_invocation", "request_slots"),
+        "dispatch_requests": _COUNT, "dispatch_writes": _COUNT,
+        "requests_attempted": _COUNT, "writes_attempted": _COUNT,
+        "guarded_requests": _COUNT, "guarded_writes": _COUNT, "unguarded_socket_attempts": _COUNT,
+        "max_requests": _COUNT, "max_writes": _COUNT, "request_budget": _COUNT, "write_budget": _COUNT,
+        "request_guard": _enum("sqlmap_urllib_do_open+socket_audit", "playwright_route+python_slot_guard"),
+        "guard_complete": _BOOL,
+    })
     run.update(_record_timestamps("run", "started_at finished_at completed_at"))
     run["files"] = _Many({"path": _Rule("path"), "bytes": _COUNT, "sha256": _SHA256, "complete": _BOOL})
     evidence = {**_fields("created_at artifact_path policy_snapshot credential_header_names error_code session_hint reason policy_changes"),
         "id": _handle("evidence"), "run_id": _handle("run"), "kind": _enum("http"), "operation_id": _handle("operation"),
+        "review_proof_receipt_id": _handle("review_proof_receipt"),
         "session_id": _handle("session"), "actor_id": _handle("actor"), "resource_id": _handle("resource"),
         "operation_signature": _digest("S"), "actor_signature": _digest("AS"), "resource_signature": _digest("RS"),
         "sha256": _SHA256, "artifact_path": _Rule("path"), "session_generation": _COUNT, "response_bytes": _COUNT,
@@ -612,11 +1128,25 @@ def _schemas():
         **_fields("complete usable usable_for_new_requests", _BOOL), "next_action": action,
         "integrity": _enum("valid", "invalid"), "lineage": _enum("current", "stale", "invalid", "operation_missing"),
         "session_status": _enum("live", "expired", "missing", "none", "unchecked", "rotated_or_other_actor"), "status_code": _Rule("http_status")}
+    reviewed_proof = {
+        "schema": _enum("awa-reviewed-detection/v1"),
+        "profile": _enum("unexpected_expression_evaluation", "bounded_side_effect",
+                         "unsafe_type_instantiation", "upload_path_escape"),
+        "proof_scope": _enum("unexpected_expression_evaluation", "bounded_side_effect",
+                             "unsafe_type_instantiation", "upload_path_escape"),
+        "not_proven": _Many(_TEXT), "reviewer_assurance": _enum("agent_recorded"),
+        "machine_proof": _Rule("false"),
+    }
     finding = {**_fields("title category impact remediation limitations created_at reviewer reason proof lifecycle_reason lifecycle_reviewer "
                          "lifecycle_updated_at evidence_reason_code limitation"),
         "id": _handle("finding"), "decision_id": _handle("decision"), "evidence_ids": _Many(_handle("evidence")),
+        "review_proof_receipt_id": _handle("review_proof_receipt"),
         "status": _enum("confirmed"), "mode": _enum("machine", "analyst"), "origin": _enum("independent", "hint_guided", "imported"),
-        "severity": _enum("critical", "high", "medium", "low", "info"), "confirmed_scope": _enum("sql_behaviour", "database_metadata", "browser_execution"),
+        "severity": _enum("critical", "high", "medium", "low", "info"),
+        "confirmed_scope": _enum("sql_behaviour", "database_metadata", "browser_execution",
+                                 "bounded_side_effect", "unexpected_expression_evaluation",
+                                 "unsafe_type_instantiation", "upload_path_escape"),
+        "reviewer_assurance": _enum("agent_recorded"), "proof": reviewed_proof,
         "verification_level": _enum("runtime_verified", "analyst_review", "unverified", "historical"),
         "lifecycle_status": _enum("active", "withdrawn", "superseded"), "lifecycle_revision_id": _handle("finding_revision"),
         "replacement_finding_id": _handle("finding"), "lifecycle_revision_count": _COUNT, "current": _BOOL, "evidence_current": _BOOL,
@@ -655,7 +1185,15 @@ def _schemas():
                   "redaction_context_available redaction_context_checked headless network_truncated", _BOOL),
         "actions": _Many(browser_action), "artifact_path": _Rule("path"), "screenshot": _Rule("path"), "html": _Rule("path"),
         "after_actions_html": _Rule("path"), "request_signature": _digest("BR"), "actor_signature": _digest("AS"),
-        "page_ids": _Many(_handle("page")), "page_adoption": _enum("adopted", "incomplete")}
+        "page_ids": _Many(_handle("page")), "page_adoption": _enum("adopted", "incomplete"),
+        "dispatch_id": _handle("execution_dispatch"), "reconciliation_id": _handle("execution_reconciliation"),
+        "dispatch_budget_name": _TEXT, "guard_budget_name": _TEXT,
+        "dispatch_budget_unit": _enum("request", "provider_invocation", "request_slots"),
+        "dispatch_requests": _COUNT, "dispatch_writes": _COUNT,
+        "requests_attempted": _COUNT, "writes_attempted": _COUNT,
+        "guarded_requests": _COUNT, "guarded_writes": _COUNT,
+        "request_budget": _COUNT, "write_budget": _COUNT,
+        "request_guard": _enum("playwright_route+python_slot_guard"), "guard_complete": _BOOL}
     visit.update(_record_timestamps("page_visit", "created_at"))
     page_row = {**_fields("name url source trigger apis reason blocked_reason visited_at triggered_at created_at"),
         "id": _handle("page"), "page_id": _handle("page"), "function_id": _handle("function"), "page_visit_id": _handle("page_visit"),
@@ -664,11 +1202,22 @@ def _schemas():
     page_row["functions"] = _Many({**page_row, "id": _handle("function")})
     frontier_row = {**_fields("reason evidence_ids page_visit_ids"), "status": _enum("reviewed", "planned", "completed", "not_applicable", "api_only", "blocked"),
                     "test_family": family, "evidence_ids": _Many(_handle("evidence")), "page_visit_ids": _Many(_handle("page_visit"))}
-    frontier = {"complete": _BOOL, "discovery": frontier_row, "categories": _Many(frontier_row), "pages": frontier_row}
+    frontier = {"complete": _BOOL, "discovery": frontier_row, "categories": _Many(frontier_row), "pages": frontier_row,
+                "dependency_hash": _digest("FRD", 64)}
+    frontier_receipt = {
+        "schema": _enum("awa-frontier/v1"), "subject_id": _TEXT,
+        "dependency_hash": _digest("FRD", 64), "observation_key": _digest("FOM", 64),
+        "evidence_ids": _Many(_handle("evidence")), "page_visit_ids": _Many(_handle("page_visit")),
+        "decision": _enum("accepted"), "observer_assurance": _enum("agent_recorded"),
+        "independent_human": _Rule("false"), "counts_as_tested": _Rule("false"),
+        "created_at": _TEXT, "id": _handle("frontier_receipt"),
+    }
     checkpoint = {**_fields("label created_at"), "id": _handle("checkpoint"), "snapshot_id": _digest("CS", 64), "progress_id": _digest("PR", 64),
         "semantic_progress_id": _digest("PR", 64), "semantic_progress_changed": _BOOL,
         "previous_checkpoint_id": _handle("checkpoint"), "progress_changed": _BOOL, "remaining": remaining,
         "completion_status": completion["status"], "frontier_review": frontier,
+        "frontier_receipt_id": _handle("frontier_receipt"),
+        "frontier_observation_key": _digest("FOM", 64),
         "parameter_delta": {**_fields("comparison_available projection_complete items_truncated tested_comparison_available "
                                       "variant_comparison_available tested_projection_complete variant_projection_complete", _BOOL),
             **_fields("newly_tested_total newly_observed_variants_total reopened_total", _COUNT),
@@ -678,7 +1227,7 @@ def _schemas():
         "snapshot_id": _digest("CS", 64), "reason": _enum("completed"), "reason_basis": _enum("engine_gate"),
         "stop_policy": _enum("exhaustion_only"), "stop_policy_version": _COUNT, "completion_status": completion["status"],
         **_fields("can_claim_complete automatic_stop_allowed frontier_reviewed external_constraint_verified blocker_facts_verified", _BOOL), "remaining": remaining}
-    result = {name: {} for name in CONTRACTS}
+    result = {name: {} for name in ALL_CONTRACTS}
     config = {**_fields("project_id target created_at external_tools"), "scope": _Many(_TEXT), "exclude": _Many(_TEXT),
               "allow_mutation": _BOOL, "schema_version": _COUNT, "assessment_mode": _enum("assessment", "src")}
     from .security_hypotheses import SECURITY_PROPERTIES, MISSING_CONTEXT_CODES
@@ -716,6 +1265,10 @@ def _schemas():
     result["surface.recon"] = {**page, "mode": recon_mode, "section": recon_section, "items": _Many(recon_item), "total": _COUNT,
         "summary": recon_summary, "stage": _enum("prepare_collection", "collect_missing_information", "ready_for_hypotheses"),
         "baseline_id": _handle("recon_baseline"), "baseline_reused": _BOOL, "baseline_changed": _BOOL,
+        "projection_reused": _BOOL,
+        "material_verification": _enum("cached_advisory", "strong_artifacts"),
+        "refreshed_at": _TEXT,
+        "parsing_work": _fields("parsed_artifacts parse_cache_hits bytes_hashed", _COUNT),
         "delta": _fields("new_technology_total removed_technology_total new_function_total removed_function_total "
                          "new_clue_total removed_clue_total", _COUNT),
         "workflow": _Many(_enum("scope_and_identity", "pages_assets_and_api_sources", "functions_and_inputs", "information_baseline", "targeted_hypotheses")),
@@ -724,6 +1277,55 @@ def _schemas():
         "collection_entry": {"action": _enum("surface.recon"), "input": {"mode": recon_mode, "section": recon_section, "limit": _COUNT}},
         "hypothesis_entry": {"action": _enum("surface.recon"), "input": {"mode": recon_mode, "section": recon_section, "limit": _COUNT}},
         "limitations": _Many(_TEXT)}
+    runtime_identity = {
+        "schema": _enum("awa-runtime-identity/v1"), "engine_version": _TEXT,
+        "package_path": _IDENTITY_PATH, "entrypoint_path": _IDENTITY_PATH,
+        "python_executable": _IDENTITY_PATH, "python_version": _TEXT,
+        "core_manifest_sha256": _SHA256, "core_file_total": _COUNT,
+        "loaded_code_sha256": _SHA256, "loaded_module_total": _COUNT,
+        "source_identity": _enum("installed_bytes"),
+        "loaded_identity": _enum("imported_function_bytecode"),
+        "target_traffic_sent": _Rule("false"),
+    }
+    runtime_candidate = {
+        **_fields("backend path discovery_source distribution"), "verified_absolute": _BOOL, "verified_file": _BOOL,
+        "path": _IDENTITY_PATH, "action": _enum("tool.probe"),
+        "input_template": {"adapter": _enum("sqlmap"), "sqlmap_path": _IDENTITY_PATH},
+        "configuration_hint": {"executionBackend": _enum("native", "wsl"), "wslDistribution": _TEXT},
+        "workspace_isolation_required": _BOOL, "automatic_execution_allowed": _Rule("false"),
+    }
+    runtime_catalog = {
+        **_fields("name limitation"), "path": _IDENTITY_PATH, "available": _BOOL,
+        "status": _enum("catalog_only"), "target_traffic_sent": _Rule("false"),
+    }
+    runtime_encodings = _fields("stdin stdout stderr filesystem locale_preferred", _TEXT) | {"utf8_mode": _COUNT}
+    runtime_native = {
+        **_fields("available os kernel python_version"), "python_executable": _IDENTITY_PATH,
+        "encodings": runtime_encodings, "inside_wsl": _BOOL,
+        "verification_level": _enum("runtime_metadata"), "target_traffic_sent": _Rule("false"),
+    }
+    runtime_wsl = {
+        **_fields("available distribution reason exit_code stderr stderr_encoding"), "catalog": _Many(runtime_catalog),
+        "verification_level": _enum("runtime_metadata"), "target_traffic_sent": _Rule("false"),
+        "reason_code": _enum("wsl_unavailable", "wsl_list_failed", "runtime_timeout", "wsl_python_unavailable",
+                             "runtime_encoding", "runtime_protocol", "runtime_output_budget"),
+        "distribution_list": {
+            **_fields("observed_encoding text exit_code"), "observes_encoding": _TEXT,
+            "distributions": _Many({**_fields("name state"), "version": _COUNT, "default": _BOOL}),
+        },
+        "metadata": {
+            **_fields("python_version os kernel"), "python_executable": _IDENTITY_PATH,
+            "encodings": runtime_encodings, "sqlmap_script": _IDENTITY_PATH, "tools": {},
+        },
+    }
+    result["runtime.probe"] = {
+        "backend": _enum("all", "native", "wsl"), "execution_backend": _enum("native", "wsl"),
+        "target_traffic_sent": _Rule("false"), "runtime_identity": runtime_identity,
+        "verification_level": _enum("runtime_metadata"),
+        "configuration_hint": {"executionBackend": _enum("native", "wsl"), "wslDistribution": _TEXT},
+        "sqlmap_candidates": _Many(runtime_candidate), "warnings": _Many(_TEXT),
+        "native": runtime_native, "wsl": runtime_wsl,
+    }
     result.update({"surface.register": operation, "surface.declare_consumer": {"operation_id": _handle("operation"), "input": input_row, "plan": {"added": _COUNT}},
         "identity.actor": actor, "identity.session": session,
         "identity.resource": resource, "identity.verify": {"session": session, "evidence_id": _handle("evidence"),
@@ -737,8 +1339,112 @@ def _schemas():
         "surface.batch": {**_fields("accepted rejected plan_added requests_sent", _COUNT), "next_action": action,
                           "results": _Many({"index": _COUNT, "status": _enum("accepted", "rejected"), "operation_id": _handle("operation"),
                                             "input_count": _COUNT, **_fields("error_code message"), "next_action": action, "help_input": {"name": action}})},
-        "surface.import": {"operation_ids": _Many(_handle("operation")), **_fields("candidates candidate_total", _COUNT), "limitations": _TEXT},
+        "surface.import": {**page, "source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+            "snapshot_reused": _BOOL, "mode": _enum("preview", "apply"),
+            "counts": _fields("created reused conflicts rejected needs_binding candidate_created candidate_reused", _COUNT),
+            "source_inventory": source_inventory, "results": _Many(source_item), "result_total": _COUNT,
+            "next_input": {"source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+                           "mode": _enum("apply"), "offset": _COUNT, "limit": _COUNT},
+            "operation_ids": _Many(_handle("operation")), "candidate_ids": _Many(_handle("candidate")),
+            **_fields("candidates candidate_total requests_sent", _COUNT), "limitations": source_limitations,
+            "automatic_execution_allowed": _Rule("false"), "usable_for_confirmation": _Rule("false")},
+        "tool.tscanplus_ingest": {**page, "source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+            "snapshot_reused": _BOOL, "mode": _enum("preview", "apply"),
+            "counts": _fields("created reused conflicts rejected needs_binding candidate_created candidate_reused", _COUNT),
+            "source_inventory": source_inventory, "results": _Many(source_item), "result_total": _COUNT,
+            "next_input": {"source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+                           "mode": _enum("apply"), "offset": _COUNT, "limit": _COUNT},
+            "operation_ids": _Many(_handle("operation")), "candidate_ids": _Many(_handle("candidate")),
+            **_fields("candidates candidate_total requests_sent", _COUNT), "limitations": source_limitations,
+            "provider": _enum("tscanplus"), "provider_receipt": provider_receipt,
+            "provider_capture": {**_fields("adapter action status tool_name catalog_sha256 verification_level error_code "
+                                           "sha256 parser_status table instance_id", _TEXT),
+                "run_id": _handle("run"),
+                "selected_tool": selected_tool_schema,
+                **_fields("result_limit reported_count returned_rows candidate_count new_candidates duplicate_candidates "
+                          "out_of_scope_rows unmapped_rows unretrieved_results reported_total reported_matched processed_rows "
+                          "omitted_candidates unsupported_rows asset_count", _COUNT),
+                "reported_http_status": _Rule("http_status"),
+                **_fields("target_traffic_sent dispatch_attempted remote_may_continue remote_stopped_verified response_truncated "
+                          "results_complete namespace_verified instance_verified user_confirmation", _BOOL),
+                "trust": _enum("untrusted_tool_output"), "finding_status": _enum("unverified"),
+                "usable_for_confirmation": _Rule("false")},
+            "control_tool_calls": _COUNT, "target_requests_sent": _COUNT, "scanner_invoked": _Rule("false"),
+            "active_capability": {"profile": _enum("active_web_discovery"), "available": _Rule("false"),
+                "missing_capabilities": _Many(_enum("explicit_outbound_request_budget", "scope_enforced_redirect_policy",
+                    "reliable_remote_cancel_receipt", "complete_remote_task_status", "cursor_or_unretrieved_result_contract")),
+                "scanner_invoked": _Rule("false"), "target_requests_sent": _COUNT,
+                "automatic_execution_allowed": _Rule("false")},
+            "trust": _enum("untrusted_provider_output"),
+            "usable_for_confirmation": _Rule("false"), "automatic_execution_allowed": _Rule("false"),
+            "next_action": action},
+        "surface.sources": {**page, "source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+            "source_inventory": source_inventory, "source": source_record, "snapshot": source_snapshot,
+            "items": _Many(source_item), "total": _COUNT, "status": source_status,
+            "snapshot_integrity": _enum("valid", "changed", "missing"), "missing_item_total": _COUNT,
+            "reason_code": _enum("source_snapshot_missing"),
+            "sources": _Many({"source_id": _handle("discovery_source"), "snapshot_id": _handle("discovery_snapshot"),
+                "format": source_format, **_fields("path base_url"), "sha256": _SHA256, "parser_version": _COUNT,
+                "snapshot_integrity": _enum("valid", "changed", "missing"), "missing_item_total": _COUNT,
+                "reason_code": _enum("source_snapshot_missing"),
+                **_fields("snapshot_total source_item_total pending_import_total historical_pending_total", _COUNT),
+                "counts": _fields("pending_import registered needs_binding conflict rejected candidate", _COUNT), "next_action": action}),
+            "comparison": {"source_id": _handle("discovery_source"),
+                "base_snapshot_id": _handle("discovery_snapshot"), "latest_snapshot_id": _handle("discovery_snapshot"),
+                **_fields("added removed changed unchanged total offset limit next_offset requests_sent", _COUNT),
+                "items": _Many({"status": _enum("added", "removed", "changed"),
+                    "previous_item_id": _handle("discovery_item"), "source_item_id": _handle("discovery_item"),
+                    "changed_fields": _Many(_TEXT)})},
+            "requests_sent": _COUNT, "automatic_execution_allowed": _Rule("false"), "usable_for_confirmation": _Rule("false")},
         "project.update": {**_fields("project_id changes"), "config": config, "changed": _BOOL},
+        "project.migrate": {
+            "migration": {
+                "schema": _enum("awa-storage-migration/v1"),
+                "id": _handle("storage_migration"),
+                "state": _enum("preview", "applied"),
+                "source_schema_version": _COUNT,
+                "core_manifest_sha256": _SHA256,
+                "source_sha256": _SHA256,
+                "config_sha256": _SHA256,
+                "source_counts": source_counts,
+                "legacy_unverified_total": _COUNT,
+                "quarantine_total": _COUNT,
+                "synthetic_test_runs": _Rule("0"),
+                "requests_sent": _Rule("0"),
+                "legacy_ids_preserved": _Rule("true"),
+                "automatic_campaign_assignment": _Rule("false"),
+                "backup_available": _BOOL,
+                "backup_manifest_sha256": _SHA256,
+                "backup_file_total": _COUNT,
+                "created_at": _TEXT,
+                "rollback_mode": _enum("legacy_read_only"),
+            },
+            "mode": _enum("dry_run", "apply"),
+            "writes": _COUNT,
+            "requests_sent": _COUNT,
+            "next_action": action,
+        },
+        "project.rollback": {
+            "rolled_back_to": _enum("legacy_read_only"),
+            "ledger_id": _handle("storage_migration"),
+            "new_facts_preserved": _Rule("true"),
+            "requests_replayed": _Rule("0"),
+            "requests_sent": _Rule("0"),
+            "next_action": action,
+        },
+        "project.projection": {
+            "schema": _enum("awa-query-projection/v1"),
+            "name": _TEXT,
+            "generation": _COUNT,
+            "projection_reused": _BOOL,
+            "rebuilt": _BOOL,
+            "comparison": {"equal": _BOOL, "differences": _Many(_TEXT)},
+            "metrics": _fields("records_decoded artifact_stats artifact_directory_reads artifact_bytes_hashed "
+                               "material_bytes_hashed method_operation_ids_returned parse_cache_hits sql_pages", _COUNT),
+            "material_verification": _enum("cached_advisory", "strong_artifacts"),
+            "requests_sent": _Rule("0"),
+            "next_action": action,
+        },
         "project.status": {**common_coverage, **_fields("project_id path"), "config": config, "next_action": action,
             **_fields("candidates actor_total actor_next_offset session_total session_next_offset run_total run_next_offset", _COUNT),
             "candidate_states": _fields("unverified linked dismissed", _COUNT), "actors": _Many(actor), "sessions": _Many(session), "runs": _Many(run)},
@@ -755,15 +1461,28 @@ def _schemas():
                                      "status": _enum("not_planned", "open", "blocked", "not_applicable", "completed", "review_required"), **_fields("label_zh proof_channels")}),
             "checklist": _Many(checklist), **_fields("requests_sent checklist_total candidate_proof_accounted administrative_reviews", _COUNT)},
         "plan.disposition": gap, "http.capture": evidence, "evidence.inspect": evidence,
-        "http.preflight": {**_fields("ready", _BOOL), **_fields("requests_sent body_bytes max_bytes", _COUNT), "operation_id": _handle("operation"),
+        "http.preflight": {**_fields("ready repeat_advisory", _BOOL), **_fields("requests_sent body_bytes max_bytes", _COUNT), "operation_id": _handle("operation"),
             "method": method, "url": _TEXT, "request_signature": _digest("REQ"), "auth_mode": evidence["auth_mode"],
             "session_id": _handle("session"), "resource_id": _handle("resource"), "timeout": _NUMBER,
             "existing_run_id": _handle("run"), "next_action": action, "limitation": _TEXT},
         "scenario.preflight": preflight, "scenario.run": run, "run.inspect": run,
         "run.recover": {"recovered": _Many(_handle("run")), "requests_replayed": _COUNT},
+        "execution.reconcile": {
+            "run_id": _handle("run"),
+            "reconciliation_id": _handle("execution_reconciliation"),
+            "dispatch_ids": _Many(_handle("execution_dispatch")),
+            "evidence_ids": _Many(_handle("evidence")),
+            "lease_released": _BOOL,
+            "effect_unknown": _Rule("false"),
+            "requests_replayed": _Rule("0"),
+            "requests_sent": _Rule("0"),
+            "next_action": action,
+        },
         "assessment.evaluate": {**_fields("oracle proof created_at reason"), "id": _handle("decision"), "obligation_id": _handle("obligation"),
             "operation_id": _handle("operation"), "operation_signature": _digest("S"), "outcome": _enum("observed", "denied", "confirmed", "refuted"),
-            "mode": _enum("machine", "analyst"), "oracle_version": _COUNT, "evidence_ids": _Many(_handle("evidence"))},
+            "mode": _enum("machine", "analyst"), "oracle_version": _COUNT, "evidence_ids": _Many(_handle("evidence")),
+            "review_proof_receipt_id": _handle("review_proof_receipt"),
+            "reviewer_assurance": _enum("agent_recorded")},
         "assessment.prepare": {**page, "continuation": continuation, "completion": completion,
             "source": {"operation_id": _handle("operation"), "obligation_id": _handle("obligation"),
                        "finding_id": _handle("finding"), "evidence_id": _handle("evidence")},
@@ -776,7 +1495,7 @@ def _schemas():
                 **_fields("input_selector schema_branch required_experiment_fields note_zh"),
                 "input_location": input_row["location"],
                 "controls_are_candidates_only": _Rule("true"), "evidence_review_required": _Rule("true"),
-                **_fields("positive_machine_adapter runtime_binding_supported observations_limited schema_branch_requires_binding hints_only", _BOOL),
+                **_fields("positive_machine_adapter runtime_binding_supported observations_limited schema_branch_requires_binding hints_only repeat_advisory", _BOOL),
                 "control_candidate_evidence_ids": _Many(_handle("evidence")), "control_candidate_required_values": _COUNT,
                 "control_review_blockers": _Many(_enum("roles_unverified", "actor_independence", "declared_access_policy")),
                 "decision_id": _handle("decision"), "outcome": _enum("confirmed", "refuted", "inconclusive"),
@@ -806,12 +1525,29 @@ def _schemas():
         "page.mark": page_row, "page.adopt": {"page_visit_id": _handle("page_visit"), "page_ids": _Many(_handle("page")), "pages": _Many(page_row)},
         "page.coverage": {"unvisited": _Many(page_row), "untriggered": _Many(page_row),
                           **_fields("pages functions pages_visited functions_triggered", _COUNT), "complete": _BOOL, "note": _TEXT},
-        "plan.checkpoint": {"checkpoint": checkpoint, "continuation": continuation, "requests_sent": _COUNT, "note": _TEXT},
+        "plan.checkpoint": {"checkpoint": checkpoint, "continuation": continuation,
+                            "frontier_receipt_id": _handle("frontier_receipt"),
+                            "frontier_receipt": frontier_receipt,
+                            "completion_decision": completion_decision,
+                            "requests_sent": _COUNT, "note": _TEXT},
         "plan.review": {"review": {**_fields("reviewer reason created_at readback_bindings"), "id": _handle("closure_review"),
             "checklist_id": _Rule("checklist"), "source_id": _Rule("source_handle"),
             "kind": _enum("unassessed_observation", "failed_partial_tool", "unreconciled_run", "orphan_browser_visit", "unlinked_analyst_finding"),
             "status": _enum("reviewed", "blocked", "reopen"), "evidence_ids": _Many(_handle("evidence"))}, "continuation": continuation, "requests_sent": _COUNT, "note": _TEXT},
         "plan.finalize": {"finalization": finalization, "continuation": continuation, "requests_sent": _COUNT, "note": _TEXT},
+        "plan.accept_partial": {
+            "partial_acceptance": {
+                "schema": _enum("awa-partial-acceptance/v1"), "subject_id": _TEXT,
+                "snapshot_id": _digest("CS", 64), "checkpoint_id": _handle("checkpoint"),
+                "completion_decision_id": _digest("CD", 64), **_fields("accepted_by explanation"),
+                "reviewer_assurance": _enum("agent_recorded"), "reason": _enum("partial_accepted"),
+                "remaining": remaining, "can_claim_complete": _Rule("false"),
+                "automatic_stop_allowed": _Rule("false"), "continue_required": _Rule("true"),
+                "created_at": _TEXT, "id": _handle("completion_acceptance"),
+            },
+            "continuation": continuation, "completion_decision": completion_decision,
+            "requests_sent": _COUNT, "next_action": action,
+        },
         "report.build": {**_fields("report summary manifest reproduction_dir generated_at"), "stage": _enum("draft", "final"),
             "verification_assurance": verification_assurance,
             "completion": completion, "continuation": continuation, "finalization": finalization, "snapshot": _BOOL,
@@ -823,30 +1559,751 @@ def _schemas():
     for name in ("tool.probe", "tool.sqlmap", "tool.yakit_replay", "tool.tscanplus_request", "tool.tscanplus_results",
                  "tool.tscanplus_summary", "tool.tscanplus_routes", "tool.inspect"):
         result[name] = run
+    test_run_public = {
+        "id": _handle("run"), "campaign_id": _handle("campaign"),
+        "hypothesis_id": _handle("hypothesis"),
+        "recipe_id": _nullable(_handle("recipe")),
+        "recipe_revision": _COUNT, "recipe_spec_hash": _SHA256,
+        "mode": _enum("observe", "test", "verify"),
+        "status": _enum("prepared", "claimed", "dispatch_started", "response_saved", "effect_unknown",
+                        "evaluation_pending", "evaluated", "published", "failed", "cancelled", "interrupted"),
+        "steps": _Many({
+            "step_id": _TEXT, "action": _TEXT, "request_digest": _SHA256, "response_digest": _SHA256,
+            "status": _enum("prepared", "dispatch_started", "completed", "failed", "skipped"),
+            "error_code": _TEXT, "at": _TEXT,
+        }),
+        "evidence_ids": _Many(_handle("evidence")), "decision_ids": _Many(_handle("decision")),
+        "error": {"code": _TEXT, "message": _TEXT},
+        "effect": {"unknown": _BOOL, "reconciled": _BOOL,
+                   "kind": _enum("read_only", "test_resource_write", "unknown")},
+        "dispatch_started_at": _TEXT, "completed_at": _TEXT, "created_at": _TEXT, "updated_at": _TEXT,
+        "evaluation": {
+            "outcome": _enum("observed", "supported", "refuted", "inconclusive", "effect_unknown"),
+            "finding_allowed": _BOOL, "proof_scope": _TEXT, "oracle_type": _TEXT,
+            "limitations": _Many(_TEXT), "missing": _Many(_TEXT),
+        },
+        "outcome": _enum("observed", "supported", "refuted", "inconclusive", "effect_unknown"),
+    }
+    test_recipe_public = {
+        "id": _handle("recipe"), "campaign_id": _handle("campaign"),
+        "universe_id": _handle("universe"), "hypothesis_id": _handle("hypothesis"),
+        "family": family, "revision": _COUNT, "spec_hash": _SHA256,
+        "provider": {"name": _enum("http", "browser", "scenario", "external"),
+                     "profile": _TEXT, "version": _TEXT},
+        "oracle": {"id": _TEXT, "type": _TEXT, "version": _TEXT, "proof_scope": _TEXT,
+                   "expected_value": _TEXT, "selector": _TEXT},
+        "limits": {"step_total": _COUNT, "time_ms": _COUNT, "max_writes": _COUNT,
+                   "effect": _enum("read_only", "test_resource_write")},
+        "control_groups": _Many({
+            "id": _TEXT, "identity_role": _TEXT, "resource_version": _TEXT,
+            "controls": _Many({"id": _TEXT, "role": _TEXT, "request_locator_sha256": _Rule("hex", 32)}),
+        }),
+        "steps": _Many(_TEXT), "variable_names": _Many(_TEXT),
+        "private_ref": {"kind": _enum("test_recipe"), "id": _handle("recipe"), "public_hash": _SHA256},
+        "executable": _Rule("false"), "detail_action": action,
+        "notice": _TEXT, "render_truncated": _BOOL,
+    }
     result["test.run"] = {
         "outcome": _enum("observed", "supported", "refuted", "inconclusive", "effect_unknown"),
-        "run": {**_fields("id status mode error evaluation effect evidence_ids"), "id": _TEXT,
-                "status": _enum("prepared", "claimed", "dispatch_started", "response_saved", "effect_unknown",
-                                "evaluation_pending", "evaluated", "published", "failed", "cancelled", "interrupted"),
-                "effect": {"unknown": _BOOL, "reconciled": _BOOL, "kind": _enum("read_only", "test_resource_write", "unknown")},
-                "evidence_ids": _Many(_handle("evidence"))},
+        "run": test_run_public,
         "finding": dict(result["finding.record"]),
         "coverage_delta": {**_fields("tested finding_created family"), "tested": _COUNT, "finding_created": _BOOL},
         "replayed": _BOOL, "requires_reconciliation": _BOOL, "notice": _TEXT,
     }
-    result["test.inspect"] = {**_fields("private_capsule_available control_count"), "recipe": _TEXT, "run": _TEXT}
-    result["campaign.status"] = {
-        "campaign": _TEXT, "universe": _TEXT, "dimensions": _TEXT, "family_matrix": _TEXT,
-        "route_matrix": _TEXT, "consumer_matrix": _TEXT, "known_case_matrix": _TEXT,
-        "known_case_summary": _TEXT, "tool_yield": _TEXT, "finding_summary": _TEXT,
-        "delivery": _TEXT, "unplanned_family_count": _COUNT, "unregistered_route_count": _COUNT,
-        "open_hypothesis_count": _COUNT, "open_gap_count": _COUNT, "capabilities": _TEXT,
-        "next_action": _TEXT}
-    result["report.matrix"] = {
-        "campaign_id": _TEXT, "universe": _TEXT, "dimensions": _TEXT, "family_matrix": _TEXT,
-        "route_matrix": _TEXT, "consumer_matrix": _TEXT, "known_case_matrix": _TEXT,
-        "known_case_summary": _TEXT, "tool_yield": _TEXT, "finding_summary": _TEXT,
-        "delivery": _TEXT, "denominators": _TEXT, "computed_by": _TEXT}
+    result["test.inspect"] = {
+        "private_capsule_available": _BOOL, "control_count": _COUNT,
+        "recipe": test_recipe_public, "run": test_run_public,
+    }
+    fixture_public = _Closed({
+        "id": _handle("fixture"), "operation_id": _handle("operation"),
+        "owner_actor_id": _handle("actor"), "resource_id": _handle("resource"),
+        "readback_operation_id": _handle("operation"), "readback_resource_id": _handle("resource"),
+        "state": _enum("created", "verified", "leased", "mutated", "readback_ok", "cleanup_pending",
+                       "cleaned", "cleanup_failed", "quarantined"),
+        "revision": _COUNT,
+        "lease": _nullable(_Closed({
+            "worker_id": _TEXT, "expires_at": _TEXT, "fence": _COUNT,
+        })),
+        "unresolved": _BOOL, "mutation_count": _COUNT,
+        "readback_ok": _BOOL, "cleanup_count": _COUNT,
+        "in_flight": _nullable(_Closed({
+            "run_id": _handle("run"), "worker_id": _TEXT,
+            "fence": _COUNT, "started_at": _TEXT,
+        })),
+    })
+    fixture_action_result = _Closed({
+        "fixture": fixture_public, "requests_sent": _Rule("0"), "idempotent": _BOOL,
+    })
+    for fixture_action in (
+        "test.fixture_create", "test.fixture_verify", "test.fixture_lease",
+        "test.fixture_inspect", "test.fixture_readback", "test.fixture_cleanup",
+    ):
+        result[fixture_action] = fixture_action_result
+    campaign_delivery = _Closed({
+        **_fields("accepted_by explanation delivered_at", _TEXT),
+        "reason": _enum("completed", "partial_accepted"),
+        "completion_decision_id": _nullable(_digest("CD", 64)),
+        "acceptance_id": _nullable(_handle("completion_acceptance")),
+        "checkpoint_id": _nullable(_handle("checkpoint")),
+        "exhausted_authority": _BOOL,
+        "delivery_status": _enum("completed", "partial_accepted", "in_progress"),
+        "remaining": _Many(_Closed({"kind": _enum(
+            "family", "route", "hypothesis", "gap", "inconclusive"), "count": _COUNT})),
+        "computed_by": _enum("engine"),
+    })
+    campaign_public = _Closed({
+        **_fields("project_id target objective model mode scope_epoch state_reason", _TEXT),
+        "id": _handle("campaign"),
+        **_fields("max_rounds rounds version", _COUNT),
+        "state": _enum("active", "paused", "delivered_partial", "completed", "abandoned"),
+        "allow_mutation": _BOOL, **_fields("created_at updated_at", _TEXT),
+        "delivery": campaign_delivery,
+        "user_stop": _BOOL,
+        "cursor": _Closed({**_fields("family_index operation_index offset", _COUNT)}),
+    })
+    bounded_ids = _Closed({
+        name: _Closed({
+            "ids": _Many(_handle(name)),
+            "returned": _COUNT, "total": _COUNT, "limited": _BOOL,
+        }) for name in (
+            "campaign", "universe", "hypothesis", "recipe", "run", "finding",
+            "gap", "checkpoint", "frontier_receipt")
+    })
+    coverage_claim_dependency = _Closed({
+        **_fields("scope_epoch universe_snapshot_hash target_build source_kind consumer_status_source "
+                  "total_including_na track", _TEXT),
+        "site_wide_discovery_allowed": _BOOL,
+        "unknown_counts": unknown_counts,
+        "outcomes": count_map,
+        "duplicates": _COUNT, "blocked": _COUNT,
+    })
+    coverage_claim = _Closed({
+        "id": _digest("COV", 24),
+        "dimension": _enum("discovery", "consumer", "hypothesis", "known_case", "machine_proof"),
+        "scope": _TEXT, "numerator": _COUNT, "denominator": _COUNT,
+        "ratio": _RATIO, "status": _enum(
+            "covered", "partial", "gap", "blocked", "not_applicable", "unknown"),
+        "unknown_extent": _TEXT, "percentage_of_unknown_total": _RATIO,
+        "dependency": coverage_claim_dependency,
+        "source_kind": _TEXT, "notes": _Many(_TEXT), "computed_by": _enum("engine"),
+        "claim_version": _COUNT,
+        "visited": _COUNT, "unknown_counts": unknown_counts, "dispositioned": _COUNT,
+        "disposition_rate": _RATIO, "tested_coverage": _RATIO,
+    })
+    coverage_dimensions = _Closed({
+        "discovery": coverage_claim, "consumer": coverage_claim,
+        "hypothesis": coverage_claim, "known_case": _Many(coverage_claim),
+        "machine_proof": coverage_claim,
+    })
+    family_counts = _Closed({
+        name: _COUNT for name in (
+            "unplanned", "ready", "running", "supported", "refuted",
+            "inconclusive", "blocked", "not_applicable", "unknown")
+    })
+    family_matrix_row = _Closed({
+        "test_family": family, "total": _COUNT,
+        "status": _enum("not_planned", "planned", "blocked", "not_applicable", "completed"),
+        "counts": family_counts,
+    })
+    route_matrix_row = _Closed({
+        "route_id": _digest("R", 24), "path_template": _TEXT, "source_kind": _TEXT,
+        "registered": _BOOL, "page_total": _COUNT, "operation_total": _COUNT,
+        "unresolved": _BOOL,
+    })
+    consumer_matrix_row = _Closed({
+        "input_key": _digest("IN", 24), "operation_id": _handle("operation"),
+        "location": input_row["location"], "selector": _TEXT, "consumer": _TEXT,
+        "status": _enum("declared", "inferred", "unknown"),
+    })
+    known_case_matrix_row = _Closed({
+        "id": _digest("KC", 24), "source_group": _TEXT, "family": family,
+        "track": _nullable(_enum("import", "hint_assisted", "blind")),
+        "status": _enum("unplanned", "planned", "verified", "reported", "blocked",
+                        "not_applicable", "duplicate"),
+        "dedupe_key": _SHA256,
+    })
+    known_case_bucket = _Closed({
+        "total": _COUNT, "verified": _COUNT, "reported": _COUNT,
+        "blocked": _COUNT, "unplanned": _COUNT,
+    })
+    known_case_summary = _Closed({
+        "by_track": _Closed({track: known_case_bucket for track in (
+            "import", "hint_assisted", "blind")}),
+        "total": _COUNT,
+    })
+    tool_yield = _Closed({
+        "calls": _Closed({name: _COUNT for name in (
+            "yakit", "tscanplus", "sqlmap", "playwright")}),
+        "candidates": _COUNT, "promoted_hypotheses": _COUNT,
+        "findings": _COUNT, "unavailable_reasons": _Many(_TEXT), "note": _TEXT,
+    })
+    campaign_finding_summary = _Closed({
+        "current_total": _COUNT, "machine": _COUNT, "reviewed": _COUNT,
+        "expired_or_invalid_total": _COUNT,
+    })
+    campaign_universe = _Closed({
+        "snapshot_hash": _SHA256, "completeness_level": _TEXT,
+        "id": _handle("universe"),
+        "site_wide_discovery_allowed": _BOOL,
+        "unknown_counts": unknown_counts,
+    })
+    campaign_status_schema = {
+        "campaign_id": _handle("campaign"), "universe_id": _handle("universe"),
+        "bounded_ids": bounded_ids, "campaign": campaign_public,
+        "universe": campaign_universe, "dimensions": coverage_dimensions,
+        "family_matrix": _Many(family_matrix_row),
+        "route_matrix": _Many(route_matrix_row),
+        "consumer_matrix": _Many(consumer_matrix_row),
+        "known_case_matrix": _Many(known_case_matrix_row),
+        "known_case_summary": known_case_summary, "tool_yield": tool_yield,
+        "finding_summary": campaign_finding_summary, "delivery": campaign_delivery,
+        "unplanned_family_count": _COUNT, "unregistered_route_count": _COUNT,
+        "open_hypothesis_count": _COUNT, "open_gap_count": _COUNT,
+        "capabilities": capabilities_schema, "continuation": campaign_continuation,
+        "completion_decision": campaign_completion_decision, "next_action": action,
+    }
+    result["campaign.status"] = _Closed(campaign_status_schema)
+    result["campaign.start"] = _Closed({
+        "campaign": campaign_public,
+        "universe": _Closed({
+            "id": _handle("universe"), "snapshot_hash": _SHA256,
+            "operation_total": _COUNT, "page_total": _COUNT, "route_total": _COUNT,
+            "input_total": _COUNT, "hypothesis_total": _COUNT,
+            "hypothesis_limited": _BOOL, "completeness_level": _TEXT,
+        }),
+        "checkpoint_id": _handle("checkpoint"), "next_action": action,
+    })
+    recipe_reference = _Closed({
+        **_fields("family", _TEXT),
+        "id": _handle("recipe"),
+        "campaign_id": _handle("campaign"),
+        "universe_id": _handle("universe"),
+        "hypothesis_id": _handle("hypothesis"),
+        "revision": _COUNT, "spec_hash": _SHA256,
+        "provider": _Closed({**_fields("name profile version", _TEXT)}),
+        "oracle": _Closed({**_fields("id type version proof_scope expected_value selector", _TEXT)}),
+        "limits": _Closed({**_fields("step_total time_ms max_writes", _COUNT),
+                           "effect": _enum("read_only", "test_resource_write")}),
+        "control_groups": _Many(_Closed({
+            **_fields("id identity_role resource_version", _TEXT),
+            "controls": _Many(_Closed({**_fields("id role request_locator_sha256", _TEXT)})),
+        })),
+        "steps": _Many(_TEXT), "variable_names": _Many(_TEXT),
+        "private_ref": _Closed({**_fields("kind id public_hash", _TEXT)}),
+        "executable": _Rule("false"), "detail_action": action,
+        "notice": _TEXT, "render_truncated": _BOOL,
+    })
+    campaign_recipe_target = _Closed({
+        "operation_id": _handle("operation"), "method": method,
+        "session_id": _handle("session"), "resource_id": _handle("resource"),
+        "fixture_id": _digest("FX", 24),
+    })
+    campaign_recipe_control = _Closed({
+        "group": _TEXT, "roles": _Many(_enum("normal", "attack", "negative", "sensitivity")),
+    })
+    campaign_preparation_action = _Closed({
+        "missing_context": _TEXT, "action": action, "reason": _TEXT,
+        "help_input": _Closed({"name": action}),
+        "automatic_execution_allowed": _Rule("false"),
+    })
+    campaign_recipe_row = _Closed({
+        "hypothesis": _Closed({
+            **_fields("family security_property statement status why", _TEXT),
+            "id": _handle("hypothesis"),
+        }),
+        "target": campaign_recipe_target, "controls": _Many(campaign_recipe_control),
+        "recipe": recipe_reference,
+        "score": _Closed({
+            **_fields(
+                "score family_gap_weight exploitability "
+                "operation_importance readiness aging cost",
+                _NUMBER,
+            ),
+        }),
+        "prerequisites": _Many(_TEXT), "expected_outcome": _TEXT,
+        "coverage_delta_preview": _Closed({"tested": _COUNT, "family": family}),
+    })
+    result["campaign.next"] = _Closed({
+        "campaign_id": _handle("campaign"), "recipes": _Many(campaign_recipe_row),
+        "preparation": _Many(_Closed({
+            "status": _TEXT, "hypothesis_id": _handle("hypothesis"), "family": family,
+            "operation_id": _handle("operation"),
+            "action": action, "reason": _TEXT, "missing_context": _Many(_TEXT),
+            "next_action": action,
+            "preparation_actions": _Many(campaign_preparation_action),
+            "automatic_execution_allowed": _Rule("false"),
+        })),
+        "queue": _Closed({
+            **_fields("families_ready diversity", _COUNT),
+            "score_model": _enum("family_gap_v1"),
+        }),
+        "returned": _COUNT, "next_action": action, "note": _TEXT,
+    })
+    checkpoint_public = _Closed({
+        **_fields("label created_at", _TEXT),
+        **_fields("universe_snapshot_hash snapshot_hash work_semantic_hash", _SHA256),
+        "id": _handle("checkpoint"),
+        "campaign_id": _handle("campaign"),
+        "universe_summary": _Closed({name: _COUNT for name in (
+            "origins", "routes", "pages", "functions", "operations", "inputs", "consumers")}),
+        "hypothesis_counts": count_map, "family_matrix": _Many(family_matrix_row),
+        "known_case_matrix": _Many(known_case_matrix_row),
+        "gaps": _Many(_handle("gap")),
+        "hypotheses": _Many(_Tuple((
+            _handle("hypothesis"), _TEXT, _nullable(_TEXT),
+            _nullable(_handle("proof_receipt")),
+            _nullable(_handle("applicability_receipt")),
+        ))),
+        "frontier_receipt_ids": _Many(_handle("frontier_receipt")),
+    })
+    result["campaign.checkpoint"] = _Closed({
+        "checkpoint": checkpoint_public, "checkpoint_id": _handle("checkpoint"),
+        "campaign": campaign_public, "bounded_ids": bounded_ids,
+        "continuation": campaign_continuation,
+        "completion_decision": campaign_completion_decision,
+        "next_action": action,
+    })
+    frontier_receipt_public = _Closed({
+        "id": _handle("frontier_receipt"), "kind": _enum("frontier"),
+        "campaign_id": _handle("campaign"), "topic": _TEXT,
+        "material": _Closed({
+            "campaign_id": _handle("campaign"), "universe_id": _handle("universe"),
+            "universe_snapshot_hash": _SHA256, "round_key": _TEXT,
+            "round_sha256": _SHA256, "semantic_schema": _TEXT,
+            "semantic": json_value, "observations": json_value,
+            "boundary_complete": _BOOL,
+        }),
+        "reviewer": _Closed({"type": _TEXT, "id": _TEXT, "source": _TEXT}),
+        "unresolved_items": _Many(_TEXT), "limitations": _Many(_TEXT),
+        "decision": _enum("proposed", "accepted", "rejected"),
+        "created_at": _TEXT, "receipt_hash": _SHA256,
+    })
+    result["campaign.review_frontier"] = _Closed({
+        "frontier_receipt": frontier_receipt_public,
+        "receipt_current": _BOOL, "reused": _BOOL,
+        "frontier_rounds": _COUNT, "frontier_current": _BOOL,
+        "bounded_ids": bounded_ids, "continuation": campaign_continuation,
+        "completion_decision": campaign_completion_decision, "next_action": action,
+    })
+    result["campaign.finish"] = _Closed({
+        "campaign": campaign_public, "delivery": campaign_delivery,
+        "dimensions": coverage_dimensions, "checkpoint_id": _handle("checkpoint"),
+        "bounded_ids": bounded_ids, "continuation": campaign_continuation,
+        "completion_decision": campaign_completion_decision, "notice": _TEXT,
+    })
+    migration_projection = _Closed({
+        **_fields("source_schema universe_snapshot_hash v2_access projection_sha256", _TEXT),
+        "source_counts": source_counts, "synthetic_test_runs": _COUNT,
+        "v1_writable": _BOOL, "legacy_evaluation_total": _COUNT,
+        "legacy_hypothesis_total": _COUNT, "legacy_unlinked_findings": _COUNT,
+    })
+    migration_ledger = _Closed({
+        **_fields("id source_schema projection_sha256 applied_at rollback", _TEXT),
+        "schema": _COUNT, "source_counts": source_counts, "synthetic_test_runs": _COUNT,
+    })
+    result["campaign.migrate"] = _Closed({
+        "projection": migration_projection, "writes": _COUNT,
+    })
+    _ACTION_VARIANTS["campaign.migrate"] = {
+        "dry_run": result["campaign.migrate"],
+        "apply": _Closed({"ledger": migration_ledger, "projection": migration_projection}),
+    }
+    result["campaign.rollback"] = _Closed({
+        "rolled_back_to": _enum("v1"), "ledger_id": _handle("migration"),
+        "v2_history_preserved": _Rule("true"),
+    })
+    universe_snapshot = _Closed({
+        "id": _handle("universe"), "snapshot_hash": _SHA256,
+        "completeness_level": _enum("declared_only", "source_inventory", "complete_snapshot"),
+        "site_wide_discovery_allowed": _BOOL, "unknown_counts": unknown_counts,
+        "origin_total": _COUNT, "route_total": _COUNT, "page_total": _COUNT,
+        "function_total": _COUNT, "operation_total": _COUNT, "input_total": _COUNT,
+        "consumer_total": _COUNT,
+    })
+    known_case_import = _Closed({
+        "kind": _enum("known_cases", "assessment_hints"),
+        "source_group": _TEXT,
+        "track": _nullable(_enum("import", "hint_assisted", "blind")),
+        "tracks": _Many(_enum("import", "hint_assisted", "blind")),
+        "track_counts": _Closed({track: _COUNT for track in (
+            "import", "hint_assisted", "blind")}),
+        "added": _COUNT,
+        "duplicates": _Many(_Closed({"case_id": _TEXT, "duplicate_of": _TEXT})),
+        "case_ids": _Many(_TEXT), "total": _COUNT,
+        "sha256": _SHA256, "normalized_sha256": _SHA256,
+    })
+    route_import = _Closed({
+        "kind": _enum("routes"), "added": _COUNT, "route_total": _COUNT,
+        "unresolved_total": _COUNT, "catch_all_total": _COUNT,
+        "limitations": _Many(_TEXT), "requests_sent": _Rule("0"),
+    })
+    result["recon.import"] = known_case_import
+    _ACTION_VARIANTS["recon.import"] = {
+        "known_cases": known_case_import,
+        "routes": route_import,
+    }
+    result["recon.snapshot"] = _Closed({
+        "universe": universe_snapshot,
+        "imported": _nullable(_one_of(known_case_import, route_import)),
+        "requests_sent": _Rule("0"), "notice": _TEXT,
+    })
+    route_source = _Closed({
+        "path_template": _TEXT, "name": _TEXT, "component": _TEXT,
+        "parent": _TEXT, "aliases": _Many(_TEXT), "redirect": _TEXT,
+        "catch_all": _BOOL, "lazy": _BOOL, "dynamic_params": _Many(_TEXT),
+        "unresolved": _BOOL, "limitations": _Many(_TEXT),
+        "id": _digest("RS", 24), "created_at": _TEXT,
+    })
+    result["recon.routes"] = _Closed({
+        "mode": _enum("history", "hash", "abstract"),
+        "routes": _Many(route_source),
+        "route_total": _COUNT, "unresolved_total": _COUNT,
+        "catch_all_total": _COUNT, "limitations": _Many(_TEXT),
+        "offset": _COUNT, "limit": _COUNT, "next_offset": _COUNT,
+    })
+    hypothesis_public = _Closed({
+        **_fields("family security_property input_key "
+                  "input_id protocol relation business_precondition source_kind statement label "
+                  "status state_reason", _TEXT),
+        "id": _handle("hypothesis"),
+        "campaign_id": _handle("campaign"),
+        "universe_id": _handle("universe"),
+        "operation_id": _handle("operation"),
+        "missing_context": _Many(_TEXT),
+        "applicability_receipt_id": _handle("applicability_receipt"),
+        "recipe_ids": _Many(_handle("recipe")), "run_ids": _Many(_handle("run")),
+        "finding_ids": _Many(_handle("finding")), "revision": _COUNT,
+        "superseded": _BOOL,
+    })
+    result["recon.hypotheses"] = _Closed({
+        "items": _Many(hypothesis_public), "total": _COUNT,
+        "offset": _COUNT, "limit": _COUNT, "next_offset": _COUNT,
+    })
+    result["recon.capabilities"] = capabilities_schema
+    review_control = _Closed({
+        **_fields("id role content_digest request_locator_sha256", _TEXT),
+        "evidence_id": _handle("evidence"),
+    })
+    review_control_group = _Closed({
+        **_fields("id identity_role resource_version", _TEXT),
+        "controls": _Many(review_control),
+    })
+    review_contract = _Closed({
+        **_fields("reason created_at contract_hash", _TEXT),
+        "id": _handle("review"),
+        "campaign_id": _handle("campaign"),
+        "universe_id": _handle("universe"),
+        "hypothesis_id": _handle("hypothesis"),
+        "run_id": _handle("run"),
+        "review_proof_receipt_id": _nullable(_handle("review_proof_receipt")),
+        "mechanism": _Closed({**_fields(
+            "family security_property input_key location selector schema_branch "
+            "branch mechanism_note", _TEXT),
+            "operation_id": _handle("operation")}),
+        "identity": _Closed({**_fields(
+            "tenant_id fixture_id", _TEXT),
+            "actor_id": _handle("actor"), "resource_id": _handle("resource"),
+            "session_generation": _COUNT}),
+        "control_groups": _Many(review_control_group),
+        "observation": _Closed({**_fields("selector expected actual", _TEXT)}),
+        "consumer_point": _Closed({**_fields(
+            "type url identity_role method selector", _TEXT),
+            "resource_id": _handle("resource")}),
+        "source_trust": _Closed({**_fields("kind trust", _TEXT)}),
+        "reviewer": _Closed({**_fields("type id source", _TEXT), "independent_human": _BOOL}),
+        "proof_scope": _Closed({**_fields("accepted not_proven", _TEXT)}),
+        "material": _Closed({
+            "evidence_ids": _Many(_handle("evidence")),
+            "digests": _Closed({}, additional=_SHA256),
+        }),
+        "verification": _Closed({**_fields("version method checked_at", _TEXT)}),
+    })
+    # Material containers are keyed by concrete evidence IDs.
+    review_contract.fields["material"].fields["evidence_ids"] = _Many(_handle("evidence"))
+    review_contract.fields["proof_scope"].fields["accepted"] = _Many(_TEXT)
+    review_contract.fields["proof_scope"].fields["not_proven"] = _Many(_TEXT)
+    receipt_dependency_public = _Closed({
+        "kind": _enum(*sorted(DEPENDENCY_KINDS)), "id": _TEXT,
+        "revision": _NULLABLE_COUNT, "fingerprint": _nullable(_TEXT),
+        "metadata": _Closed({
+            **_fields(
+                "artifact_path fingerprint_fields target_build material_id receipt_kind",
+                _TEXT,
+            ),
+            "universe_id": _nullable(_handle("universe")),
+            "campaign_id": _nullable(_handle("campaign")),
+            "hypothesis_id": _nullable(_handle("hypothesis")),
+            "recipe_id": _nullable(_handle("recipe")),
+            "evidence_id": _nullable(_handle("evidence")),
+            "build_evidence_id": _nullable(_handle("evidence")),
+            "fingerprint_fields": _Many(_TEXT),
+            "requires_platform_build": _BOOL,
+        }),
+        "key": _TEXT,
+    })
+    receipt_material = _Closed({
+        "evidence_ids": _Many(_handle("evidence")),
+        "digests": _Closed({}, additional=_SHA256),
+    })
+    receipt_reviewer = _Closed({**_fields("type id source", _TEXT)})
+    receipt_scope = _Closed({
+        "accepted": _Many(_TEXT), "not_proven": _Many(_TEXT),
+    })
+    proof_receipt_public = _Closed({
+        "created_at": _TEXT, "receipt_hash": _SHA256,
+        "decision": _enum("proposed", "accepted", "rejected"),
+        "campaign_id": _handle("campaign"),
+        "hypothesis_id": _handle("hypothesis"),
+        "run_id": _handle("run"),
+        "review_id": _nullable(_handle("review")),
+        "review_proof_receipt_id": _nullable(_handle("review_proof_receipt")),
+        "schema": _COUNT, "kind": _enum("proof"),
+        "mode": _enum("machine", "reviewed"),
+        "proof_scope": receipt_scope, "material": receipt_material,
+        "reviewer": receipt_reviewer,
+        "dependencies": _Many(receipt_dependency_public),
+        "id": _handle("proof_receipt"),
+    })
+    review_proof_receipt_public = _Closed({
+        **_fields("subject_id material_id created_at", _TEXT),
+        "schema": _enum("awa-reviewed-detection/v1"),
+        "profile": _enum("unexpected_expression_evaluation", "bounded_side_effect",
+                         "unsafe_type_instantiation", "upload_path_escape"),
+        "bindings": _Closed({
+            "input_selector": _TEXT, "test_family": family,
+            "operation_id": _handle("operation"),
+            "actor_id": _handle("actor"),
+            "session_id": _handle("session"),
+            "resource_id": _handle("resource"),
+            "operation_signature": _digest("S"),
+            "input_location": input_row["location"],
+            "schema_branch": _nullable(_TEXT),
+            "session_generation": _COUNT,
+        }),
+        "evidence_ids": _Many(_handle("evidence")),
+        "digests": _Closed({}, additional=_SHA256),
+        "proof_scope": _enum("unexpected_expression_evaluation", "bounded_side_effect",
+                             "unsafe_type_instantiation", "upload_path_escape"),
+        "not_proven": _Many(_TEXT),
+        "observation_sha256": _SHA256,
+        "reviewer_assurance": _enum("agent_recorded"),
+        "machine_proof": _Rule("false"), "rules_version": _COUNT,
+        "material_sha256": _SHA256, "scope_sha256": _SHA256,
+        "id": _handle("review_proof_receipt"),
+    })
+    receipt_bindings = _Closed({
+        "operation_signature": _digest("S"),
+        "input_location": input_row["location"],
+        "input_selector": _TEXT, "test_family": family,
+        "operation_id": _handle("operation"),
+        "schema_branch": _nullable(_TEXT),
+    })
+    applicability_receipt_public = _Closed({
+        **_fields("security_property input_key reason created_at", _TEXT),
+        "receipt_hash": _SHA256,
+        "campaign_id": _handle("campaign"),
+        "hypothesis_id": _handle("hypothesis"),
+        "schema": _COUNT, "kind": _enum("applicability"),
+        "bindings": receipt_bindings,
+        "input_branch": _Closed({
+            **_fields("location selector", _TEXT),
+            "schema_branch": _nullable(_TEXT),
+        }),
+        "predicate": _Closed({}, additional=json_value),
+        "verifier": _Closed({**_fields("type id version method", _TEXT)}),
+        "evidence_ids": _Many(_handle("evidence")),
+        "material": receipt_material,
+        "reviewer": receipt_reviewer,
+        "proof": _Closed({
+            **_fields(
+                "type build_selector deployment_id manifest_sha256_selector "
+                "predicate_selector reviewer reason",
+                _TEXT,
+            ),
+            "build_evidence_id": _nullable(_handle("evidence")),
+        }),
+        "manifest_material": _Closed({
+            **_fields("material_id material_sha256 build_evidence_sha256", _TEXT),
+        }),
+        "dependencies": _Many(receipt_dependency_public),
+        "decision": _enum("proposed", "accepted", "rejected"),
+        "id": _handle("applicability_receipt"),
+    })
+    review_evidence_review = _Closed({"review": review_contract})
+    review_evidence_run = _Closed({"run": test_run_public})
+    result["review.evidence"] = review_evidence_review
+    _ACTION_VARIANTS["review.evidence"] = {
+        "review": review_evidence_review, "run": review_evidence_run,
+    }
+    disposition_active = _Closed({
+        "hypothesis": hypothesis_public, "status": _TEXT,
+        "counts_as_tested": _BOOL,
+    })
+    disposition_na = _Closed({
+        "hypothesis": hypothesis_public, "status": _enum("not_applicable"),
+        "applicability_receipt": applicability_receipt_public,
+        "bindings": receipt_bindings, "counts_as_tested": _Rule("false"),
+    })
+    result["review.disposition"] = disposition_active
+    _ACTION_VARIANTS["review.disposition"] = {
+        "active": disposition_active, "not_applicable": disposition_na,
+    }
+    finding_v2 = _Closed({
+        **_fields("mode status severity confidence title category impact remediation "
+                  "proof_scope created_at updated_at "
+                  "confirmed_scope reviewer_assurance verified_observation_sha256", _TEXT),
+        "id": _handle("finding"),
+        "campaign_id": _handle("campaign"),
+        "hypothesis_id": _handle("hypothesis"),
+        "run_id": _nullable(_handle("run")),
+        "test_run_id": _nullable(_handle("run")),
+        "review_id": _nullable(_handle("review")),
+        "proof_receipt_id": _nullable(_handle("proof_receipt")),
+        "decision_id": _nullable(_handle("decision")),
+        "superseded_by": _nullable(_handle("finding")),
+        "review_proof_receipt_id": _nullable(_handle("review_proof_receipt")),
+        "schema": _COUNT, "evidence_ids": _Many(_handle("evidence")),
+        "limitations": _Many(_TEXT), "legacy_unlinked": _BOOL, "current": _BOOL,
+        "machine_proof": _BOOL,
+    })
+    result["review.finding"] = _Closed({
+        "review": review_contract, "finding": finding_v2,
+        "proof_receipt": proof_receipt_public,
+        "review_proof_receipt": review_proof_receipt_public,
+        "machine_proof": _Rule("false"), "detection": _Rule("true"),
+        "reviewer_independent": _BOOL,
+    })
+    result["review.bind"] = _Closed({
+        "finding": finding_v2, "proof_receipt": proof_receipt_public,
+        "superseded_finding_id": _handle("finding"), "machine_proof": _Rule("true"),
+    })
+    external_result = _Closed({
+        **_fields("kind status session_generation method effect started_at completed_at "
+                  "error error_code reason files partial_files "
+                  "server_info tools tool_version scanner_project instance_id remote_run_id table "
+                  "declared_flags trust finding_status", _TEXT),
+        "id": _handle("run"), "run_id": _handle("run"),
+        "operation_id": _handle("operation"),
+        "session_id": _handle("session"),
+        "actor_id": _handle("actor"),
+        "resource_id": _handle("resource"),
+        "evidence_ids": _Many(_handle("evidence")),
+        "candidate_ids": _Many(_handle("candidate")),
+        "available": _BOOL, "usable_for_confirmation": _Rule("false"),
+    })
+    result["test.run_external"] = _Closed({
+        "adapter": _enum("sqlmap", "yakit"), "tool_run_id": _handle("run"),
+        "result": external_result, "usable_for_confirmation": _Rule("false"),
+        "notice": _TEXT,
+    })
+    external_run = _Closed({
+        **_fields("mode status provider verification_level created_at updated_at", _TEXT),
+        "id": _handle("run"),
+        "campaign_id": _handle("campaign"),
+        "hypothesis_id": _handle("hypothesis"),
+        "recipe_id": _nullable(_handle("recipe")),
+        "schema": _COUNT, "evidence_ids": _Many(_handle("evidence")),
+        "external_receipt": _Closed({**_fields("sha256", _TEXT)}),
+        "evaluation": _Closed({**_fields("outcome", _TEXT), "finding_allowed": _BOOL,
+                               "limitations": _Many(_TEXT)}),
+        "effect": _Closed({**_fields("kind", _TEXT), "unknown": _BOOL, "reconciled": _BOOL}),
+    })
+    result["test.record_external"] = _Closed({
+        "run": external_run, "usable_for_confirmation": _Rule("false"), "notice": _TEXT,
+    })
+    xss_evaluation = _Closed({
+        **_fields("profile proof_scope observation_sha256 reason", _TEXT),
+        "finding_allowed": _BOOL, "machine_proof": _Rule("false"),
+        "not_proven": _Many(_TEXT),
+    })
+    browser_observations = _Closed({
+        "trigger_source": _enum("application", "none"),
+        "application_triggered": _BOOL, "attack_dialog": _BOOL,
+        "normal_dialog": _BOOL, "consumer_page": _TEXT,
+        "same_identity": _BOOL, "content_version": _SHA256,
+        "writer_attack_evidence": _handle("evidence"),
+        "writer_normal_evidence": _handle("evidence"),
+    })
+    browser_oracle_result = _Closed({
+        "outcome": _enum("observed", "supported", "refuted", "inconclusive"),
+        "finding_allowed": _BOOL, "limitations": _Many(_TEXT),
+        "proof_scope": _nullable(_enum(
+            "browser_runtime_xss",
+            "unexpected_expression_evaluation",
+            "unsafe_type_instantiation",
+            "bounded_side_effect",
+            "upload_path_escape",
+        )),
+        "missing": _Many(_TEXT),
+        "observations": browser_observations,
+    })
+    browser_evaluate = _Closed({
+        "evaluation": browser_oracle_result, "finding_allowed": _BOOL,
+        "notice": _TEXT,
+    })
+    # `test.run_browser` visit delegates to the existing browser result contract.
+    result["test.run_browser"] = browser_evaluate
+    _ACTION_VARIANTS["test.run_browser"] = {
+        "evaluate": browser_evaluate, "visit": visit,
+    }
+    result["test.run_scenario"] = _Closed({
+        "scenario_result": run,
+        "verification_level": _enum("scenario_evidence"),
+        "notice": _TEXT,
+    })
+    matrix_findings = _Many(finding_v2)
+    report_matrix_schema = _Closed({
+        "campaign_id": _handle("campaign"), "universe": campaign_universe,
+        "dimensions": coverage_dimensions, "family_matrix": _Many(family_matrix_row),
+        "route_matrix": _Many(route_matrix_row),
+        "consumer_matrix": _Many(consumer_matrix_row),
+        "known_case_matrix": _Many(known_case_matrix_row),
+        "known_case_summary": known_case_summary, "tool_yield": tool_yield,
+        "finding_summary": campaign_finding_summary,
+        "findings": matrix_findings, "delivery": campaign_delivery,
+        "completion_decision": campaign_completion_decision,
+        "continuation": campaign_continuation, "checkpoint_id": _handle("checkpoint"),
+        "bounded_ids": bounded_ids,
+        "denominators": _Closed({name: _TEXT for name in (
+            "discovery", "consumer", "hypothesis", "known_case", "machine_proof")}),
+        "computed_by": _enum("engine"),
+    })
+    result["report.matrix"] = report_matrix_schema
+    compare_campaign = _Closed({
+        "campaign_id": _handle("campaign"),
+        "dimensions": _Closed({
+            "discovery": coverage_claim, "consumer": coverage_claim,
+            "hypothesis": coverage_claim, "machine_proof": coverage_claim,
+        }),
+        "known_case": known_case_summary,
+        "unplanned_family_count": _COUNT,
+        "finding_summary": campaign_finding_summary,
+        "current_finding_ids": _Many(_handle("finding")),
+        "completion_decision": campaign_completion_decision,
+        "checkpoint_id": _handle("checkpoint"),
+    })
+    result["report.compare"] = _Closed({
+        "campaigns": _Many(compare_campaign), "notice": _TEXT,
+    })
+    result["report.artifact"] = _Closed({
+        "handle": _ARTIFACT, "content": _TEXT_PAGE, "offset": _COUNT,
+        "limit": _COUNT, "next_offset": _NULLABLE_COUNT,
+        "size_bytes": _COUNT, "sha256": _SHA256, "complete": _BOOL,
+        "media_type": _enum("text/markdown", "application/json"),
+    })
+    report_v2 = _Closed({
+        "report": _ARTIFACT, "matrix": _ARTIFACT, "manifest": _ARTIFACT,
+        "report_sha256": _SHA256, "matrix_sha256": _SHA256, "manifest_sha256": _SHA256,
+        "stage": _enum("draft", "final"),
+        "profile": _enum("full", "technical", "executive", "both", "repro"),
+        "checkpoint_id": _handle("checkpoint"),
+        "completion_decision": campaign_completion_decision,
+        "delivery": campaign_delivery, "dimensions": coverage_dimensions,
+        "bounded_ids": bounded_ids, "generated_at": _TEXT, "notice": _TEXT,
+    })
+    _ACTION_VARIANTS["report.build"] = {
+        "v1": result["report.build"], "v2": report_v2,
+    }
     result["tool.artifact"] = {**_fields("content name trust finding_status"), "run_id": _handle("run"),
                                 **_fields("offset limit total_chars next_offset", _COUNT), "usable_for_confirmation": _BOOL}
     evidence_hash = {"evidence_id": _handle("evidence"), "sha256": _SHA256, "kind": _enum("http", "browser"),
@@ -863,10 +2320,15 @@ def _schemas():
     exchange_decision = {**_fields("category oracle_type reason"), "decision_id": proof_handle,
                          "outcome": _enum("confirmed", "refuted", "inconclusive"),
                          "mode": _enum("machine", "analyst"), "proof_mode": _enum("machine", "analyst"),
+                         "review_proof_receipt_id": _handle("review_proof_receipt"),
+                         "reviewer_assurance": _enum("agent_recorded"),
                          "evidence_ids": _Many(_handle("evidence")), "evidence_hashes": _Many(evidence_hash),
                          **_fields("current validated usable_for_confirmation", _BOOL)}
     exchange_finding = {**_fields("category title"), "finding_id": finding_handle, "decision_id": proof_handle,
                         "mode": _enum("machine", "analyst"),
+                        "review_proof_receipt_id": _handle("review_proof_receipt"),
+                        "reviewer_assurance": _enum("agent_recorded"),
+                        "confirmed_scope": finding["confirmed_scope"],
                         "status": _enum("confirmed", "machine_confirmed", "reviewed_confirmed", "withdrawn", "rejected", "superseded"),
                         "severity": _enum("info", "low", "medium", "high", "critical"),
                         "evidence_ids": _Many(_handle("evidence")), **_fields("current usable_for_confirmation", _BOOL)}
@@ -883,7 +2345,9 @@ def _schemas():
             "severity": _enum("info", "low", "medium", "high", "critical"), "status": _enum("unverified", "linked", "dismissed"),
             "source": exchange_source, "decisions": _Many(exchange_decision), "findings": _Many(exchange_finding),
             "usable_for_confirmation": _BOOL, "proofs_truncated": _BOOL})}
-    error = {"code": _enum(*_ERROR_CODES), "message": _TEXT, "details": {**_fields("field step_id reason missing_prerequisites"), "action": action,
+    error_details = {name: _TEXT for name in ERROR_DETAIL_FIELDS}
+    error_details.update({**_fields("field step_id reason locator", _TEXT), "missing": _Rule("text_or_string_list"),
+        "missing_prerequisites": _Many(_TEXT), "action": action,
         "assessment_mode": config["assessment_mode"], "required_assessment_mode": config["assessment_mode"],
         "decision_id": proof_handle, "evidence_ids": _Many(_handle("evidence")),
         "next_action": action, "help_action": action, "help_input": {"name": action}, "continuation": continuation,
@@ -899,7 +2363,26 @@ def _schemas():
         "progress_export": {"action": action, "input": {"stage": _enum("draft")}},
         "run_id": _handle("run"), "operation_id": _handle("operation"), "obligation_id": _handle("obligation"),
         "evidence_id": _handle("evidence"), "candidate_id": _handle("candidate"), "steps": _Many(checkpoint_step),
-        "requests_sent": _COUNT, "requests_replayed": _COUNT}}
+        "requests_sent": _COUNT, "requests_replayed": _COUNT,
+        "actor_id": _nullable(_handle("actor")),
+        "actual_campaign_id": _nullable(_TEXT), "expected_campaign_id": _TEXT,
+        "allowed": _Many(_TEXT), "binding": _TEXT, "blocked": _BOOL,
+        "completion_decision": campaign_completion_decision,
+        "current_revision": _COUNT, "expected_revision": _COUNT,
+        "effect_unknown": _BOOL, "entity_id": _TEXT,
+        "fixture_state": _enum("created", "verified", "leased", "mutated", "readback_ok",
+                               "cleanup_pending", "cleaned", "cleanup_failed", "quarantined"),
+        "hypothesis_status": _enum("unplanned", "ready", "running", "supported", "refuted",
+                                   "inconclusive", "blocked", "not_applicable"),
+        "matches": _COUNT, "max_requests": _nullable(_COUNT), "max_writes": _nullable(_COUNT),
+        "missing_terms": _Many(_TEXT), "outcome": _nullable(_TEXT),
+        "planned_requests": _COUNT, "planned_writes": _COUNT, "remote_may_continue": _BOOL,
+        "session_id": _nullable(_handle("session")), "unknown_fields": _Many(_TEXT),
+        "validation_stage": _enum("multipart_framing")})
+    error = _Closed({
+        "code": _enum(*_ERROR_CODES), "message": _TEXT,
+        "details": _Closed(error_details),
+    })
     visited = set()
 
     def privacy_controls(shape):
@@ -911,8 +2394,16 @@ def _schemas():
                 privacy_controls(child)
             shape.update({key: _Rule("true") for key in ("url_redacted", "path_redacted", "locator_requires_binding", "native_input_requires_binding")})
             shape["requestable"] = _Rule("false")
+        elif isinstance(shape, _Closed):
+            for child in list(shape.fields.values()) + (
+                [shape.additional] if shape.additional is not None else []
+            ):
+                privacy_controls(child)
         elif isinstance(shape, _Many):
             privacy_controls(shape.item)
+        elif isinstance(shape, _Tuple):
+            for child in shape.items:
+                privacy_controls(child)
 
     for shape in result.values():
         privacy_controls(shape)
@@ -921,14 +2412,34 @@ def _schemas():
 
 
 _ACTION_SCHEMAS = None
+_ACTION_VARIANTS = {}
 _ERROR_SCHEMA = None
+
+
+def _select_action_schema(project, action, result):
+    schema = _ACTION_SCHEMAS.get(action, {})
+    variants = _ACTION_VARIANTS.get(action, {})
+    key = None
+    if action == "report.build":
+        key = "v2" if project.config.get("assessment_model") == "v2" else "v1"
+    elif action == "campaign.migrate":
+        key = "apply" if isinstance(result, dict) and isinstance(result.get("ledger"), dict) else "dry_run"
+    elif action == "recon.import":
+        key = "routes" if isinstance(result, dict) and result.get("kind") == "routes" else "known_cases"
+    elif action == "review.evidence":
+        key = "review" if isinstance(result, dict) and "review" in result else "run"
+    elif action == "review.disposition":
+        key = "not_applicable" if isinstance(result, dict) and "applicability_receipt" in result else "active"
+    elif action == "test.run_browser":
+        key = "evaluate" if isinstance(result, dict) and "evaluation" in result else "visit"
+    return variants.get(key, schema)
 
 
 def publish(project, action, result, *, minted=None):
     global _ACTION_SCHEMAS, _ERROR_SCHEMA
     if _ACTION_SCHEMAS is None:
         _ACTION_SCHEMAS, _ERROR_SCHEMA = _schemas()
-    schema = _ACTION_SCHEMAS.get(action, {})
+    schema = _select_action_schema(project, action, result)
     if action == "run.inspect" and isinstance(result, dict) and result.get("kind") == "browser":
         schema = {**schema, **_ACTION_SCHEMAS["browser.visit"], "id": _handle("run"),
                   "status": _enum("running", "interrupted", "succeeded", "failed"),
@@ -944,7 +2455,9 @@ def publish_report_summary(project, summary, *, extra_secrets=(), files=None):
     context = PublicationContext(project, extra_secrets=extra_secrets)
     finding = dict(_ACTION_SCHEMAS["finding.record"])
     proof = {**_fields("channel source metadata_type input_location input_selector response_selector recovered_value observed_change "
-                       "expression source_reference witness marker consumer_url limitations content_selector resource_selector schema_branch runtime_marker"),
+                       "expression source_reference witness marker consumer_url limitations content_selector resource_selector schema_branch runtime_marker "
+                       "schema profile proof_scope not_proven reviewer_assurance"),
+             "machine_proof": _Rule("false"),
              "operation_id": _handle("operation"), "obligation_id": _handle("obligation"), "tool_run_id": _handle("run"),
              "visit_id": _handle("page_visit"), "runtime_visit_id": _handle("page_visit"),
              "normal_runtime_visit_id": _handle("page_visit"), "read_operation_id": _handle("operation"),
@@ -982,7 +2495,8 @@ def publish_report_summary(project, summary, *, extra_secrets=(), files=None):
               "manual_only": _Rule("true"), "executed_by_report": _Rule("false"), "steps": _Many(step), "sqlmap": sqlmap,
               "evidence_ids": _Many(_handle("evidence")),
               "oracle_type": _enum("baseline", "authorization", "semantic_negative", "state_invariant", "state_transition",
-                                   "extraction", "error_channel", "sql_metadata", "analyst_review", "analyst_runtime")}
+                                   "extraction", "error_channel", "sql_metadata", "analyst_review", "analyst_runtime",
+                                   "reviewed_detection")}
     details = summary.get("reproduction") if isinstance(summary, dict) else None
     reproduction = {identity: detail for identity in details or {} if context.bound_handle("finding", identity)}
     schema = {**_ACTION_SCHEMAS["report.build"], "format_version": _COUNT, "language": _enum("zh-CN"),
@@ -1243,11 +2757,13 @@ def _reproduction_sqlmap(project, target, decision, finding_id, files, steps):
 
 
 EXECUTION_ACTIONS = frozenset({"http.capture", "identity.verify", "scenario.run", "browser.visit", "browser.probe", "tool.probe",
-    "tool.sqlmap", "tool.yakit_replay", "tool.tscanplus_request", "tool.tscanplus_results", "tool.tscanplus_summary", "tool.tscanplus_routes"})
+    "tool.sqlmap", "tool.yakit_replay", "tool.tscanplus_request", "tool.tscanplus_results", "tool.tscanplus_summary", "tool.tscanplus_routes",
+    "tool.tscanplus_ingest"})
 OFFLINE_MUTATIONS = frozenset({"project.update", "project.import_pentest", "surface.register", "surface.batch", "surface.import",
     "surface.declare_consumer", "identity.actor", "identity.session", "identity.resource", "browser.import_mcp", "page.register",
     "page.adopt", "page.function", "page.mark", "plan.build", "plan.disposition", "plan.checkpoint", "plan.review", "plan.finalize",
-    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.bind", "finding.update", "integration.import"})
+    "candidate.link", "candidate.dismiss", "candidate.reopen", "run.recover", "assessment.evaluate", "finding.record", "finding.bind", "finding.update",
+    "integration.import", "tool.tscanplus_ingest"})
 
 
 def _persisted_run(project, action, args, previous, result=None, error=None, *, claimed=()):
@@ -1310,11 +2826,30 @@ def _public_error(project, action, args, previous, error, *, claimed=()):
         _ACTION_SCHEMAS, _ERROR_SCHEMA = _schemas()
     try:
         context = PublicationContext(project)
-        value = context.metadata({"code": error.code, "message": str(error), "details": error.details}, schema=_ERROR_SCHEMA)
+        input_details = error.details if isinstance(error.details, dict) else {}
+        protected_locator = "locator" in input_details
+        raw_details = dict(input_details)
+        if protected_locator:
+            raw_details.update(
+                locator=_PRIVATE_LOCATOR,
+                locator_redacted=True,
+                locator_requires_binding=True,
+                native_input_requires_binding=True,
+                requestable=False,
+            )
+        value = context.metadata({"code": error.code, "message": str(error), "details": raw_details}, schema=_ERROR_SCHEMA)
         code = value.get("code")
-        if not isinstance(code, str) or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", code) is None:
+        if not isinstance(code, str) or code not in _ERROR_CODES:
             code = "engine_error"
         details = value.get("details") if isinstance(value.get("details"), dict) else {}
+        if protected_locator:
+            details.update(
+                locator=_PRIVATE_LOCATOR,
+                locator_redacted=True,
+                locator_requires_binding=True,
+                native_input_requires_binding=True,
+                requestable=False,
+            )
         row = _persisted_run(project, action, args, previous, error=error, claimed=claimed)
         if row is not None:
             details.update(run_id=row["id"], execution_status=_execution_status(row),
@@ -1375,7 +2910,7 @@ def invoke(project, action, args, handler):
     project.id = mint
     project.claim = claim
     try:
-        if action in OFFLINE_MUTATIONS:
+        if action in OFFLINE_MUTATIONS and action not in EXECUTION_ACTIONS:
             with project.transaction():
                 return execute()
         return execute()

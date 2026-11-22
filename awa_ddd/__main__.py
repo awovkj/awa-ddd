@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from .store import Project, EngineError, canonical
 from . import engine
-from .contracts import validate_action_args
+from .contracts import validate_action_args, validate_action_shape
 
 
 def _unique_json_object(pairs):
@@ -56,6 +56,7 @@ def _project_dispatch(project, action, args):
         handler = {
             "campaign.start": v2api.campaign_start, "campaign.status": v2api.campaign_status,
             "campaign.next": v2api.campaign_next, "campaign.checkpoint": v2api.campaign_checkpoint,
+            "campaign.review_frontier": v2api.campaign_review_frontier,
             "campaign.finish": v2api.campaign_finish, "campaign.migrate": v2api.campaign_migrate,
             "campaign.rollback": v2api.campaign_rollback,
         }.get(action)
@@ -76,6 +77,9 @@ def _project_dispatch(project, action, args):
             "test.run": v2api.test_run, "test.run_browser": v2api.test_run_browser,
             "test.run_scenario": v2api.test_run_scenario, "test.run_external": v2api.test_run_external,
             "test.record_external": v2api.test_record_external, "test.inspect": v2api.test_inspect,
+            "test.fixture_create": v2api.test_fixture_create, "test.fixture_verify": v2api.test_fixture_verify,
+            "test.fixture_lease": v2api.test_fixture_lease, "test.fixture_inspect": v2api.test_fixture_inspect,
+            "test.fixture_readback": v2api.test_fixture_readback, "test.fixture_cleanup": v2api.test_fixture_cleanup,
         }.get(action)
         if handler:
             return handler(project, args)
@@ -93,8 +97,18 @@ def _project_dispatch(project, action, args):
     if action == "report.compare":
         from . import v2api
         return v2api.report_compare(project, args)
+    if action == "report.artifact":
+        from .report_artifacts import read_report_artifact
+        return read_report_artifact(project, args)
     if action=="project.update":
         return engine.update_project(project,args)
+    if action in {"project.migrate", "project.rollback"}:
+        from . import migration
+        return {"project.migrate": migration.migrate,
+                "project.rollback": migration.rollback}[action](project, args)
+    if action == "project.projection":
+        from .read_model import maintain
+        return maintain(project, args)
     if action=="project.status":
         from .workflow import project_status
         return project_status(project,args)
@@ -105,6 +119,10 @@ def _project_dispatch(project, action, args):
     if action == "surface.recon":
         from .reconnaissance import profile
         return profile(project, args)
+    if action == "surface.sources":
+        from .source_inventory import list_sources
+        from . import provider_discovery
+        return provider_discovery.public_sources_view(list_sources(project, args))
     if action=="surface.register":
         operation=engine.register_operation(project,args.get("operation",args))
         engine.build_plan(project)
@@ -132,6 +150,9 @@ def _project_dispatch(project, action, args):
                 "tool.tscanplus_results": tscanplus.query_results,
                 "tool.tscanplus_summary": tscanplus.project_summary,
                 "tool.tscanplus_routes": tscanplus.route_candidates}[action](project, args)
+    if action == "tool.tscanplus_ingest":
+        from . import provider_discovery
+        return provider_discovery.ingest(project, args)
     if action=="page.register":
         from . import browser
         return browser.public_metadata(project,browser.register_page(project,args))
@@ -148,23 +169,8 @@ def _project_dispatch(project, action, args):
         from . import browser
         return browser.public_metadata(project,browser.coverage(project))
     if action=="surface.import":
-        from .discovery import discover
-        from .candidates import store_candidate
-        result=discover(args["path"],args["format"],args.get("base_url"))
-        registered, rejected=[],[]
-        for hint in result["operations"]:
-            try:
-                registered.append(engine.register_operation(project,hint)["id"])
-            except EngineError as exc:
-                rejected.append({"kind":"operation_hint","hint":hint,"reason":exc.code})
-        created=0
-        for candidate in result.get("candidates",[])+rejected:
-            _,is_new=store_candidate(project,candidate)
-            created+=1 if is_new else 0
-        engine.build_plan(project)
-        return {"operation_ids":registered,"candidates":created,
-                "candidate_total":len(project.list("candidate")),
-                "limitations":result.get("limitations",[])}
+        from .source_inventory import import_source
+        return import_source(project, args)
     if action=="identity.actor":
         result=engine.add_actor(project,args)
         engine.build_plan(project)
@@ -189,9 +195,10 @@ def _project_dispatch(project, action, args):
     if action=="plan.audit":
         from .completeness import audit
         return audit(project,args)
-    if action in {"plan.checkpoint", "plan.review", "plan.finalize"}:
+    if action in {"plan.checkpoint", "plan.review", "plan.accept_partial", "plan.finalize"}:
         from . import continuation
         return {"plan.checkpoint": continuation.checkpoint, "plan.review": continuation.review,
+                "plan.accept_partial": continuation.accept_partial,
                 "plan.finalize": continuation.finalize}[action](project, args)
     if action=="candidate.list":
         from .candidates import list_candidates
@@ -228,6 +235,9 @@ def _project_dispatch(project, action, args):
         return run_scenario(project,args)
     if action=="run.recover":
         return engine.recover_runs(project,args)
+    if action=="execution.reconcile":
+        from .execution_coordinator import reconcile
+        return reconcile(project,args)
     if action=="run.inspect":
         run=project.get("run",args["run_id"])
         if run.get("kind")=="browser":
@@ -350,6 +360,8 @@ def main():
     # Own the protocol encoding even when invoked without Python's -X utf8 flag.
     sys.stdout.reconfigure(encoding="utf-8", errors="strict", newline="\n")
     sys.stderr.reconfigure(encoding="utf-8", errors="strict", newline="\n")
+    from .ipc import emit, accepted
+    emit("startup")
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace",required=True)
     options=parser.parse_args()
@@ -363,7 +375,14 @@ def main():
         if not isinstance(request,dict) or not isinstance(request.get("action"),str):
             raise EngineError("request", "Request requires action and args")
         action=request["action"]
-        data=dispatch(options.workspace,action,request.get("args",{}))
+        args=request.get("args", {})
+        # Acceptance proves a known action with a valid JSON object shape. Full
+        # field validation remains inside dispatch: project publication must
+        # enforce the persisted SRC policy before a missing field can mask a
+        # policy denial, while non-project actions still validate completely.
+        validate_action_shape(action, args)
+        accepted(raw, action)
+        data=dispatch(options.workspace,action,args)
         print(canonical({"ok":True,"data":data}))
         return 0
     except EngineError as exc:

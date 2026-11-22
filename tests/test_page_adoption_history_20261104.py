@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from awa_ddd import browser, completeness, engine
 from awa_ddd.store import EngineError, Project, canonical
+from awa_test_support import record_observation
 
 
 class PageAdoptionHistoryTests(unittest.TestCase):
@@ -25,7 +26,7 @@ class PageAdoptionHistoryTests(unittest.TestCase):
         raw = {"url": url, "finalUrl": url, "status": 200, "signals": {"forms": 1},
                "title": identity, "network": [{"url": url, "method": "GET", "status": 200}],
                "actions": [{"action": "click", "ok": True, "finalUrl": url}]}
-        browser._record_observation(self.project, raw, identity, source)
+        record_observation(self.project, raw, identity, source)
         return self.project.get("page_visit", identity)
 
     def audit(self):

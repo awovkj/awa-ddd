@@ -6,6 +6,7 @@ import unittest
 
 from awa_ddd import browser, engine
 from awa_ddd.store import EngineError, Project
+from awa_test_support import record_observation
 
 
 class PageAdoptionTests(unittest.TestCase):
@@ -25,7 +26,7 @@ class PageAdoptionTests(unittest.TestCase):
                             {"url": self.base + "/home", "method": "GET", "status": 200}], **changes}
 
     def test_successful_local_visit_adopts_navigation_without_http_or_function_claims(self):
-        visit = browser._record_observation(self.project, self.raw(), "PV-local", "local_playwright")
+        visit = record_observation(self.project, self.raw(), "PV-local", "local_playwright")
         self.assertEqual(visit["page_adoption"], "adopted")
         self.assertEqual(len(visit["page_ids"]), 2)
         self.assertEqual(browser.coverage(self.project)["pages_visited"], 2)
@@ -48,7 +49,7 @@ class PageAdoptionTests(unittest.TestCase):
         self.assertEqual(self.project.list("evidence"), [])
 
     def test_failed_or_corrupted_visits_do_not_manufacture_pages(self):
-        visit = browser._record_observation(self.project, self.raw(status=404), "PV-failed", "local_playwright")
+        visit = record_observation(self.project, self.raw(status=404), "PV-failed", "local_playwright")
         self.assertEqual(self.project.list("page"), [])
         with self.assertRaises(EngineError):
             browser.adopt_visit(self.project, {"page_visit_id": visit["id"]})

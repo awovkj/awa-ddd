@@ -1,13 +1,14 @@
 """Offline regressions for field-session tool results and safe artifact reads."""
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from awa_ddd import engine, external
+from awa_ddd import engine, execution_coordinator as coordinator, external
 from awa_ddd.store import EngineError, Project
 
 
@@ -21,6 +22,10 @@ class ExternalFixture(unittest.TestCase):
         self.addCleanup(self.project.close)
         self.executable = Path(self.tmp.name) / "sqlmap.py"
         self.executable.write_text("# A fixture, never executed.\n", encoding="utf-8")
+        trusted = patch.dict("os.environ", {external.TRUSTED_SQLMAP_ENV: json.dumps({
+            "path": str(self.executable.resolve()), "sha256": ""})})
+        trusted.start()
+        self.addCleanup(trusted.stop)
         self.operation = engine.register_operation(self.project, {
             "url": "http://audit.invalid/items", "method": "GET", "auth": "public",
             "inputs": [{"name": "sort", "location": "query", "selector": "sort", "consumer": "sql_order_by"}],
@@ -30,10 +35,26 @@ class ExternalFixture(unittest.TestCase):
 
     def fake_process(self, stdout_text, traffic_text="", exit_code=0, stderr_text=""):
         def start(command, **options):
-            options["stdout"].write(stdout_text.encode("utf-8"))
-            options["stderr"].write(stderr_text.encode("utf-8"))
-            traffic = Path(command[command.index("-t") + 1])
+            spec = json.loads(Path(command[-1]).read_text(encoding="utf-8"))
+            Path(spec["stdout_path"]).write_text(stdout_text, encoding="utf-8")
+            Path(spec["stderr_path"]).write_text(stderr_text, encoding="utf-8")
+            traffic = Path(spec["argv"][spec["argv"].index("-t") + 1])
             traffic.write_text(traffic_text, encoding="utf-8")
+            coordinator.dispatch(
+                self.project, spec["lease"], action="tool.sqlmap",
+                run_id=spec["run_id"],
+                request_hash=hashlib.sha256(b"external-fixture").hexdigest(),
+                budget=spec["budget_name"], max_requests=spec["max_requests"],
+                max_writes=spec["max_writes"], effect="read_only",
+                requests=1, writes=0, budget_unit="request_slots",
+                emit_ipc=False)
+            Path(spec["summary_path"]).write_text(json.dumps({
+                "schema": "awa-sqlmap-guard/v1", "complete": True,
+                "requests_attempted": 1, "writes_attempted": 0,
+                "guarded_requests": 1, "denied_requests": [],
+                "unguarded_socket_attempts": 0, "transport": "fixture",
+                "exit_code": exit_code,
+            }), encoding="utf-8")
 
             class Process:
                 returncode = exit_code

@@ -57,9 +57,14 @@ def transition(campaign, state, *, reason=None):
     return campaign
 
 
-def deliver(campaign, *, reason, accepted_by=None, explanation=None):
+def deliver(campaign, *, reason, accepted_by=None, explanation=None,
+            checkpoint_id=None, completion_decision=None, acceptance_id=None):
     """Record a delivery decision. Only ``completed`` grants exhaustion authority."""
     enum(reason, "delivery_reason", DELIVERY_REASONS)
+    if campaign.get("state") != "active" or campaign.get("delivery") is not None:
+        from .common import fail
+        fail("v2_campaign_frozen",
+             "A campaign delivery is immutable and can be recorded only once")
     state = "completed" if reason == "completed" else "delivered_partial"
     if reason == "partial_accepted":
         text(accepted_by, "accepted_by")
@@ -70,11 +75,51 @@ def deliver(campaign, *, reason, accepted_by=None, explanation=None):
         "explanation": optional_text(explanation, "explanation"),
         "delivered_at": utc_now(),
         "exhausted_authority": reason == "completed",
+        "checkpoint_id": optional_text(
+            checkpoint_id, "checkpoint_id", maximum=128),
+        "completion_decision_id": optional_text(
+            (completion_decision or {}).get("id"),
+            "completion_decision_id",
+            maximum=128,
+        ),
+        "acceptance_id": optional_text(
+            acceptance_id, "acceptance_id", maximum=128),
     }
     campaign["state"] = state
     campaign["updated_at"] = utc_now()
     campaign["version"] = int(campaign.get("version", 1)) + 1
     return campaign
+
+
+def delivery_acceptance(campaign, *, reason, accepted_by=None, explanation=None,
+                        checkpoint_id=None, completion_decision=None,
+                        remaining=None):
+    """Freeze the public delivery facts and the exact shared decision."""
+    enum(reason, "delivery_reason", DELIVERY_REASONS)
+    decision = mapping(completion_decision, "completion_decision")
+    completed = reason == "completed"
+    body = {
+        "schema": "awa-completion-acceptance/v1",
+        "campaign_id": campaign.get("id"),
+        "state": "completed" if completed else "delivered_partial",
+        "reason": reason,
+        "accepted_by": optional_text(
+            accepted_by, "accepted_by"),
+        "explanation": optional_text(explanation, "explanation"),
+        "checkpoint_id": optional_text(
+            checkpoint_id, "checkpoint_id", maximum=128),
+        "completion_decision_id": optional_text(
+            decision.get("id"), "completion_decision_id", maximum=128),
+        "completion_decision": dict(decision),
+        "remaining": list(remaining or []),
+        "exhausted_authority": bool(
+            completed and decision.get("can_claim_complete") is True),
+        "automatic_stop_allowed": bool(
+            completed and decision.get("can_claim_complete") is True),
+        "created_at": utc_now(),
+    }
+    body["id"] = stable_id("CDA", body)
+    return body
 
 
 def public_view(campaign):

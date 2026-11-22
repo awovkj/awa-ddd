@@ -25,9 +25,88 @@ REQUEST_ARGS = {"project_id", "operation_id", "url", "session_id", "resource_id"
 QUERY_ARGS = {"project_id", "table", "scanner_project", "instance_id", "limit", "result_limit", "timeout", "mcp_url"}
 SUMMARY_ARGS = {"project_id", "scanner_project", "mcp_url", "timeout"}
 ROUTE_ARGS = SUMMARY_ARGS | {"limit"}
+SOURCE_CAPTURE_ARGS = {"project_id", "source_kind", "table", "result_limit", "instance_id",
+                       "timeout", "mcp_url", "scanner_project"}
+DISPATCH_ACTIONS = {
+    "http_request": "tool.tscanplus_request",
+    "query_results": "tool.tscanplus_results",
+    "project_summary": "tool.tscanplus_summary",
+    "route_candidates": "tool.tscanplus_routes",
+}
 HTTP_SCHEMA = {"url": "string", "method": "string", "headers": "string", "cookie": "string", "body": "string",
                "follow_redirect": "boolean", "path_as_is": "boolean", "max_bytes": "number",
                "max_lines": "number", "timeout": "number"}
+
+
+def _dispatch_spec(name, values):
+    return _hash({"tool": name, "arguments": values})
+
+
+def _dispatch_remote(project, run, action, request_hash, *, timeout, effect="read_only"):
+    """Fence one MCP call and commit its budget/lease immediately before sending."""
+    from . import execution_coordinator as coordinator
+    from .ipc import emit_dispatch
+
+    ttl = max(30, min(3600, int(float(timeout)) + 60))
+    lease = coordinator.claim(
+        project, "tscanplus:" + run["id"], owner="run:" + run["id"], ttl=ttl)
+    try:
+        receipt = coordinator.dispatch(
+            project, lease,
+            action=action,
+            run_id=run["id"],
+            request_hash=request_hash,
+            budget="tscanplus:" + run["id"],
+            max_requests=1,
+            max_writes=int(effect != "read_only"),
+            effect=effect,
+            requests=1,
+            emit_ipc=False,
+        )
+    except Exception:
+        # A pre-flight dispatch failure never reached the remote provider.  If
+        # the receipt had already committed, release reports effect_unknown and
+        # the dispatched lease is deliberately retained.
+        try:
+            coordinator.release(project, lease)
+        except EngineError:
+            pass
+        raise
+    run.update(dispatch_attempted=True, remote_may_continue=True,
+               provider_terminal=False, effect_unknown=effect != "read_only", remote_state_unknown=True,
+               dispatch_hash=request_hash, dispatch_id=receipt["id"],
+               dispatch_budget={
+                   "max_requests": receipt["requests_remaining"] + receipt["requests"],
+                   "max_writes": receipt["writes_remaining"] + receipt["writes"],
+                   "requests_used": receipt["requests"],
+                   "writes_used": receipt["writes"],
+               },
+               lease_name=lease["name"], lease_owner=lease["owner"],
+               lease_fence=lease["fence"], lease_released=False)
+    project.put("run", run)
+    # Preserve the durable run checkpoint before the host receives the event.
+    emit_dispatch(action, run["id"], request_hash)
+    return lease, receipt
+
+
+def _release_remote(project, run, lease):
+    """Release only after a parsed terminal receipt and durable local artifact."""
+    if lease is None or run.get("status") != "succeeded" \
+            or run.get("provider_terminal") is not True \
+            or run.get("effect_unknown") is True or run.get("remote_state_unknown") is True:
+        return
+    if run.get("action") == "http_request" \
+            and (run.get("target_traffic_sent") is not True
+                 or type(run.get("reported_http_status")) is not int
+                 or not 100 <= run["reported_http_status"] <= 599):
+        return
+    from . import execution_coordinator as coordinator
+
+    released = coordinator.release(project, lease, reconciled=True)
+    run.update(lease_released=bool(released), lease_reconciled=bool(released))
+    project.put("run", run)
+
+
 QUERY_SCHEMA = {"table": "string", "project": "string", "instance_id": "string", "result_limit": "number",
                 "finger": "string", "keyword": "string", "poc_name": "string", "port": "string"}
 SUMMARY_SCHEMA = {"project": "string"}
@@ -220,8 +299,15 @@ def _document(project, run):
     if run.get("kind") != "external_tool" or run.get("adapter") != "tscanplus" or not run.get("artifact_path") or not run.get("sha256"):
         raise EngineError("tscanplus_artifact", "This is not a finalized TscanPlus tool artifact")
     document = project.read_artifact(run)
-    if not isinstance(document, dict) or not isinstance(document.get("execution"), dict) \
-            or any(run.get(key) != value for key, value in document["execution"].items()):
+    execution = document.get("execution") if isinstance(document, dict) else None
+    # Lease release is a post-capture reconciliation fact.  The signed artifact
+    # records the dispatch as still fenced; only the current run may advance
+    # those two lifecycle flags, and only monotonically from false to true.
+    post_capture = frozenset({"lease_released", "lease_reconciled"})
+    if not isinstance(execution, dict) or any(
+            run.get(key) != value
+            and not (key in post_capture and value is False and run.get(key) is True)
+            for key, value in execution.items()):
         raise EngineError("tscanplus_artifact", "The TscanPlus execution differs from its immutable artifact")
     reference = document.get("exchanges_ref")
     if reference is not None:
@@ -257,8 +343,10 @@ def _finish_saved(project, run, document):
 def _public(run, **extra):
     fields = ("id", "adapter", "action", "status", "available", "operation_id", "session_id", "session_generation", "actor_id",
               "resource_id", "effect", "mcp_url", "scanner_project", "selected_tool", "tool_name", "tool_count", "catalog_sha256",
+              "catalog_complete", "catalog_pages", "catalog_returned_count", "catalog_continuation_received",
               "verification_level", "error_code", "artifact_path", "sha256", "target_traffic_sent", "dispatch_attempted",
-              "remote_may_continue", "remote_stopped_verified", "response_truncated", "results_complete", "parser_status",
+              "remote_may_continue", "remote_stopped_verified", "provider_terminal", "effect_unknown", "remote_state_unknown",
+              "lease_released", "lease_reconciled", "response_truncated", "results_complete", "parser_status",
               "table", "instance_id", "result_limit", "reported_count", "returned_rows", "candidate_count", "new_candidates",
               "duplicate_candidates", "out_of_scope_rows", "unmapped_rows", "unretrieved_results", "reported_http_status",
               "reported_total", "reported_matched", "namespace_verified", "instance_verified", "counts", "has_assets",
@@ -268,8 +356,13 @@ def _public(run, **extra):
 
 
 def _record_error(project, run, document, error):
+    if run.get("action") == "http_request" and run.get("target_traffic_sent") is not True:
+        run["target_traffic_sent"] = None
     run.update(status="failed", error_code=getattr(error, "code", "tscanplus_failed"),
-               remote_may_continue=bool(run.get("dispatch_attempted")), remote_stopped_verified=False)
+               remote_may_continue=bool(run.get("dispatch_attempted")), remote_stopped_verified=False,
+               provider_terminal=False,
+               effect_unknown=bool(run.get("dispatch_attempted") and run.get("effect") != "read_only"),
+               remote_state_unknown=bool(run.get("dispatch_attempted")))
     document["error_type"] = type(error).__name__
     result = _finish_saved(project, run, document)
     raise EngineError(run["error_code"], "The bounded TscanPlus operation failed; inspect its immutable artifact before any new execution",
@@ -291,8 +384,32 @@ def probe(project, args):
     try:
         client = StreamableHTTPClient(endpoint, timeout=timeout, max_bytes=MCP_BYTES)
         initialized, catalog = client.initialize(), client.list_tools()
-        document.update(initialize=initialized, tools=catalog)
-        run.update(status="succeeded", available=True, verification_level="mcp_discovery", tool_count=len(catalog), catalog_sha256=_hash(catalog))
+        catalog_info = getattr(client, "catalog_info", None)
+        if not isinstance(catalog_info, dict) or catalog_info.get("complete") is not True \
+                or catalog_info.get("tool_count") != len(catalog) \
+                or type(catalog_info.get("pages")) is not int \
+                or catalog_info["pages"] < 1 \
+                or catalog_info.get("continuation_received") is not False:
+            raise EngineError(
+                "mcp_catalog",
+                "The MCP catalog did not provide a complete, internally consistent pagination receipt",
+            )
+        document.update(
+            initialize=initialized,
+            tools=catalog,
+            catalog_info=catalog_info,
+        )
+        run.update(
+            status="succeeded",
+            available=True,
+            verification_level="mcp_discovery",
+            tool_count=len(catalog),
+            catalog_sha256=_hash(catalog),
+            catalog_complete=True,
+            catalog_pages=catalog_info["pages"],
+            catalog_returned_count=catalog_info["tool_count"],
+            catalog_continuation_received=False,
+        )
     except (EngineError, OSError, ValueError, TypeError) as exc:
         run.update(status="failed", available=False, error_code=getattr(exc, "code", "tscanplus_probe_failed"))
         document["error_type"] = type(exc).__name__
@@ -307,6 +424,15 @@ def probe(project, args):
         config = project.config
         project.set_config({**config, "external_tools": {**config.get("external_tools", {}), "tscanplus": state}})
     return _public(result, limitation="Catalog discovery did not invoke a scanner, touch target URLs, clear a database or prove any vulnerability")
+
+
+def _http_terminal_status(data):
+    statuses = [data[key] for key in ("status_code", "statusCode", "StatusCode", "status") if key in data]
+    if not statuses or any(type(value) is not int or not 100 <= value <= 599 for value in statuses) \
+            or any(value != statuses[0] for value in statuses[1:]):
+        raise EngineError("tscanplus_result",
+                          "The scanner success envelope has no unique HTTP terminal status; target traffic and write effects remain unknown")
+    return statuses[0]
 
 
 def request_run(project, args):
@@ -344,8 +470,9 @@ def request_run(project, args):
     run.update(mcp_url=state["mcp_url"], scanner_project=state["scanner_project"], catalog_sha256=state["catalog_sha256"],
                selected_tool="http_request", tool_name="http_request", dispatch_attempted=False, remote_may_continue=False,
                remote_stopped_verified=False, request_fingerprint=fingerprint,
+               target_traffic_sent=None, provider_terminal=False, effect_unknown=False, remote_state_unknown=False,
                call_input_signature=_input_signature(project, args, state, base64.b64decode(request["body_base64"])))
-    document, client, error = {"request": request, "arguments": values}, None, None
+    document, client, error, lease = {"request": request, "arguments": values}, None, None, None
     try:
         client = StreamableHTTPClient(state["mcp_url"], timeout=timeout, max_bytes=MCP_BYTES)
         document["initialize"] = client.initialize()
@@ -355,15 +482,19 @@ def request_run(project, args):
         _same_settings(project, state)
         if _prepare(project, args)[3] != fingerprint:
             raise EngineError("tscanplus_context", "Request or security context changed during discovery")
-        run.update(dispatch_attempted=True, remote_may_continue=True)
-        project.put("run", run)
+        dispatch_hash = fingerprint
+        lease, dispatch_receipt = _dispatch_remote(
+            project, run, DISPATCH_ACTIONS["http_request"], dispatch_hash,
+            timeout=timeout, effect=run["effect"])
+        document["dispatch_receipt"] = dispatch_receipt
         document["result"] = client.call_tool("http_request", values)
         parsed = document["parsed_result"] = _tool_result(document["result"])
         data = parsed["data"]
-        statuses = [data[key] for key in ("status_code", "statusCode", "StatusCode", "status") if type(data.get(key)) is int and 100 <= data[key] <= 599]
+        status = _http_terminal_status(data)
+        run.update(reported_http_status=status, target_traffic_sent=True)
         truncated, complete = _result_flags(data)
         run.update(status="succeeded", verification_level="mcp_execution_untrusted", remote_may_continue=False,
-                   reported_http_status=statuses[0] if statuses else None, target_traffic_sent=bool(statuses),
+                   provider_terminal=True, effect_unknown=False, remote_state_unknown=False,
                    response_truncated=truncated,
                    results_complete=not truncated and complete is not False if truncated is not None else False if complete is False else None,
                    parser_status="recognized", limitation="A tool-reported HTTP result is not independent engine evidence; response completeness is unknown unless explicitly reported")
@@ -376,7 +507,9 @@ def request_run(project, args):
             document.setdefault("result", client.last_tool_result)
     if error:
         return _record_error(project, run, document, error)
-    return _public(_finish_saved(project, run, document))
+    result = _finish_saved(project, run, document)
+    _release_remote(project, run, lease)
+    return _public(run)
 
 
 def _row_value(row, names):
@@ -505,20 +638,24 @@ def _read_run(project, args, name, state, saved, values, parser, metadata=None):
     run.update(mcp_url=state["mcp_url"], scanner_project=state["scanner_project"], catalog_sha256=state["catalog_sha256"],
                selected_tool=name, tool_name=name, dispatch_attempted=False, remote_may_continue=False,
                remote_stopped_verified=False, results_complete=False, namespace_verified=False, **(metadata or {}))
-    document, client, error, plans = {"arguments": values}, None, None, []
+    document, client, error, plans, lease = {"arguments": values}, None, None, [], None
     try:
         client = StreamableHTTPClient(state["mcp_url"], timeout=timeout, max_bytes=MCP_BYTES)
         document["initialize"] = client.initialize()
         catalog = document["live_catalog"] = client.list_tools()
         document["selected_tool"] = _gate(catalog, saved, name, values)
         _same_settings(project, state)
-        run.update(dispatch_attempted=True, remote_may_continue=True)
-        project.put("run", run)
+        dispatch_hash = _dispatch_spec(name, values)
+        lease, dispatch_receipt = _dispatch_remote(
+            project, run, DISPATCH_ACTIONS[name], dispatch_hash,
+            timeout=timeout, effect="read_only")
+        document["dispatch_receipt"] = dispatch_receipt
         document["result"] = client.call_tool(name, values)
         parsed = document["parsed_result"] = _tool_result(document["result"])
         plans = parser(run, parsed, _secrets({"result": document["result"], "parsed_result": parsed}))
         _same_settings(project, state)
-        run.update(status="succeeded", remote_may_continue=False)
+        run.update(status="succeeded", remote_may_continue=False,
+                   provider_terminal=True, effect_unknown=False, remote_state_unknown=False)
         document["candidate_ids"] = [plan["id"] for plan in plans]
     except (EngineError, OSError, ValueError, TypeError, KeyError) as exc:
         run.update(parser_status="blocked", results_complete=False)
@@ -541,8 +678,135 @@ def _read_run(project, args, name, state, saved, values, parser, metadata=None):
             project.put("candidate", {**plan, "status": "unverified", "origin": "imported", "source": source,
                                       "sources": [source], "created_at": now(), "updated_at": now()}, create_only=True)
             project.event("candidate.tscanplus_imported", {"candidate_id": plan["id"], "run_id": run["id"]})
-    return _public(result, candidate_ids=document["candidate_ids"],
+    # A provider response is terminal, but the lease stays fenced until both
+    # the signed artifact and every local projection have been persisted.
+    _release_remote(project, run, lease)
+    return _public(run, candidate_ids=document["candidate_ids"],
                    limitation="Scanner data and routing suggestions are unverified; database counts are not a security negative, target authorization or full assessment coverage")
+
+
+def capture_source(project, args):
+    """Read one existing Tscan result profile without importing candidate records.
+
+    The returned private capture is consumed by provider_discovery, which maps
+    it into the common discovery snapshot ledger.  No scanner tool is called
+    here: only the already-existing result query or route inventory endpoints.
+    """
+    from .external import _start, _timeout
+
+    _arguments(args, SOURCE_CAPTURE_ARGS)
+    state, saved = _profile_settings(project, args)
+    kind = args.get("source_kind", "results")
+    table, limit, instance = args.get("table", "urlscan"), args.get("result_limit", 25), args.get("instance_id")
+    if not isinstance(kind, str) or kind not in {"results", "routes"}:
+        raise EngineError("tscanplus_source", "source_kind must be results or routes")
+    if kind == "results" and (not isinstance(table, str) or table not in TABLES):
+        raise EngineError("tscanplus_query", "Select a supported existing-result table")
+    if type(limit) is not int or not 1 <= limit <= 100 \
+            or instance is not None and (not isinstance(instance, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", instance)):
+        raise EngineError("tscanplus_query", "result_limit must be 1..100 and instance_id must be bounded")
+    name = "query_results" if kind == "results" else "route_candidates"
+    if kind == "results":
+        values = {"table": table, "project": state["scanner_project"], "result_limit": limit}
+        if instance is not None:
+            values["instance_id"] = instance
+    else:
+        if "table" in args:
+            raise EngineError("tscanplus_source", "route_candidates does not accept a result table")
+        if "instance_id" in args:
+            raise EngineError("tscanplus_source", "route_candidates does not accept an instance filter")
+        table, values = None, {"project": state["scanner_project"]}
+    _gate(saved, saved, name, values)
+    timeout = _timeout(args)
+    run, _ = _start(project, "tscanplus", "source_" + kind)
+    run.update(mcp_url=state["mcp_url"], scanner_project=state["scanner_project"],
+               catalog_sha256=state["catalog_sha256"], selected_tool=name, tool_name=name,
+               dispatch_attempted=False, remote_may_continue=False, remote_stopped_verified=False,
+               results_complete=False, namespace_verified=False, source_kind=kind,
+               table=table, instance_id=instance, result_limit=limit)
+    document = {"arguments": values, "source_kind": kind}
+    client = error = parsed = info = lease = None
+    try:
+        client = StreamableHTTPClient(state["mcp_url"], timeout=timeout, max_bytes=MCP_BYTES)
+        document["initialize"] = client.initialize()
+        catalog = document["live_catalog"] = client.list_tools()
+        if _hash(catalog) != state["catalog_sha256"]:
+            raise EngineError("mcp_schema", "The complete live TscanPlus tool catalog differs from the probed catalog; review it explicitly")
+        selected = _gate(catalog, saved, name, values)
+        document["selected_tool"] = selected
+        _same_settings(project, state)
+        dispatch_hash = _dispatch_spec(name, values)
+        lease, dispatch_receipt = _dispatch_remote(
+            project, run, "tool.tscanplus_ingest", dispatch_hash,
+            timeout=timeout, effect="read_only")
+        document["dispatch_receipt"] = dispatch_receipt
+        document["result"] = client.call_tool(name, values)
+        parsed = document["parsed_result"] = _tool_result(document["result"])
+        if kind == "results":
+            info = _query_rows(parsed, table, state["scanner_project"], instance, limit)
+            info.update(kind=kind, instance_id=instance, rows=info["rows"][:limit],
+                        processed_count=len(info["rows"][:limit]))
+            run.update(verification_level="mcp_results_untrusted",
+                       parser_status="namespace_echo_missing" if not info["namespace_verified"]
+                           else "instance_echo_missing" if not info["instance_verified"] else "recognized",
+                       reported_count=info["reported_count"], reported_total=info["reported_total"],
+                       reported_matched=info["reported_matched"], returned_rows=len(info["rows"]),
+                       namespace_verified=info["namespace_verified"], instance_verified=info["instance_verified"],
+                       response_truncated=info["truncated"],
+                       results_complete=bool(info["namespace_verified"] and info["instance_verified"]
+                           and info["reported_count"] == len(info["rows"]) and info["truncated"] is not True
+                           and info["complete"] is not False),
+                       unretrieved_results=info["reported_count"] > len(info["rows"]) or info["truncated"] is True)
+        else:
+            data, rows, counts, assets = parsed["data"], parsed["data"].get("candidates"), \
+                parsed["data"].get("counts", {}), parsed["data"].get("assets", [])
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows) \
+                    or not isinstance(assets, list) or not isinstance(counts, dict) \
+                    or any(type(value) is not int or value < 0 for key, value in counts.items() if key in TABLES) \
+                    or "has_assets" in data and type(data["has_assets"]) is not bool:
+                raise EngineError("tscanplus_result", "The route result collection/count structure is unsupported")
+            binding, flags = _bindings(data, rows, state["scanner_project"]), _result_flags(data)
+            processed = rows[:limit]
+            omitted = max(0, len(rows) - len(processed))
+            info = {"kind": kind, "rows": processed, "locator": "parsed_result.data.candidates",
+                    "reported_count": len(rows), "returned_count": len(rows),
+                    "processed_count": len(processed), "omitted_count": omitted,
+                    "truncated": flags[0], "complete": flags[1],
+                    "namespace_verified": binding["namespace_verified"],
+                    "instance_verified": binding["instance_verified"],
+                    "asset_count": len(assets),
+                    "counts": {key: counts[key] for key in sorted(TABLES) if key in counts},
+                    "has_assets": data.get("has_assets")}
+            run.update(verification_level="mcp_routes_untrusted", parser_status="recognized"
+                           if binding["namespace_verified"] else "namespace_echo_missing",
+                       namespace_verified=binding["namespace_verified"], reported_count=len(rows),
+                       returned_rows=len(rows), processed_rows=len(processed), omitted_candidates=omitted,
+                       asset_count=len(assets), response_truncated=flags[0],
+                       counts=info["counts"], has_assets=info["has_assets"],
+                       unretrieved_results=bool(omitted) or flags[0] is True,
+                       results_complete=binding["namespace_verified"] and not omitted
+                           and flags[0] is not True and flags[1] is not False
+                           and (flags[0] is False or flags[1] is True))
+        _same_settings(project, state)
+        run.update(status="succeeded", remote_may_continue=False,
+                   provider_terminal=True, effect_unknown=False, remote_state_unknown=False)
+    except (EngineError, OSError, ValueError, TypeError, KeyError) as exc:
+        run.update(parser_status="blocked", results_complete=False)
+        error = exc
+    finally:
+        if client:
+            client.close()
+            document["exchanges"] = client.exchanges
+            document.setdefault("result", client.last_tool_result)
+    if error:
+        return _record_error(project, run, document, error)
+    result = _finish_saved(project, run, document)
+    _release_remote(project, run, lease)
+    return _public(run, source_kind=kind, limitation=(
+        "Only an existing TscanPlus result profile was read; scanner execution remains unavailable "
+        "until scope, outbound redirect and reliable cancel contracts are proven"
+    )), document, parsed, info, state
 
 
 def query_results(project, args):

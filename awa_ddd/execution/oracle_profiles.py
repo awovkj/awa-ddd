@@ -199,7 +199,7 @@ def evaluate(oracle_type, observations, controls=None):
             return _result("supported", True, ["Exact type marker with bounded canary; gadget/RCE not proven."])
         return _result("inconclusive", False, ["Type marker without a bounded canary is insufficient."])
     if oracle_type == "bounded_side_effect":
-        if observations.get("reflection_excluded") is not True or observations.get("timing_not_sole_evidence") is not True:
+        if observations.get("reflection_exclusion") is not True or observations.get("timing_not_sole_evidence") is not True:
             return _result("inconclusive", False, ["Reflection or timing alone cannot prove a side effect."])
         if observations.get("attack_canary") is True and observations.get("normal_control") is False \
                 and observations.get("negative_control") is False:
@@ -241,7 +241,7 @@ def evaluate(oracle_type, observations, controls=None):
             return _result("supported", True, ["Forbidden transition completed and was read back."])
         return _result("refuted", False, ["Transition was rejected or state unchanged."])
     if oracle_type == "extraction":
-        if observations.get("extraction_matched") is True and observations.get("reflection_excluded") is True:
+        if observations.get("extraction_matched") is True and observations.get("reflection_exclusion") is True:
             return _result("supported", True, ["Expected controlled extraction observed."])
         return _result("inconclusive", False, ["No discriminating extraction."])
     if oracle_type == "error_channel":

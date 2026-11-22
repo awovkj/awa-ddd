@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { toolDefinitions, GROUPS, V2_GROUPS } from '../src/tools.mjs';
-import { ACTION_GROUPS, V2_ACTION_GROUPS, ALL_ACTIONS } from '../src/actions.mjs';
+import { ACTION_GROUPS, ACTIONS, V2_ACTION_GROUPS, ALL_ACTIONS } from '../src/actions.mjs';
 import { resolveConfig, validateRequest } from '../src/bridge.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -14,7 +14,7 @@ const defineTool = definition => definition;
 test('default surface remains the ten legacy groups', () => {
   const definitions = toolDefinitions(defineTool, config);
   assert.equal(definitions.length, 10);
-  assert.equal(GROUPS.flatMap(group => group.actions).length, 67);
+  assert.equal(GROUPS.flatMap(group => group.actions).length, ACTIONS.length);
 });
 
 test('v2 mode registers six groups and only v2 actions', () => {

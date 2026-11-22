@@ -276,7 +276,7 @@ class HintProofBindingTests(unittest.TestCase):
         self.link(candidate, proof_decision_ids=[decision["id"]])
         self.assertFalse(self.audit()["continuation"]["can_finalize"])
         self.fixture.checkpoint(self.fixture.frontier())
-        checkpoint = self.fixture.checkpoint(self.fixture.frontier())
+        checkpoint = self.fixture.checkpoint(self.fixture.frontier(self.fixture.variant_evidence))
         final = self.fixture.finish(checkpoint)
         self.assertTrue(final["continuation"]["automatic_stop_allowed"])
         evidence = self.project.get("evidence", decision["evidence_ids"][1])

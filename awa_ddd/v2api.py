@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .domain.repository import Repository
 from .domain.common import fail, text
-from .execution import capabilities, external_provider, review_engine, test_runner
+from .execution import capabilities, external_provider, fixture_api, review_engine, test_runner
 from .planning import campaign as campaign_planning
 from .planning import coverage, known_cases, migration, route_parser, scheduler
 from .reporting import compare as _report_compare
@@ -21,9 +21,8 @@ def recon_snapshot(project, args):
                                           "track": args.get("track", "hint_assisted")})
     universe = campaign_planning.build_universe(project)
     if args.get("save") is True:
-        repository = Repository(project)
-        if repository.get("universe", universe["id"], required=False) is None:
-            repository.add("universe", universe, immutable=True)
+        campaign_planning.save_universe(
+            project, universe, campaign_id=args.get("campaign_id"))
     return {"universe": {
         "id": universe["id"], "snapshot_hash": universe["snapshot_hash"],
         "completeness_level": universe["completeness_level"],
@@ -39,9 +38,10 @@ def recon_snapshot(project, args):
 def recon_import(project, args):
     kind = args.get("kind", "known_cases")
     if kind in {"known_cases", "assessment_hints"}:
-        return known_cases.import_known_cases(
+        imported = known_cases.import_known_cases(
             project, args["path"], source_group=args.get("source_group"),
             track=args.get("track", "hint_assisted"))
+        return {"kind": kind, **imported}
     if kind == "routes":
         parsed = route_parser.parse_route_manifest(args["path"])
         repository = Repository(project)
@@ -89,16 +89,19 @@ def recon_routes(project, args):
 
 def recon_hypotheses(project, args):
     repository = Repository(project)
-    where = {}
+    # Superseded hypotheses are historical records. Filter them in the durable
+    # query before pagination so total and next_offset describe the same
+    # collection as items.
+    where = {"superseded": False}
     for key in ("status", "family", "operation_id", "source_kind"):
         if args.get(key):
             where[key] = args[key]
-    rows, total = repository.list("hypothesis", where=where, offset=args.get("offset", 0),
-                                  limit=args.get("limit", 25))
-    return {"items": [row for row in rows if not row.get("superseded")], "total": total,
-            "offset": args.get("offset", 0), "limit": args.get("limit", 25),
-            "next_offset": (args.get("offset", 0) + args.get("limit", 25))
-                            if args.get("offset", 0) + args.get("limit", 25) < total else None}
+    offset, limit = args.get("offset", 0), args.get("limit", 25)
+    rows, total = repository.list(
+        "hypothesis", where=where, offset=offset, limit=limit)
+    return {"items": rows, "total": total,
+            "offset": offset, "limit": limit,
+            "next_offset": offset + limit if offset + limit < total else None}
 
 
 def capabilities_view(project, args):
@@ -141,6 +144,30 @@ def test_record_external(project, args):
     return external_provider.record(project, args)
 
 
+def test_fixture_create(project, args):
+    return fixture_api.create(project, args)
+
+
+def test_fixture_verify(project, args):
+    return fixture_api.verify(project, args)
+
+
+def test_fixture_lease(project, args):
+    return fixture_api.lease(project, args)
+
+
+def test_fixture_inspect(project, args):
+    return fixture_api.inspect(project, args)
+
+
+def test_fixture_readback(project, args):
+    return fixture_api.readback(project, args)
+
+
+def test_fixture_cleanup(project, args):
+    return fixture_api.cleanup(project, args)
+
+
 def review_finding(project, args):
     return review_engine.accept(project, args)
 
@@ -171,6 +198,10 @@ def campaign_next(project, args):
 
 def campaign_checkpoint(project, args):
     return campaign_planning.checkpoint(project, args)
+
+
+def campaign_review_frontier(project, args):
+    return campaign_planning.review_frontier(project, args)
 
 
 def campaign_finish(project, args):

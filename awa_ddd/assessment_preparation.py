@@ -320,11 +320,9 @@ def prepare(project, args):
         ], ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         if loop_guard.repeat_seen(project, "assessment.prepare", signature):
             for row in rows:
-                row["preparation_state"] = "frozen"
-                row["assessment_action"] = "plan.review"
-                row["suggested_action"] = "plan.review"
-                row["note_zh"] = ("This exact preparation set has been returned repeatedly without a state or evidence change; "
-                                  "frozen by loop guard. Reopen only after changing the prerequisite, identity, resource, or evidence.")
+                row["repeat_advisory"] = True
+                row["note_zh"] = ("This preparation set has been viewed repeatedly. Inspect the actual controls or "
+                                  "supply the missing prerequisite; the prepared action and readiness are unchanged.")
     reviewed_ids = list(dict.fromkeys(identity for row in rows for identity in row["control_candidate_evidence_ids"]))
     if key == "evidence_id":
         reviewed_ids = list(dict.fromkeys([identity, *reviewed_ids]))

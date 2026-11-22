@@ -546,11 +546,27 @@ def _render(summary):
     basis_labels = {"engine_gate": "引擎严格闭环门禁（登记范围内，零执行/复核/阻塞/未决任务）"}
     partial = evaluated.get("open", 0) or evaluated.get("blocked", 0)
     label = completion.get("label_zh") or ("部分评估，仍有未完成工作" if partial else "仅限已登记范围的评估快照")
+    frontier_rounds = continuation.get("frontier_rounds")
+    if type(frontier_rounds) is int and frontier_rounds >= 2:
+        frontier_notice = (
+            "当前已建立两轮（或以上）有证据引用的 frontier_review 记录；"
+            "它们是范围复核声明，不是两次独立安全实验。"
+        )
+    elif type(frontier_rounds) is int and frontier_rounds == 1:
+        frontier_notice = (
+            "当前仅建立一轮有证据引用的 frontier_review 记录，"
+            "尚未达到完成授权所需的两个不同观测材料。"
+        )
+    else:
+        frontier_notice = (
+            "当前尚未建立有证据引用的两轮 frontier_review 记录；"
+            "草稿或阶段快照不能据此授权完成。"
+        )
     rows = ["# awa-ddd 中文渗透测试报告", "", "- 项目：" + _md(summary["project_id"]),
             "- 生成时间（UTC）：" + _md(summary["generated_at"]), "- 评估状态：**" + _md(label) + "**", "",
             "## " + stage_labels.get(delivery, stage_labels["draft"]), "",
             "**" + stage_warnings.get(delivery, stage_warnings["draft"]) + "**", "",
-            "frontier_review 两轮记录属于引用已有证据的范围复核声明，不是两次独立安全实验。", "",
+            frontier_notice, "",
             "自动停测仅允许严格核验的登记范围耗尽；预算、耗时、发现数量、受阻声明及阶段报告均不能授权自动停止。真实用户停止或宿主中断只保存续接快照，不冒充评估完成。", "",
             "- 报告阶段：" + _md(stage),
             "- 当前续接判定：" + ("仍需继续" if continuation.get("continue_required") else "登记范围已通过严格闭环；不等于目标绝对安全"),
@@ -665,7 +681,7 @@ def _render(summary):
     rows.extend("- " + _md(json.dumps(operation, ensure_ascii=False, sort_keys=True)) for operation in summary["operation_metadata"])
     rows += ["", "## 交付限制与校验", "",
              "- 只报告已登记和已观察范围；队列为空也不证明未发现的攻击面不存在漏洞。",
-             "- 两轮 frontier_review 是有证据引用的范围复核声明，不是两次独立实验；阻塞或外部退出声明不会因此成为独立核验的事实。",
+             "- " + frontier_notice + "阻塞或外部退出声明不会因此成为独立核验的事实。",
              "- XSS 绑定覆盖仅限已验证的精确消费链：POST 存储型 JSON、GET 精确攻击 URL；多页面 dialog 归因歧义、未捕获 fill 值或缺少摘要绑定的文档请求头时仍保留部分或未绑定，不能用空白页或无弹窗外推排除。",
              "- 导入结论、扫描告警和模拟材料不会自动变为当前执行证明。",
              "- 原始凭据和未经筛选的响应正文不公开；原材料需单独授权访问。", 
@@ -689,13 +705,70 @@ def _check_plain_path(path):
     return path
 
 
-def _require_final_delivery(evaluated, continuation, finalization):
+def _require_final_delivery(project, evaluated, continuation, finalization):
     """A report must not relabel an inconsistent or partial stop as final."""
-    from .continuation import MIN_FRONTIER_ROUNDS
-    from .store import EngineError
+    from . import completeness
+    from .continuation import (
+        MIN_FRONTIER_ROUNDS,
+        _valid_frontier,
+        control,
+    )
+    from .store import EngineError, canonical
 
     remaining = finalization.get("remaining") or {}
     zero_counts = ("ready_total", "review_total", "blocked_total", "unresolved_total")
+    decision = continuation.get("completion_decision")
+    if not isinstance(decision, dict):
+        decision = {}
+    facts = {
+        key: value
+        for key, value in decision.items()
+        if key not in {"id", "created_at"}
+    }
+    decision_id_valid = (
+        isinstance(decision.get("id"), str)
+        and decision["id"].startswith("CD-")
+        and decision["id"]
+        == "CD-" + hashlib.sha256(
+            canonical(facts).encode("utf-8")).hexdigest()
+    )
+    inventory = completeness._inventory(project, evaluated)
+    security, _ = completeness._security(inventory)
+    completion = completeness._completion(
+        inventory, security, evaluated)
+    expected = control(
+        project,
+        evaluated=evaluated,
+        inventory=inventory,
+        security=security,
+        completion=completion,
+    )
+    expected_decision = expected.get("completion_decision") or {}
+    checkpoints = project.list("checkpoint")
+    checkpoint = checkpoints[-1] if checkpoints else {}
+    frontier_receipt = (
+        project.get(
+            "frontier_receipt",
+            checkpoint.get("frontier_receipt_id"),
+            required=False,
+        )
+        if checkpoint.get("frontier_receipt_id")
+        else None
+    )
+    frontier_current = bool(
+        checkpoint
+        and checkpoint.get("id") == continuation.get("checkpoint_id")
+        and expected.get("frontier_rounds", 0) >= MIN_FRONTIER_ROUNDS
+        and expected.get("frontier_receipt_id")
+        and expected.get("frontier_receipt_id")
+        == checkpoint.get("frontier_receipt_id")
+        and frontier_receipt
+        and frontier_receipt.get("observation_key")
+        == checkpoint.get("frontier_observation_key")
+        and frontier_receipt.get("dependency_hash")
+        == expected.get("frontier_dependency_hash")
+        and _valid_frontier(project, checkpoint, inventory)
+    )
     valid = finalization.get("reason") == "completed" \
         and finalization.get("reason_basis") == "engine_gate" \
         and finalization.get("can_claim_complete") is True \
@@ -714,6 +787,22 @@ def _require_final_delivery(evaluated, continuation, finalization):
         and continuation.get("snapshot_id") == finalization.get("snapshot_id") \
         and continuation.get("checkpoint_id") == finalization.get("checkpoint_id") \
         and continuation.get("finalization_id") == finalization.get("id") \
+        and decision_id_valid \
+        and decision == expected_decision \
+        and decision.get("schema") == "awa-completion/v1" \
+        and decision.get("model") == "v1" \
+        and decision.get("subject_id") == project.project_id \
+        and decision.get("state") == "complete_for_declared_scope" \
+        and decision.get("can_finalize") is True \
+        and decision.get("can_claim_complete") is True \
+        and decision.get("finalized") is True \
+        and decision.get("checkpoint_current") is True \
+        and decision.get("frontier_current") is True \
+        and decision.get("material_current") is True \
+        and decision.get("source_complete") is True \
+        and decision.get("continue_required") is False \
+        and continuation == expected \
+        and frontier_current \
         and all(type(continuation.get(key)) is int and continuation[key] == 0
                 for key in (*zero_counts, "actionable_total")) \
         and all(type(continuation.get(key, 0)) is int and continuation.get(key, 0) == 0
@@ -745,6 +834,117 @@ def _publish_report(staging, destination, parent):
             time.sleep(delay)
 
 
+def publish_report_batch(project, output_dir, *, files, manifest):
+    """Publish an immutable file batch through the same staging boundary as V1.
+
+    Callers must redact ``files`` and run the report redaction self-test first.
+    The complete material tree is written under a fresh sibling staging
+    directory and becomes visible with one rename.
+    """
+    from .store import EngineError
+
+    if not isinstance(files, dict) or not files:
+        raise EngineError(
+            "report_material", "A report batch requires at least one file")
+    if not isinstance(manifest, dict):
+        raise EngineError(
+            "report_manifest", "A report manifest must be an object")
+    material = {}
+    for relative, data in files.items():
+        if not isinstance(relative, str) or not relative \
+                or not isinstance(data, bytes):
+            raise EngineError(
+                "report_material",
+                "Report file names must be strings and contents bytes",
+            )
+        material[relative] = data
+    generated = datetime.now(timezone.utc)
+    parent = _check_plain_path(
+        output_dir if output_dir is not None else project.base / "reports")
+    parent.mkdir(parents=True, exist_ok=True)
+    batch = generated.strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:12]
+    destination = parent / batch
+    staging = Path(tempfile.mkdtemp(prefix=".report-", dir=parent))
+    written, directories = [], set()
+    manifest_document = {
+        **manifest,
+        "format_version": manifest.get("format_version", 1),
+        "generated_at": manifest.get("generated_at", generated.isoformat()),
+        "files": [
+            {
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+            }
+            for relative, data in sorted(material.items())
+        ],
+        "credentials_redacted": True,
+        "executed_by_report": False,
+    }
+    manifest_document["manifest_sha256"] = hashlib.sha256(
+        json.dumps(
+            manifest_document,
+            ensure_ascii=False,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    all_material = {
+        **material,
+        "manifest.json": (
+            json.dumps(
+                manifest_document,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ) + "\n"
+        ).encode("utf-8"),
+    }
+    try:
+        for relative, data in all_material.items():
+            relative_path = Path(relative)
+            path = staging / relative_path
+            if relative_path.is_absolute() or ".." in relative_path.parts \
+                    or staging.resolve() not in path.resolve().parents:
+                raise EngineError(
+                    "report_material",
+                    "Report artifact escaped the staging directory",
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            directories.update(
+                item for item in path.parents
+                if item != staging and staging in item.parents
+            )
+            with path.open("xb") as stream:
+                written.append(path)
+                stream.write(data)
+        _publish_report(staging, destination, parent)
+    finally:
+        if staging.exists():
+            for path in written:
+                path.unlink(missing_ok=True)
+            for path in sorted(
+                    directories, key=lambda item: len(item.parts),
+                    reverse=True):
+                path.rmdir()
+            staging.rmdir()
+    return {
+        "destination": destination,
+        "files": {
+            relative: destination / Path(relative)
+            for relative in material
+        },
+        "sha256": {
+            relative: hashlib.sha256(data).hexdigest()
+            for relative, data in material.items()
+        },
+        "manifest": destination / "manifest.json",
+        "manifest_sha256": hashlib.sha256(
+            all_material["manifest.json"]).hexdigest(),
+        "generated_at": generated.isoformat(),
+    }
+
+
 def build_report(project, output_dir=None, *, stage="draft", finalization_id=None, profile="full"):
     from .store import EngineError
     if not isinstance(stage, str) or stage not in {"draft", "final"}:
@@ -764,7 +964,8 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
         finalization = require_finalization(project, finalization_id, evaluated=original) if stage == "final" else None
         continuation = control(project, evaluated=original)
         if stage == "final":
-            _require_final_delivery(original, continuation, finalization)
+            _require_final_delivery(
+                project, original, continuation, finalization)
         source_context = {"continuation": continuation, "finalization": finalization}
         if any(run.get("kind") == "external_tool" and run.get("adapter") == "tscanplus" for run in project.list("run")):
             from .tscanplus import report_context
@@ -822,7 +1023,8 @@ def build_report(project, output_dir=None, *, stage="draft", finalization_id=Non
             # preparation; this is not a lock against later external changes.
             current = evaluate_coverage(project)
             current_stop = require_finalization(project, finalization_id, evaluated=current)
-            _require_final_delivery(current, current["continuation"], current_stop)
+            _require_final_delivery(
+                project, current, current["continuation"], current_stop)
             if current_stop != finalization or current["continuation"]["snapshot_id"] != original["continuation"]["snapshot_id"]:
                 raise EngineError("finalization_stale", "Report sources changed during preparation; create a current stop record",
                     {"continuation": control(project, evaluated=current), "next_action": "plan.checkpoint"})

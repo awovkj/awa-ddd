@@ -505,6 +505,8 @@ def _oracle_family(item, operation, oracle):
         if kind != "analyst_runtime":
             raise EngineError("xss_runtime_required", "Static input observations cannot close an XSS runtime obligation; use a real application-triggered browser observation and reviewed finding")
         return
+    if kind == "reviewed_detection" and family in {"command_injection", "template_injection", "deserialization", "file_upload"}:
+        return
     allowed = {"sql_injection": {"sql_metadata", "error_channel", "sql_boolean"},
                "business_logic": {"semantic_negative", "state_invariant", "state_transition"},
                "generic": {"semantic_negative"},
@@ -1043,6 +1045,12 @@ def validate_confirmation(project, decision, category=None):
         if bound_item.get("test_family") and claimed_family and bound_item["test_family"] != claimed_family:
             code = "sql_metadata_required" if claimed_family == "sql_injection" else "xss_runtime_required" if claimed_family == "xss" else "oracle_family"
             raise EngineError(code, "The explicitly claimed finding family does not match its supporting input-test obligation")
+        if oracle.get("type") == "reviewed_detection":
+            from .reviewed_detection import current as reviewed_current
+            if decision.get("mode") != "analyst" or decision.get("outcome") != "confirmed":
+                raise EngineError("reviewed_receipt", "Reviewed detection retains its recorded analyst assurance")
+            reviewed_current(project, decision, category)
+            return
         if oracle.get("type") in {"baseline", "sql_boolean", "semantic_negative", "state_invariant"}:
             observations = _observations(project, decision["evidence_ids"], bound_item)
             outcome, reason = _json_oracle_result(project, bound_item, bound_operation, observations, oracle)
@@ -1390,12 +1398,18 @@ def record_finding(project,args):
         raise EngineError("finding_fields", "limitations must be an array of strings")
     mode = args.get("mode", "machine")
     requested_obligation = args.get("obligation_id")
+    reviewed_spec = args.get("reviewed_proof")
+    reviewed_receipt = None
+    reviewed_family = _category_family(args["category"])
+    if reviewed_spec is not None and (not isinstance(reviewed_spec, dict) or mode != "analyst"
+            or requested_obligation is None or reviewed_family not in {"command_injection", "template_injection", "deserialization", "file_upload"}):
+        raise EngineError("reviewed_proof", "Reviewed proof needs one explicit implemented-family analyst obligation")
     if args.get("xss_consumption") is not None and (requested_obligation is None or mode != "analyst"
                                                   or not is_xss_category(args["category"])):
         raise EngineError("analyst_obligation", "xss_consumption requires a current source XSS obligation and analyst runtime review")
     if requested_obligation is not None and (not isinstance(requested_obligation, str) or not requested_obligation
-            or mode != "analyst" or not is_xss_category(args["category"])):
-        raise EngineError("analyst_obligation", "obligation_id is only supported for an explicitly reviewed XSS runtime finding")
+            or mode != "analyst" or not (is_xss_category(args["category"]) or reviewed_spec is not None)):
+        raise EngineError("analyst_obligation", "obligation_id requires a typed reviewed runtime or mechanism proof")
     sql_evidence = None
     if mode == "machine":
         if not isinstance(args.get("decision_id"), str) or not args["decision_id"]:
@@ -1411,7 +1425,17 @@ def record_finding(project,args):
     elif mode == "analyst":
         if not str(args.get("reviewer", "")).strip() or not str(args.get("reason", "")).strip():
             raise EngineError("analyst_review", "Explicit reviewer and impact reasoning required")
-        if is_sql_category(args["category"]):
+        if reviewed_spec is not None:
+            from .reviewed_detection import accept as accept_reviewed
+            bound_item = project.get("obligation", requested_obligation)
+            if bound_item.get("test_family") != reviewed_family:
+                raise EngineError("oracle_family", "Reviewed family must exactly match the current input obligation")
+            reviewed_spec = {**reviewed_spec, "reviewer": args["reviewer"], "reason": args["reason"]}
+            reviewed_receipt = accept_reviewed(project, bound_item, reviewed_spec)
+            ids, source_decision = reviewed_receipt["evidence_ids"], None
+            if args.get("evidence_ids") is not None and args["evidence_ids"] != ids:
+                raise EngineError("evidence_binding", "Reviewed evidence must match request controls and consumer readbacks in order")
+        elif is_sql_category(args["category"]):
             proof_id = args.get("proof_decision_id", args.get("decision_id"))
             if proof_id:
                 if not isinstance(proof_id, str) or args.get("decision_id", proof_id) != proof_id:
@@ -1460,6 +1484,12 @@ def record_finding(project,args):
         decision = {"id": project.id("D"), "outcome": "confirmed", "mode": "analyst",
                     "oracle": {"type": "analyst_review"}, "reviewer": args["reviewer"],
                     "reason": args["reason"], "evidence_ids": ids, "created_at": now()}
+        if reviewed_receipt:
+            decision.update(obligation_id=bound_item["id"], operation_id=bound_item["operation_id"],
+                            operation_signature=reviewed_receipt["bindings"]["operation_signature"],
+                            oracle={"type": "reviewed_detection", "test_family": reviewed_family},
+                            review_proof_receipt_id=reviewed_receipt["id"],
+                            proof={key: reviewed_receipt[key] for key in ("schema", "profile", "proof_scope", "not_proven", "reviewer_assurance", "machine_proof")})
         if source_decision:
             for key in ("obligation_id", "operation_id", "operation_signature", "oracle", "oracle_version", "proof"):
                 if key in source_decision:
@@ -1490,6 +1520,10 @@ def record_finding(project,args):
              "remediation":args["remediation"],"severity":severity,"decision_id":decision["id"],
              "evidence_ids":decision["evidence_ids"],"mode":decision["mode"],"origin":origin,"status":"confirmed",
              "limitations":list(limitations),"created_at":now()}
+    if reviewed_receipt:
+        finding.update(review_proof_receipt_id=reviewed_receipt["id"], proof=decision["proof"],
+                       confirmed_scope=reviewed_receipt["proof_scope"], reviewer_assurance="agent_recorded")
+        finding["limitations"].extend(reviewed_receipt["not_proven"])
     if is_sql_category(args["category"]):
         proof = decision.get("proof") or {}
         finding["proof"] = proof
@@ -1512,7 +1546,7 @@ def record_finding(project,args):
         bound_item.update(status="evaluated", decision_id=decision["id"], reason=args["reason"])
         project.put("obligation", bound_item)
         project.event("assessment.analyst_bound", {"obligation_id": bound_item["id"], "decision_id": decision["id"],
-                                                 "finding_id": finding["id"], "test_family": "xss"})
+                                                 "finding_id": finding["id"], "test_family": bound_item.get("test_family", "xss")})
     project.event("finding.recorded",{"finding_id":finding["id"],"decision_id":decision["id"]})
     from .assessment_mode import mode as project_mode, record_stop
     if project_mode(project) == "src":

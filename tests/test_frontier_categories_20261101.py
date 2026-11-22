@@ -49,6 +49,7 @@ class FrontierCategoryTests(unittest.TestCase):
                                 "evidence_ids": [item["id"] for item in controls],
                                 "oracle": {"type": "semantic_negative", "test_family": "deserialization",
                                            "selector": "/count", "baseline_expected": 1, "control_expected": 2}})
+        self.variant_evidence = controls[1]
         return controls
 
     def frontier(self, evidence, status="completed"):
@@ -70,7 +71,7 @@ class FrontierCategoryTests(unittest.TestCase):
         evidence = self.close_family()[0]
         frontier = self.frontier(evidence)
         continuation.checkpoint(self.project, {"frontier_review": frontier})
-        saved = dispatch(self.root, "plan.checkpoint", {"project_id": "frontier", "frontier_review": frontier})
+        saved = dispatch(self.root, "plan.checkpoint", {"project_id": "frontier", "frontier_review": self.frontier(self.variant_evidence)})
         self.assertEqual(2, saved["continuation"]["frontier_rounds"])
         self.assertTrue(saved["continuation"]["can_finalize"])
         row = next(item for item in saved["checkpoint"]["frontier_review"]["categories"]

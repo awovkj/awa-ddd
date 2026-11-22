@@ -11,6 +11,7 @@ from unittest.mock import patch
 from awa_ddd import engine, external
 from awa_ddd.assessment import evaluate
 from awa_ddd.store import EngineError, Project, now
+from awa_test_support import guarded_sqlmap_result
 
 
 def observed(url, method, headers, body, timeout, max_bytes, response=None):
@@ -33,6 +34,10 @@ class PostSqlmapTests(unittest.TestCase):
         self.addCleanup(self.project.close)
         self.executable = Path(self.tmp.name) / "sqlmap.py"
         self.executable.write_text("# Mock fixture, never executed.\n", encoding="utf-8")
+        trusted = patch.dict("os.environ", {external.TRUSTED_SQLMAP_ENV: json.dumps({
+            "path": str(self.executable.resolve()), "sha256": ""})})
+        trusted.start()
+        self.addCleanup(trusted.stop)
         identity = engine.register_operation(self.project, {"url": self.base + "/whoami", "method": "GET", "auth": "authenticated"})
         self.actor = engine.add_actor(self.project, {"subject": "alice", "roles": ["user"]})
         self.session = engine.add_session(self.project, {"actor_id": self.actor["id"],
@@ -55,18 +60,17 @@ class PostSqlmapTests(unittest.TestCase):
 
     def process(self, text="identified the following injection point(s)\ncurrent database: 'lab_db'\n", exit_code=0):
         def start(command, **options):
-            self.commands.append((list(command), options))
-            options["stdout"].write(text.encode("utf-8"))
-            Path(command[command.index("-t") + 1]).write_text(
-                "HTTP request [#1]:\nPOST /items/lab-1 HTTP/1.1\n\nHTTP response [#1]:\nHTTP/1.1 200 OK\n\n", encoding="utf-8")
-
-            class Process:
-                returncode = exit_code
-
-                def poll(self):
-                    return self.returncode
-
-            return Process()
+            spec = json.loads(
+                Path(command[-1]).read_text(encoding="utf-8")
+            )
+            self.commands.append((list(spec["argv"]), options))
+            return guarded_sqlmap_result(
+                self.project,
+                command,
+                stdout_text=text,
+                traffic_text="HTTP request [#1]:\nPOST /items/lab-1 HTTP/1.1\n\nHTTP response [#1]:\nHTTP/1.1 200 OK\n\n",
+                returncode=exit_code,
+            )
         return start
 
     def tool(self, **changes):

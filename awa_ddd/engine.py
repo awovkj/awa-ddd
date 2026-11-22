@@ -1005,16 +1005,81 @@ def preflight_capture(project, args, *, for_identity=False):
     capture_policy(project, operation, args, existing=bool(existing))
     if mode(project) == "src":
         timeout, max_bytes = min(timeout, SRC_MAX_TIMEOUT), min(max_bytes, SRC_MAX_RESPONSE)
+    dispatch_hash = hashlib.sha256(canonical([
+        signature,
+        operation_signature(operation),
+        session.get("generation") if session else None,
+        resource_signature(resource) if resource else None,
+    ]).encode("utf-8")).hexdigest()
     return {"operation": operation, "url": url, "params": params, "session": session,
             "actor": actor, "headers": headers, "body": body, "body_bytes": len(encoded_body),
             "resource": resource, "request_signature": signature, "run_id": run_id, "existing": existing,
             "timeout": timeout, "max_bytes": max_bytes,
-            "auth_mode": "anonymous_cookie" if anonymous_cookie else ("session" if session else "none")}
+            "auth_mode": "anonymous_cookie" if anonymous_cookie else ("session" if session else "none"),
+            "dispatch_spec": {"action": "http.capture", "request_hash": dispatch_hash}}
 
 
-def capture(project,args, *, for_identity=False):
+def _capture_dispatch_context(project, prepared, context):
+    """Validate a caller-owned dispatch without exposing it through action args."""
+    if not isinstance(context, dict):
+        raise EngineError("capture_dispatch_context",
+                          "Internal capture dispatch context must be an object")
+    required = ("receipt_id", "action", "run_id", "request_hash",
+                "lease_name", "fence")
+    missing = [
+        key for key in required
+        if context.get(key) in {None, ""}
+    ]
+    if missing:
+        raise EngineError("capture_dispatch_context",
+                          "Internal capture dispatch context is incomplete: "
+                          + ", ".join(missing),
+                          {"missing": missing})
+    expected = prepared["dispatch_spec"]
+    if context["action"] != expected["action"] \
+            or context["request_hash"] != expected["request_hash"]:
+        raise EngineError("capture_dispatch_context",
+                          "Dispatch context does not match the exact request about to be sent")
+    receipt = project.get(
+        "execution_dispatch", context["receipt_id"], required=False)
+    if receipt is None or receipt.get("dispatch_attempted") is not True:
+        raise EngineError("capture_dispatch_context",
+                          "Dispatch context has no durable dispatch attempt")
+    for key in ("action", "run_id", "request_hash", "lease_name", "fence"):
+        if receipt.get(key) != context.get(key):
+            raise EngineError("capture_dispatch_context",
+                              "Dispatch receipt does not match the caller context",
+                              {"field": key})
+    if receipt.get("requests") != 1 or type(receipt.get("writes")) is not int:
+        raise EngineError("capture_dispatch_context",
+                          "Dispatch receipt must cover exactly one request")
+    if prepared["operation"]["method"] not in {"GET", "HEAD", "OPTIONS"} \
+            and receipt.get("effect") == "read_only":
+        raise EngineError("capture_dispatch_context",
+                          "A mutating HTTP method cannot use a read-only dispatch receipt")
+    run = project.get("v2_run", context["run_id"], required=False)
+    if run is None or context["receipt_id"] not in (
+            run.get("dispatch_receipt_ids") or []):
+        raise EngineError("capture_dispatch_context",
+                          "Dispatch receipt is not bound to the claimed V2 run")
+    return receipt
+
+
+def capture(project,args, *, for_identity=False, dispatch_context=None):
     prepared = preflight_capture(project, args, for_identity=for_identity)
+    durable_dispatch = (
+        _capture_dispatch_context(project, prepared, dispatch_context)
+        if dispatch_context is not None else None)
     if prepared["existing"]:
+        if durable_dispatch is not None:
+            existing = prepared["existing"]
+            if existing.get("dispatch_id") != durable_dispatch["id"] \
+                    or existing.get("dispatch_run_id") != durable_dispatch["run_id"]:
+                raise EngineError(
+                    "idempotency_conflict",
+                    "Idempotency key belongs to another execution run; its evidence cannot be adopted",
+                    {"run_id": existing.get("id"), "operation_id": existing.get("operation_id"),
+                     "next_action": "run.inspect", "requests_replayed": 0})
         return project.get("evidence", prepared["existing"]["evidence_id"])
     operation, url, session, actor, resource = (prepared[key] for key in ("operation", "url", "session", "actor", "resource"))
     headers, body = prepared["headers"], prepared["body"]
@@ -1027,9 +1092,25 @@ def capture(project,args, *, for_identity=False):
            "resource_id":resource["id"] if resource else None,"resource_signature":resource_signature(resource) if resource else None,
            "effect":"read_only" if operation["method"] in {"GET","HEAD","OPTIONS"} else "test_resource_write"}
     project.claim(run)
+    from . import execution_coordinator as coordinator
+    owned_lease = None
     try:
         from .assessment_mode import capture_policy
         capture_policy(project, operation, args)
+        if durable_dispatch is None:
+            owned_lease = coordinator.claim(project, "http:" + run_id)
+            durable_dispatch = coordinator.dispatch(
+                project, owned_lease, action="http.capture", run_id=run_id,
+                request_hash=prepared["dispatch_spec"]["request_hash"],
+                effect=run["effect"], max_requests=1,
+                max_writes=int(run["effect"] != "read_only"))
+        run.update(
+            dispatch_attempted=True,
+            dispatch_id=durable_dispatch["id"],
+            dispatch_run_id=durable_dispatch["run_id"],
+            lease_fence=durable_dispatch["fence"],
+        )
+        project.put("run", run)
         artifact = request(url,operation["method"],headers,body,prepared["timeout"],prepared["max_bytes"])
         identity = project.id("E")
         path,digest = project.artifact(identity,artifact)
@@ -1048,15 +1129,22 @@ def capture(project,args, *, for_identity=False):
         run.update(status="succeeded" if evidence["complete"] else "failed",evidence_id=identity,finished_at=now())
         if not evidence["complete"]:
             run.update(error_code=artifact.get("error", "evidence_incomplete"), next_action="run.inspect")
+            run.update(effect_unknown=run["effect"] != "read_only", remote_state_unknown=True)
             evidence.update(error_code=run["error_code"], next_action=run["next_action"])
         with project.transaction():
             project.put("evidence",evidence,create_only=True)
             project.put("run",run)
             project.event("http.captured", {"run_id":run_id,"evidence_id":identity,"complete":evidence["complete"]})
+        if evidence["complete"] and owned_lease is not None:
+            coordinator.release(project, owned_lease, reconciled=True)
         return evidence
     except Exception as exc:
         code = exc.code if isinstance(exc, EngineError) else "capture_failed"
         run.update(status="failed",finished_at=now(),error="capture_failed", error_code=code, next_action="run.inspect")
+        run.update(effect_unknown=bool(run.get("dispatch_attempted") and run["effect"] != "read_only"),
+                   remote_state_unknown=bool(run.get("dispatch_attempted")))
+        if owned_lease is not None and not run.get("dispatch_attempted"):
+            coordinator.release(project, owned_lease)
         message = str(exc) if isinstance(exc, EngineError) else "Capture failed after the run was claimed; inspect its checkpoint before attempting another request"
         try:
             project.put("run",run)
@@ -1202,7 +1290,9 @@ def _ownership_samples(operation, actors, resources, previous):
         resource["id"] in preferred for resource in pair[1]), pair[0]))
     cases, variant_total, selected_fixtures = [], 0, []
     for context, fixtures in ordered_groups[:MAX_OWNERSHIP_CONTEXTS]:
-        ordered = sorted(fixtures, key=lambda item: (item.get("created_at") or "", item["id"]))
+        # Python's stable sort retains physical insertion order when the wall
+        # clock returns the same timestamp for adjacent registrations.
+        ordered = sorted(fixtures, key=lambda item: item.get("created_at") or "")
         representative = next((item for item in ordered if item["id"] in preferred), ordered[0])
         selected_fixtures.append(representative["id"])
         owner = actors_by_id[representative["owner_actor_id"]]
@@ -1255,9 +1345,18 @@ def _case_identity(case):
 
 @atomic
 def build_plan(project):
+    generation = project.get_metadata("plan_generation")
+    if type(generation) is not int or generation < 0:
+        generation = project.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE type='plan.generated'").fetchone()[0]
+    generation += 1
+    project.connection.execute(
+        "INSERT INTO metadata(key,value) VALUES('plan_generation',?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (canonical(generation),))
     added = 0
     actors = _canonical_actors(project, project.list("actor"))
-    resources = project.list("resource")
+    resources = project.list_inserted("resource")
     owned_by_operation = {}
     obligations_by_operation = {}
     for obligation in project.list("obligation"):
@@ -1312,13 +1411,19 @@ def build_plan(project):
             expected.add(identity)
             current = project.get("obligation",identity,required=False)
             if not current:
-                project.put("obligation",{"id":identity,**case,"status":"open","created_at":now()},create_only=True)
+                project.put("obligation",{"id":identity,**case,"status":"open","created_at":now(),
+                                           "plan_generation":generation},create_only=True)
                 added += 1
             else:
                 changed = False
                 if current.get("superseded"):
                     current["superseded"] = False
                     current.pop("superseded_at", None)
+                    current.pop("superseded_generation", None)
+                    changed = True
+                if case["kind"] == "access" and operation["auth"] != "unknown" \
+                        and current.get("known_policy_generation") != generation:
+                    current["known_policy_generation"] = generation
                     changed = True
                 if case["kind"] == "input_test" and current.get("input_signature") == case["input_signature"]:
                     for field in ("scope_family", "consumer_family"):
@@ -1335,8 +1440,9 @@ def build_plan(project):
             if old["id"] not in expected and not old.get("superseded"):
                 old["superseded"] = True
                 old["superseded_at"] = now()
+                old["superseded_generation"] = generation
                 project.put("obligation",old)
-    project.event("plan.generated",{"added":added})
+    project.event("plan.generated",{"added":added,"generation":generation})
     return {"added":added,**evaluate_coverage(project)}
 
 
@@ -1469,7 +1575,7 @@ def _tested_surfaces(obligations, status_by_id=None):
     return operation_ids, inputs
 
 
-def _method_coverage(project, tested_operation_ids=None, *, current_observations=None):
+def _method_coverage(project, tested_operation_ids=None, *, current_observations=None, operations=None):
     """Keep registration, complete observations and evaluated tests distinct."""
     if tested_operation_ids is None:
         tested_operation_ids = set()
@@ -1492,7 +1598,7 @@ def _method_coverage(project, tested_operation_ids=None, *, current_observations
             except (EngineError, OSError, ValueError, KeyError):
                 pass
     matrix = {}
-    for operation in project.list("operation"):
+    for operation in operations if operations is not None else project.list("operation"):
         shape = _path_shape(operation["url"])
         key = (shape, operation.get("auth"))
         bucket = matrix.setdefault(key, {"path_shape": list(shape), "auth": operation.get("auth"),
@@ -1518,7 +1624,7 @@ def _method_coverage(project, tested_operation_ids=None, *, current_observations
     return rows
 
 
-def _coverage_metrics(project, obligations, status_by_id=None):
+def _coverage_metrics(project, obligations, status_by_id=None, *, operations=None):
     """Break the raw obligation ratio down so the denominator stays readable."""
     by_kind = {}
     for item in obligations:
@@ -1532,7 +1638,8 @@ def _coverage_metrics(project, obligations, status_by_id=None):
     for bucket in by_kind.values():
         count = bucket["total"] - bucket["not_applicable"]
         bucket["ratio"] = bucket["evaluated"] / count if count else None
-    operations = project.list("operation")
+    if operations is None:
+        operations = project.list("operation")
     operation_ids, tested_inputs = _tested_surfaces(obligations, status_by_id)
     input_total = sum(len(operation.get("inputs") or []) for operation in operations)
     surface_numerator = len(operation_ids) + len(tested_inputs)
@@ -1552,7 +1659,8 @@ def _coverage_metrics(project, obligations, status_by_id=None):
 
 
 def evaluate_coverage(project):
-    for operation in project.list("operation"):
+    operations = project.list("operation")
+    for operation in operations:
         _validate_operation_inputs(operation)
     gaps, totals = [], {"total":0,"evaluated":0,"open":0,"blocked":0,"not_applicable":0}
     dependent = {}
@@ -1574,6 +1682,10 @@ def evaluate_coverage(project):
                                else "evidence_invalid")
         elif status == "not_applicable":
             try:
+                if item.get("applicability_receipt_id"):
+                    from .applicability import current as applicability_current
+                    if not applicability_current(project, item):
+                        raise EngineError("applicability_expired", "Applicability manifest, deployment or exact input changed")
                 for eid in item.get("evidence_ids",[]):
                     verify_current_evidence(project,eid)
                 if not item.get("evidence_ids") or item.get("basis") != "business_fact":
@@ -1613,8 +1725,8 @@ def evaluate_coverage(project):
             row["limitation"] = "Finding was explicitly " + lifecycle + "; its original evidence and decision remain preserved."
         findings.append(row)
     count = totals["total"]-totals["not_applicable"]
-    metrics = _coverage_metrics(project, all_obligations, status_by_id)
-    evaluated = {"operations":len(project.list("operation")),"inputs":sum(len(o["inputs"]) for o in project.list("operation")),
+    metrics = _coverage_metrics(project, all_obligations, status_by_id, operations=operations)
+    evaluated = {"operations":len(operations),"inputs":sum(len(o["inputs"]) for o in operations),
         "obligations":totals["total"],**totals,"coverage_ratio":totals["evaluated"]/count if count else None,
         **metrics,
         "gaps":gaps,"gap_dependencies":dict(sorted(dependent.items())),"findings":findings,
@@ -1622,7 +1734,7 @@ def evaluate_coverage(project):
             "coverage_ratio is obligation-weighted; surface_coverage is operation/input-weighted and is usually more readable.",
             "Imported or simulated artifacts do not satisfy execution evidence."]}
     from .completeness import summarize
-    evaluated.update(summarize(project, evaluated))
+    evaluated.update(summarize(project, evaluated, operations=operations, all_obligations=all_obligations))
     return evaluated
 
 
@@ -1647,6 +1759,15 @@ def disposition(project,args):
             evidence,_ = verify_current_evidence(project,eid)
             if evidence["operation_id"] != item["operation_id"]:
                 raise EngineError("evidence_binding", "Exclusion evidence belongs to another operation")
+        if args.get("applicability_proof") is not None:
+            from .applicability import accept
+            proof = args["applicability_proof"]
+            if not isinstance(proof, dict) or proof.get("build_evidence_id") not in evidence_ids:
+                raise EngineError("applicability_binding", "Applicability deployment evidence must be included in evidence_ids")
+            receipt = accept(project, item, proof)
+            item["applicability_receipt_id"] = receipt["id"]
+    else:
+        item.pop("applicability_receipt_id", None)
     previous = {key: item.get(key) for key in ("status", "reason", "basis", "evidence_ids")}
     item.update(status=status,reason=reason,basis=args.get("basis"),evidence_ids=evidence_ids)
     project.put("obligation",item)

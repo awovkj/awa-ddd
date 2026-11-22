@@ -24,7 +24,8 @@ SOURCE_KINDS = {"unassessed_observation": "evidence", "failed_partial_tool": "ru
                 "unreconciled_run": "run", "orphan_browser_visit": "page_visit",
                 "unlinked_analyst_finding": "finding"}
 STATE_KINDS = ("operation", "actor", "session", "resource", "obligation", "evidence", "decision", "finding",
-               "candidate", "page", "page_visit", "run", "closure_review")
+               "candidate", "page", "page_visit", "run", "closure_review", "discovery_source", "discovery_snapshot",
+               "discovery_item", "discovery_ingest")
 
 
 def _digest(prefix, value):
@@ -135,7 +136,9 @@ def _material(project, record):
                 state.update(state="over_budget", size_bytes=stat.st_size,
                              mtime_ns=stat.st_mtime_ns, ctime_ns=stat.st_ctime_ns)
             else:
-                state["actual"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                data = path.read_bytes()
+                project.metrics["material_bytes_hashed"] += len(data)
+                state["actual"] = hashlib.sha256(data).hexdigest()
         except (EngineError, OSError, ValueError, TypeError):
             state["state"] = "unreadable"
         states.append(state)
@@ -433,6 +436,19 @@ def _frontier_review(project, value, inventory, cache=None):
                 "evaluated_family": _completed_family(project, family, inventory, cache)})
         result["categories"].append(row)
     result["reference_signatures"] = reference_signatures
+    from .engine import operation_signature
+    roots = {"scope": inventory.get("browser_scope_config"),
+             "sources": sorted((row["id"], row.get("sha256"), row.get("normalized_sha256"))
+                               for row in inventory.get("source_inventory", {}).get("snapshots", {}).values()),
+             "source_heads": sorted((row["id"], row.get("latest_snapshot_id"))
+                                    for row in inventory.get("source_inventory", {}).get("sources", {}).values()),
+             "surfaces": sorted((row["id"], operation_signature(row))
+                                for row in inventory["operations"].values()),
+             "pages": sorted((row["id"], row.get("url"),
+                              _digest("PFD", row.get("functions") if isinstance(row.get("functions"), list) else []))
+                             for row in project.list("page")),
+             "references": reference_signatures}
+    result["dependency_hash"] = _digest("FRD", roots)
     result["complete"] = result["discovery"]["status"] == "reviewed" \
         and result["pages"]["status"] != "blocked" \
         and all(row["status"] != "blocked" for row in result["categories"])
@@ -445,9 +461,83 @@ def _valid_frontier(project, checkpoint, inventory, cache=None):
         return False
     try:
         checked = _frontier_review(project, {key: review[key] for key in ("discovery", "categories", "pages")}, inventory, cache)
-        return checked == review
+        if checked != review:
+            return False
+        receipt = project.get("frontier_receipt", checkpoint.get("frontier_receipt_id"))
+        facts = {key: value for key, value in receipt.items() if key not in {"id", "created_at"}}
+        return receipt["id"] == _digest("FRC", facts) and receipt.get("schema") == "awa-frontier/v1" \
+            and receipt.get("subject_id") == project.project_id and receipt.get("decision") == "accepted" \
+            and receipt.get("dependency_hash") == checked["dependency_hash"] \
+            and receipt.get("observation_key") == checkpoint.get("frontier_observation_key") \
+            and receipt.get("observation_key") == _frontier_material(project, checked, cache)
     except (EngineError, OSError, ValueError, TypeError, KeyError):
         return False
+
+
+def _frontier_observation(value, field=None):
+    """Discard transport clocks and receipt handles, retaining observed content."""
+    volatile = {"started_at", "completed_at", "finished_at", "created_at", "timestamp", "time",
+                "duration", "duration_ms", "elapsed_ms", "timings", "guard_dispatch_id", "dispatch_id",
+                "run_id", "page_visit_id", "request_id", "trace_id"}
+    response_headers = {"date", "server-timing", "x-request-id"}
+    if isinstance(value, dict):
+        return {key: _frontier_observation(item, key) for key, item in value.items()
+                if key not in volatile and not (field == "response_headers" and key.lower() in response_headers)}
+    if isinstance(value, list):
+        return [_frontier_observation(item) for item in value
+                if not (field == "response_headers" and isinstance(item, list) and item
+                        and str(item[0]).lower() in response_headers)]
+    return value
+
+
+def _frontier_material(project, review, cache=None):
+    """Deduplicate actual observations, excluding labels, handles and clocks.
+
+    Re-reading a source or capturing its identical request/response again is one
+    material review. A caller-supplied reviewer name cannot create independence.
+    """
+    from . import browser, engine
+    cache = cache if cache is not None else {}
+    declarations = [review["discovery"], review["pages"], *review["categories"]]
+    evidence_ids = sorted({identity for row in declarations for identity in row.get("evidence_ids", [])})
+    visit_ids = sorted({identity for row in declarations for identity in row.get("page_visit_ids", [])})
+    material = set()
+    for identity in evidence_ids:
+        key = ("frontier_observation", "evidence", identity)
+        if key not in cache:
+            meta, artifact = engine.verify_current_evidence(project, identity)
+            response = dict(artifact["response"])
+            response["headers"] = [header for header in response.get("headers", [])
+                                   if str(header[0]).lower() not in {"date", "server-timing", "x-request-id"}]
+            cache[key] = _digest("FO", {"operation_signature": meta["operation_signature"],
+                "identity": {name: meta.get(name) for name in ("actor_id", "session_id", "session_generation", "resource_id")},
+                "request": artifact["request"], "response": response})
+        material.add(cache[key])
+    for identity in visit_ids:
+        key = ("frontier_observation", "page_visit", identity)
+        if key not in cache:
+            visit = project.get("page_visit", identity)
+            meta, raw = browser._verified_visit(project, identity, visit["url"])
+            cache[key] = _digest("FO", {"identity": {name: meta.get(name) for name in
+                ("actor_id", "session_id", "session_generation")}, "observation": _frontier_observation({name: raw.get(name) for name in
+                ("url", "finalUrl", "status", "network", "actions", "signals", "console", "dialogs", "navigation_trail")})})
+        material.add(cache[key])
+    return _digest("FOM", sorted(material))
+
+
+def _capture_frontier(project, review):
+    key = _frontier_material(project, review)
+    declarations = [review["discovery"], review["pages"], *review["categories"]]
+    facts = {"schema": "awa-frontier/v1", "subject_id": project.project_id,
+             "dependency_hash": review["dependency_hash"], "observation_key": key,
+             "evidence_ids": sorted({identity for row in declarations for identity in row.get("evidence_ids", [])}),
+             "page_visit_ids": sorted({identity for row in declarations for identity in row.get("page_visit_ids", [])}),
+             "decision": "accepted", "observer_assurance": "agent_recorded",
+             "independent_human": False, "counts_as_tested": False}
+    identity = _digest("FRC", facts)
+    if project.get("frontier_receipt", identity, required=False) is None:
+        project.put("frontier_receipt", {"id": identity, **facts, "created_at": now()}, create_only=True)
+    return identity, key
 
 
 def _semantic_projection(project, inventory, rows):
@@ -528,6 +618,16 @@ def _semantic_projection(project, inventory, rows):
         fact(preparation, "candidate_context", {key: candidate.get(key) for key in ("id", "kind", "operation_id")}
              | {"input_binding": {key: (candidate.get("link") or {}).get(key)
                                   for key in ("input_location", "input_selector", "schema_branch")}})
+    for snapshot in rows.get("discovery_snapshot", []):
+        if inventory.get("source_inventory", {}).get("snapshot_issues", {}).get(snapshot["id"]):
+            continue
+        fact(preparation, "discovery_snapshot", {key: snapshot.get(key) for key in
+             ("id", "source_id", "sha256", "parser_version", "normalized_sha256")})
+    source_items = {item["id"] for item in inventory.get("source_inventory", {}).get("items", [])}
+    for receipt in rows.get("discovery_ingest", []):
+        if receipt.get("source_item_id") in source_items:
+            fact(preparation, "discovery_ingest", {key: receipt.get(key) for key in
+                 ("source_item_id", "operation_id", "candidate_id")})
 
     # The queue retains actual prerequisites under a caller-only blocked wrapper.
     # Administrative blocked/open flags themselves are deliberately absent.
@@ -614,10 +714,13 @@ def _state(project, evaluated, inventory, completion):
     snapshot_completion = dict(completion)
     # Empty derived review counters extend the public schema, not the material
     # snapshot. Keep genuinely closed legacy checkpoints usable after upgrade.
-    for key in ("applicability_review_total", "scope_reduction_review_total"):
+    for key in ("applicability_review_total", "scope_reduction_review_total", "unimported_source_items",
+                "source_conflict_total", "source_unresolved_total"):
         if snapshot_completion.get(key) == 0:
             snapshot_completion.pop(key, None)
-    snapshot = _digest("CS", {"config": project.config, "rows": rows, "material": material, "validity": validity,
+    snapshot_rows = {kind: values for kind, values in rows.items()
+                     if values or not kind.startswith("discovery_")}
+    snapshot = _digest("CS", {"config": project.config, "rows": snapshot_rows, "material": material, "validity": validity,
                                "completion": snapshot_completion})
     # Raw captures and repeated plan/tool calls deliberately do not count as progress.
     bad_pages = {row["page_id"] for row in inventory["page_coverage"]["unvisited"]}
@@ -654,7 +757,16 @@ def _state(project, evaluated, inventory, completion):
             break
         no_progress += 1
     no_progress = max(0, no_progress - 1)
-    candidates = [row for row in checkpoints if row.get("snapshot_id") == snapshot and row.get("frontier_review")][-MIN_FRONTIER_ROUNDS:]
+    candidates, observed_material = [], set()
+    for row in reversed(checkpoints):
+        key = row.get("frontier_observation_key")
+        if not key or key in observed_material or not row.get("frontier_receipt_id") or not row.get("frontier_review"):
+            continue
+        observed_material.add(key)
+        candidates.append(row)
+        if len(candidates) == MIN_FRONTIER_ROUNDS:
+            break
+    candidates.reverse()
     cache = {}
     frontier = [row for row in candidates if isinstance(row["frontier_review"], dict)
                 and row["frontier_review"].get("complete") is True
@@ -667,26 +779,33 @@ def _state(project, evaluated, inventory, completion):
             "scope_reduction_review_total": len(inventory.get("scope_reductions", [])) + len(inventory.get("consumer_requirements", [])),
             "no_progress_rounds": no_progress, "checkpoint_id": checkpoints[-1]["id"] if checkpoints else None,
             "frontier_rounds": len(frontier), "frontier_complete": bool(frontier and frontier[-1]["frontier_review"]["complete"]),
-            "current_checkpoint": bool(checkpoints and checkpoints[-1].get("snapshot_id") == snapshot),
+            "current_checkpoint": bool(checkpoints and (checkpoints[-1].get("snapshot_id") == snapshot
+                or frontier and frontier[-1]["id"] == checkpoints[-1]["id"]
+                and checkpoints[-1].get("semantic_progress_id", checkpoints[-1].get("progress_id")) == semantic_progress)),
             "current_frontier": bool(frontier and checkpoints and frontier[-1]["id"] == checkpoints[-1]["id"]),
+            "frontier_receipt_id": frontier[-1].get("frontier_receipt_id") if frontier else None,
+            "frontier_dependency_hash": frontier[-1]["frontier_review"].get("dependency_hash") if frontier else None,
             "checkpoints": checkpoints}
 
 
 def _exhausted(state, completion, has_operations):
     """One predicate governs the advertised gate, stop records and final reports."""
-    return bool(has_operations and completion.get("status") == "complete"
-        and not state["actionable_total"] and not state["blocked_total"] and not state["unresolved_total"]
-        and not state.get("applicability_review_total", 0)
-        and not state.get("scope_reduction_review_total", 0)
-        and state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["frontier_complete"]
-        and state["current_checkpoint"] and state["current_frontier"])
+    from .completion import declared_scope_ready
+    return declared_scope_ready(has_scope=bool(has_operations), coverage_complete=completion.get("status") == "complete",
+        counts={"actionable": state["actionable_total"], "blocked": state["blocked_total"],
+                "unresolved": state["unresolved_total"], "applicability": state.get("applicability_review_total", 0),
+                "scope_reduction": state.get("scope_reduction_review_total", 0)},
+        frontier_current=bool(state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["frontier_complete"]
+                              and state["current_checkpoint"] and state["current_frontier"]))
 
 
 def _valid_stop(stop, state, can_finalize):
     if not can_finalize or not stop or stop.get("reason") != "completed" \
             or stop.get("can_claim_complete") is not True or stop.get("completion_status") != "complete" \
             or stop.get("frontier_reviewed") is not True or stop.get("reason_basis") != "engine_gate" \
-            or stop.get("snapshot_id") != state["snapshot_id"] or stop.get("checkpoint_id") != state["checkpoint_id"]:
+            or (stop.get("snapshot_id") != state["snapshot_id"] and not (stop.get("frontier_dependency_hash")
+                and stop.get("frontier_dependency_hash") == state.get("frontier_dependency_hash"))) \
+            or stop.get("checkpoint_id") != state["checkpoint_id"]:
         return False
     if "automatic_stop_allowed" in stop and stop["automatic_stop_allowed"] is not True:
         return False
@@ -719,11 +838,13 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
         security, _ = completeness._security(inventory)
     completion = completion if completion is not None else completeness._completion(inventory, security, evaluated)
     state = _state(project, evaluated, inventory, completion)
+    acceptance = _current_partial_acceptance(project, state)
     frontier_ready = state["frontier_rounds"] >= MIN_FRONTIER_ROUNDS and state["frontier_complete"] \
         and state["current_checkpoint"] and state["current_frontier"]
-    can_finalize = _exhausted(state, completion, bool(inventory["operations"]))
+    can_finalize = _exhausted(state, completion, bool(inventory["operations"])) and acceptance is None
     latest_stop = next((row for row in reversed(project.list("finalization"))
-                       if row.get("snapshot_id") == state["snapshot_id"]
+                       if (row.get("snapshot_id") == state["snapshot_id"] or row.get("frontier_dependency_hash")
+                           and row.get("frontier_dependency_hash") == state.get("frontier_dependency_hash"))
                        and row.get("checkpoint_id") == state["checkpoint_id"]), None)
     finalization = latest_stop if _valid_stop(latest_stop, state, can_finalize) else None
     reason = ("work_remaining" if state["actionable_total"] else "blocked_preconditions" if state["blocked_total"]
@@ -738,9 +859,22 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
         status, reason, next_action = "stalled", "no_closure_progress", "plan.audit"
     if not inventory["operations"]:
         status, reason, next_action = "not_started", "inventory_missing", "surface.list"
+        if any(inventory.get("source_inventory", {}).get("summary", {}).get(key) for key in ("snapshot_total", "source_total")):
+            status, reason, next_action = "continue", "work_remaining", "surface.sources"
     if finalization:
         status, reason, next_action = "finalized", finalization["reason"], "report.build"
+    from .completion import CompletionEvaluator
+    decision = CompletionEvaluator.evaluate(model="v1", subject_id=project.project_id,
+        has_scope=bool(inventory["operations"]), coverage_complete=completion["status"] == "complete",
+        counts={"ready": state["ready_total"], "review": state["review_total"], "blocked": state["blocked_total"],
+                "unresolved": state["unresolved_total"]}, frontier_current=bool(frontier_ready),
+        source_complete=not completion.get("source_unresolved_total", 0), finalized=finalization is not None,
+        partial_accepted=acceptance is not None,
+        next_action=next_action)
     return {"contract_version": 2, "stop_policy": STOP_POLICY, "stop_policy_version": STOP_POLICY_VERSION,
+            "completion_decision": decision,
+            "partial_acceptance_id": acceptance["id"] if acceptance else None,
+            "frontier_dependency_hash": state.get("frontier_dependency_hash"),
             "continue_required": finalization is None, "automatic_stop_allowed": finalization is not None,
             "can_finalize": can_finalize, "can_claim_complete": finalization is not None,
             "legacy_finalization_ignored": latest_stop is not None and finalization is None,
@@ -748,8 +882,10 @@ def control(project, evaluated=None, *, inventory=None, security=None, completio
             "scope_reduction_review_total": state.get("scope_reduction_review_total", 0),
             "state": status, "reason_code": reason, "next_action": next_action,
             **{key: state[key] for key in ("snapshot_id", "progress_id", "semantic_progress_id", "checkpoint_id", "ready_total", "review_total",
-                "blocked_total", "actionable_total", "unresolved_total", "no_progress_rounds", "frontier_rounds")
+                "blocked_total", "actionable_total", "unresolved_total", "no_progress_rounds", "frontier_rounds",
+                )
                 if key != "semantic_progress_id" or key in state},
+            "frontier_receipt_id": state.get("frontier_receipt_id"),
             "frontier_review_required": not frontier_ready,
             "finalization_id": finalization["id"] if finalization else None,
             "coverage_status": completion["status"], "registered_scope_only": True}
@@ -823,14 +959,81 @@ def checkpoint(project, args):
                   "remaining": {key: current[key] for key in ("ready_total", "review_total", "blocked_total", "unresolved_total")},
                   "completion_status": evaluated["completion"]["status"], "frontier_review": frontier,
                   "parameter_progress": projection, "parameter_delta": delta}
+        if frontier and frontier["complete"]:
+            record["frontier_receipt_id"], record["frontier_observation_key"] = _capture_frontier(project, frontier)
         project.put("checkpoint", record, create_only=True)
         project.event("plan.checkpoint", {"checkpoint_id": record["id"], "progress_changed": record["progress_changed"]})
         updated = engine.evaluate_coverage(project)["continuation"]
         public_record = {key: value for key, value in record.items() if key not in {"parameter_progress", "semantic_progress"}}
+        frontier_receipt = (project.get("frontier_receipt", record["frontier_receipt_id"])
+                            if record.get("frontier_receipt_id") else None)
         from .publication import publish
-        public = publish(project, "plan.checkpoint", {"checkpoint": public_record, "continuation": updated, "requests_sent": 0,
+        public = publish(project, "plan.checkpoint", {
+            "checkpoint": public_record, "frontier_receipt_id": record.get("frontier_receipt_id"),
+            "frontier_receipt": frontier_receipt, "continuation": updated,
+            "completion_decision": updated["completion_decision"], "requests_sent": 0,
             "note": "Repeated calls or captures are not closure progress. Review existing evidence or change the bounded hypothesis; never auto-replay uncertain writes."})
     return public
+
+
+def _current_partial_acceptance(project, state):
+    rows = project.connection.execute("SELECT document FROM entities WHERE kind='completion_acceptance' "
+        "AND json_extract(document,'$.snapshot_id')=? AND json_extract(document,'$.checkpoint_id')=? "
+        "ORDER BY created_at DESC,id DESC LIMIT 1", (state["snapshot_id"], state["checkpoint_id"])).fetchall()
+    if not rows:
+        return None
+    import json
+    receipt = json.loads(rows[0][0])
+    facts = {key: value for key, value in receipt.items() if key not in {"id", "created_at"}}
+    return receipt if receipt.get("id") == _digest("CA", facts) and receipt.get("schema") == "awa-partial-acceptance/v1" \
+        and receipt.get("subject_id") == project.project_id and receipt.get("can_claim_complete") is False \
+        and receipt.get("automatic_stop_allowed") is False and receipt.get("continue_required") is True else None
+
+
+def accept_partial(project, args):
+    """Record a bounded partial delivery; completion and execution remain gated."""
+    from . import engine
+    checkpoint_id = _text(args.get("checkpoint_id"), "checkpoint_id", 100)
+    accepted_by = _text(args.get("accepted_by"), "accepted_by", 200)
+    explanation = _text(args.get("explanation"), "explanation")
+    with project.transaction():
+        evaluated = engine.evaluate_coverage(project)
+        current = evaluated["continuation"]
+        checkpoint = project.get("checkpoint", checkpoint_id)
+        if current["checkpoint_id"] != checkpoint_id or checkpoint.get("snapshot_id") != current["snapshot_id"]:
+            raise EngineError("checkpoint_stale", "Partial delivery requires a current checkpoint", {"next_action": "plan.checkpoint"})
+        if current["can_finalize"] or current["can_claim_complete"]:
+            raise EngineError("partial_acceptance", "A partial acceptance cannot borrow completed-scope authority")
+        existing = _current_partial_acceptance(project, current)
+        if existing and existing.get("accepted_by") == accepted_by \
+                and existing.get("explanation") == explanation:
+            updated = engine.evaluate_coverage(project)["continuation"]
+            from .publication import publish
+            return publish(project, "plan.accept_partial", {
+                "partial_acceptance": existing, "continuation": updated,
+                "completion_decision": updated["completion_decision"], "requests_sent": 0,
+                "next_action": updated["next_action"]})
+        # The completion decision changes to partial_accepted after the first
+        # immutable receipt. Keep the pre-acceptance decision identity stable so
+        # an idempotent replay and a later named acceptance bind the same snapshot.
+        decision_id = existing["completion_decision_id"] if existing \
+            else current["completion_decision"]["id"]
+        facts = {"schema": "awa-partial-acceptance/v1", "subject_id": project.project_id,
+                 "snapshot_id": current["snapshot_id"], "checkpoint_id": checkpoint_id,
+                 "completion_decision_id": decision_id, "accepted_by": accepted_by,
+                 "explanation": explanation, "reviewer_assurance": "agent_recorded", "reason": "partial_accepted",
+                 "remaining": {key: current[key] for key in ("ready_total", "review_total", "blocked_total", "unresolved_total")},
+                 "can_claim_complete": False, "automatic_stop_allowed": False, "continue_required": True}
+        identity = _digest("CA", facts)
+        receipt = project.get("completion_acceptance", identity, required=False)
+        if receipt is None:
+            receipt = {"id": identity, **facts, "created_at": now()}
+            project.put("completion_acceptance", receipt, create_only=True)
+            project.event("plan.partial_accepted", {"acceptance_id": identity, "checkpoint_id": checkpoint_id})
+        updated = engine.evaluate_coverage(project)["continuation"]
+        from .publication import publish
+        return publish(project, "plan.accept_partial", {"partial_acceptance": receipt, "continuation": updated,
+            "completion_decision": updated["completion_decision"], "requests_sent": 0, "next_action": updated["next_action"]})
 
 
 def _write_contexts(project, kind, item):
@@ -1013,7 +1216,9 @@ def finalize(project, args):
         current = evaluated["continuation"]
         record = project.get("checkpoint", checkpoint_id)
         checkpoints = project.list("checkpoint")
-        if not checkpoints or checkpoints[-1]["id"] != checkpoint_id or record["snapshot_id"] != current["snapshot_id"]:
+        if not checkpoints or checkpoints[-1]["id"] != checkpoint_id or (record["snapshot_id"] != current["snapshot_id"]
+                and not ((record.get("frontier_review") or {}).get("dependency_hash")
+                         and record["frontier_review"]["dependency_hash"] == current.get("frontier_dependency_hash"))):
             raise EngineError("checkpoint_stale", "Create a current checkpoint before stopping; scope, evidence or task state changed",
                               {"continuation": current, "next_action": "plan.checkpoint"})
         if current["actionable_total"]:
@@ -1032,6 +1237,7 @@ def finalize(project, args):
             raise EngineError("frontier_review_required", "Two current, complete, evidence-bound discovery/category/page review rounds "
                               "and the latest complete frontier are required for bounded exhaustion", _recovery(current))
         stop = {"id": project.id("FN"), "checkpoint_id": checkpoint_id, "snapshot_id": current["snapshot_id"],
+                "frontier_dependency_hash": current.get("frontier_dependency_hash"),
                 "reason": reason, "explanation": explanation, "reviewer": reviewer, "created_at": now(),
                 "stop_policy": STOP_POLICY, "stop_policy_version": STOP_POLICY_VERSION,
                 "completion_status": evaluated["completion"]["status"], "can_claim_complete": True,
@@ -1061,7 +1267,8 @@ def require_finalization(project, finalization_id, evaluated=None):
     stop = project.get("finalization", finalization_id, required=False)
     if not stop:
         raise EngineError("finalization_required", "Unknown finalization record in this project", {"continuation": current})
-    if stop.get("snapshot_id") != current["snapshot_id"] or stop.get("checkpoint_id") != current["checkpoint_id"]:
+    if stop.get("snapshot_id") != current["snapshot_id"] \
+            or stop.get("checkpoint_id") != current["checkpoint_id"]:
         raise EngineError("finalization_stale", "The project changed after finalization; continue work and create a new stop record",
                           _recovery(current))
     if not _valid_stop(stop, current, current["can_finalize"]):

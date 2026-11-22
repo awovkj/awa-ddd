@@ -1,33 +1,151 @@
 /** Offline release smoke: pack, inspect, extract and execute the shipped entry. */
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const validation = join(root, '.validation');
-await mkdir(validation, { recursive: true });
-const stage = await mkdtemp(join(validation, 'package-smoke-'));
 const pythonExecutable = process.env.AWA_DDD_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
 const options = { cwd: root, shell: false, windowsHide: true, timeout: 60000, maxBuffer: 8 * 1024 * 1024 };
 const recordPath = join(validation, 'package-check.json');
+const runningRecordPath = join(validation, 'package-check.running.json');
+const lockPath = join(validation, 'package-check.lock');
+const archiveRoot = join(validation, 'archives');
+const requestedRunId = process.env.AWA_RELEASE_RUN_ID || randomUUID();
+const runId = requestedRunId;
 const startedAt = new Date().toISOString();
-await writeFile(recordPath, JSON.stringify({ result: 'running', started_at: startedAt }, null, 2) + '\n');
+const bundledResources = new Map([
+  ['awa_ddd/resources/js_parser/manifest.json', '9cd41e076c3bcf2a4bc61bcfd52130d319b42354232d5d127c98ade42f614686'],
+  ['awa_ddd/resources/js_parser/parse-js.mjs', '972badd3720729ad0336ab6d610576d2b748a8f38e7ed9c3a9cea4ba1da28210'],
+  ['awa_ddd/resources/js_parser/vendor/acorn/LICENSE', '76a876cf886ff9be2a8b5e2e86514fed06223c8c9f0c1e9ee9606e93841e00b7'],
+  ['awa_ddd/resources/js_parser/vendor/acorn/package.json', '04d6fecaafb5e3d20a38fc3b64fed84bb3830a7759a8c00400ebcb87331fec00'],
+  ['awa_ddd/resources/js_parser/vendor/acorn/dist/acorn.mjs', '76254fc76529713b4dfd2532972d17a991ffd9aafeebb1f977445b5506b9fb0b'],
+]);
+const phases = [];
+let currentPhase = 'initialize';
+let phaseStartedAt = startedAt;
+
+function beginPhase(name) {
+  currentPhase = name;
+  phaseStartedAt = new Date().toISOString();
+}
+
+function finishPhase(summary = null) {
+  phases.push({
+    name: currentPhase,
+    started_at: phaseStartedAt,
+    finished_at: new Date().toISOString(),
+    result: 'passed',
+    ...(summary ? { summary } : {}),
+  });
+}
+
+function errorRecord(error) {
+  return {
+    code: String(error?.code || error?.name || 'PACKAGE_CHECK_FAILED'),
+    message: String(error?.message || 'Package check failed.'),
+    ...(Number.isInteger(error?.exitCode) ? { exit_code: error.exitCode } : {}),
+    ...(Array.isArray(error?.errors) ? { nested_errors: error.errors.map(errorRecord) } : {}),
+  };
+}
+
+async function atomicWriteJson(path, value) {
+  const temporary = `${path}.${runId}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
+    await rename(temporary, path);
+  } catch (primary) {
+    try {
+      await rm(temporary, { force: true });
+    } catch (cleanup) {
+      throw new AggregateError([primary, cleanup], primary.message, { cause: primary });
+    }
+    throw primary;
+  }
+}
+
+function failureRecord(error, stagePath = null, extras = {}) {
+  return {
+    schema_version: 1,
+    run_id: runId,
+    result: 'failed',
+    phase: currentPhase,
+    primary_error: errorRecord(error),
+    cleanup_errors: (extras.cleanupErrors || []).map(item => ({
+      surface: item.surface,
+      error: errorRecord(item.error),
+    })),
+    dispose_error: extras.disposeError ? errorRecord(extras.disposeError) : null,
+    phases,
+    ...(stagePath ? { stage_path: stagePath } : {}),
+    started_at: startedAt,
+    finished_at: new Date().toISOString(),
+  };
+}
+
+function assertLexicallyWithin(candidate, parent, allowEqual = false) {
+  const candidateFull = resolve(candidate);
+  const parentFull = resolve(parent);
+  const delta = relative(parentFull, candidateFull);
+  assert.ok(
+    (allowEqual && delta === '') || (delta && delta !== '..' && !delta.startsWith(`..${sep}`) && !isAbsolute(delta)),
+    `Path must stay below ${parentFull}: ${candidateFull}`,
+  );
+  return candidateFull;
+}
+
+async function assertNoLinkComponents(path, stopAt = root) {
+  let cursor = resolve(path);
+  const stop = resolve(stopAt);
+  assertLexicallyWithin(cursor, stop, true);
+  while (true) {
+    try {
+      const metadata = await lstat(cursor);
+      assert.ok(!metadata.isSymbolicLink(), `Refusing symbolic-link path component: ${cursor}`);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    if (cursor === stop) break;
+    const parent = dirname(cursor);
+    assert.notEqual(parent, cursor, `Path ancestry ended before ${stop}`);
+    cursor = parent;
+  }
+}
+
+async function assertRealPathWithin(candidate, parentReal, allowEqual = false, label = 'path') {
+  const actual = await realpath(candidate);
+  assertLexicallyWithin(actual, parentReal, allowEqual);
+  assert.equal(resolve(actual), actual, `${label} must resolve to a canonical path.`);
+  return actual;
+}
+
+async function assertRegularSource(path) {
+  const full = assertLexicallyWithin(resolve(root, path), root);
+  await assertNoLinkComponents(full, root);
+  const metadata = await lstat(full);
+  assert.ok(metadata.isFile() && !metadata.isSymbolicLink(), `Release source is not a regular file: ${path}`);
+  const actual = await assertRealPathWithin(full, await realpath(root), false, 'release source');
+  assert.equal(actual, full, `Release source must not be re-addressed through a link: ${path}`);
+  return metadata;
+}
 
 async function shippedSourceManifest(files, installedRoot) {
   const rows = [];
   for (const path of [...files].sort()) {
     const original = resolve(root, path);
-    const delta = relative(root, original);
-    assert.ok(delta && !isAbsolute(delta) && delta !== '..' && !delta.startsWith(`..${sep}`), 'Source must stay below the checkout.');
-    const sourceDigest = createHash('sha256').update(await readFile(original)).digest('hex');
-    assert.equal(sourceDigest, createHash('sha256').update(await readFile(join(installedRoot, path))).digest('hex'),
+    await assertRegularSource(path);
+    const sourceBytes = await readFile(original);
+    const installedBytes = await readFile(join(installedRoot, path));
+    const sourceDigest = createHash('sha256').update(sourceBytes).digest('hex');
+    assert.equal(sourceBytes.length, installedBytes.length, `The extracted ${path} has a different byte length.`);
+    assert.equal(sourceDigest, createHash('sha256').update(installedBytes).digest('hex'),
       `The extracted ${path} differs from the current release source.`);
-    rows.push({ path, sha256: sourceDigest });
+    rows.push({ path, bytes: sourceBytes.length, sha256: sourceDigest });
   }
   return rows;
 }
@@ -298,13 +416,139 @@ print(json.dumps({kind: counts.get(kind, 0) for kind in ("run", "evidence", "dec
     src_write_rejected_before_dispatch: true, src_exchange_idempotent: true, src_external_confirmation_ignored: true };
 }
 
+async function verifySourceInventorySmoke(dispatch, fixtureRoot) {
+  const projectId = 'package-source-inventory';
+  const baseUrl = 'https://source-package.invalid';
+  const call = (name, action, input = {}) => dispatch(name, action, input, projectId);
+  await call('awa_project', 'project.create', { target: baseUrl, assessment_mode: 'src' });
+  const importHelp = await dispatch('awa_project', 'action.help', { name: 'surface.import' }, null);
+  assert.match(importHelp.fields.format, /actuator_mappings/);
+  assert.match(importHelp.fields.snapshot_id, /saved/);
+  const sourcePath = join(fixtureRoot, 'source-mappings.json');
+  const sourceBytes = JSON.stringify({ contexts: { fixture: { mappings: { dispatcherServlets: { dispatcher: [
+    ...['/records', '/records/{record}', '/assets/**'].map(pattern => ({
+      handler: 'fixture-only', details: { requestMappingConditions: { methods: ['GET'], patterns: [pattern] } },
+    })),
+  ] } } } } });
+  await writeFile(sourcePath, sourceBytes);
+  const preview = await call('awa_surface', 'surface.import', {
+    path: sourcePath, format: 'actuator_mappings', base_url: baseUrl, mode: 'preview', limit: 1,
+  });
+  assert.equal(preview.result_total, 3);
+  assert.equal(preview.results.length, 1);
+  assert.deepEqual(preview.operation_ids, []);
+  assert.deepEqual(preview.candidate_ids, []);
+  assert.equal(preview.source_inventory.pending_import_total, 3);
+  assert.equal(preview.requests_sent, 0);
+  assert.equal((await call('awa_surface', 'surface.list')).operation_total, 0);
+  const saved = await call('awa_surface', 'surface.sources', { snapshot_id: preview.snapshot_id, limit: 1 });
+  assert.equal(saved.snapshot.sha256, createHash('sha256').update(sourceBytes).digest('hex'));
+  assert.equal(saved.snapshot.inventory.mapping_total, 3);
+  assert.equal(saved.snapshot_integrity, 'valid');
+  // The reviewed snapshot must remain usable after the local file changes.
+  await writeFile(sourcePath, JSON.stringify({ contexts: {} }));
+  let input = { snapshot_id: preview.snapshot_id, mode: 'apply', offset: 0, limit: 1 };
+  let applied;
+  let pageCount = 0;
+  while (input && pageCount < 3) {
+    applied = await call('awa_surface', 'surface.import', input);
+    assert.equal(applied.snapshot_id, preview.snapshot_id);
+    assert.equal(applied.results.length, 1);
+    assert.ok(applied.operation_ids.length + applied.candidate_ids.length <= 1);
+    assert.equal(applied.requests_sent, 0);
+    input = applied.next_input;
+    pageCount++;
+  }
+  assert.equal(input, null);
+  assert.equal(pageCount, 3);
+  assert.equal(applied.next_action, 'surface.sources');
+  assert.equal(applied.source_inventory.pending_import_total, 0);
+  assert.equal((await call('awa_surface', 'surface.list')).operation_total, 2);
+  assert.equal((await call('awa_candidate', 'candidate.list')).candidate_total, 1);
+  const status = await call('awa_project', 'project.status');
+  assert.equal(status.run_total, 0);
+  assert.equal(status.source_inventory.known_not_registered_total, 1);
+  assert.equal(status.completion.status, 'partial');
+  assert.equal(status.continuation.can_finalize, false);
+  assert.equal(status.source_inventory.site_wide_discovery_allowed, false);
+  return { preview_rows: 3, apply_pages: pageCount, operations: 2, candidates: 1,
+    exact_snapshot_ignores_file_changes: true, requests_sent: 0, can_finalize: false };
+}
+
+let stage;
+let mainFailure;
+let lockAcquired = false;
+let disposeFailure = null;
+let successRecord;
+const cleanupErrors = [];
+
+function addCleanupFailure(surface, error) {
+  cleanupErrors.push({ surface, error });
+}
+
 try {
+  assert.match(runId, /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/,
+    'AWA_RELEASE_RUN_ID must be a safe 1-128 character path token.');
+  await mkdir(validation, { recursive: true });
+  const rootReal = await realpath(root);
+  assertLexicallyWithin(validation, root);
+  await assertNoLinkComponents(validation, root);
+  await assertRealPathWithin(validation, rootReal, false, 'validation directory');
+  await assertNoLinkComponents(lockPath, root);
+  await writeFile(lockPath, JSON.stringify({
+    schema_version: 1, run_id: runId, pid: process.pid, started_at: startedAt,
+  }, null, 2) + '\n', { flag: 'wx' });
+  lockAcquired = true;
+  await assertNoLinkComponents(lockPath, root);
+
+  // The running marker is written before any old result is invalidated. Consumers
+  // must require result=passed, this exact run_id, and absence of the running marker.
+  await assertNoLinkComponents(runningRecordPath, root);
+  await writeFile(runningRecordPath, JSON.stringify({
+    schema_version: 1, run_id: runId, result: 'running', started_at: startedAt,
+  }, null, 2) + '\n', { flag: 'w' });
+  await assertNoLinkComponents(runningRecordPath, root);
+  await assertNoLinkComponents(recordPath, root);
+  await rm(recordPath, { force: true });
+
+  await mkdir(archiveRoot, { recursive: true });
+  await assertNoLinkComponents(archiveRoot, root);
+  await assertRealPathWithin(archiveRoot, await realpath(validation), false, 'archive root');
+  stage = await mkdtemp(join(validation, 'package-smoke-'));
+  await assertNoLinkComponents(stage, root);
+  await assertRealPathWithin(stage, await realpath(validation), false, 'smoke stage');
+  await writeFile(runningRecordPath, JSON.stringify({
+    schema_version: 1, run_id: runId, result: 'running', started_at: startedAt,
+    phase: currentPhase, stage_path: stage,
+  }, null, 2) + '\n', { flag: 'w' });
+} catch (error) {
+  mainFailure = error;
+}
+
+if (!mainFailure) try {
   assert.ok(process.env.npm_execpath, 'Run this check with npm run pack:check.');
+  finishPhase({ lock_acquired: true, running_marker_written: true, stage_created: true });
+  beginPhase('npm-pack');
   const { stdout } = await run(process.execPath, [process.env.npm_execpath, 'pack', '--ignore-scripts', '--offline',
     '--json', '--cache', join(stage, 'cache'), '--pack-destination', stage], options);
-  const [packed] = JSON.parse(stdout);
-  const files = new Set(packed.files.map(file => file.path));
-  const required = ['package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'pyproject.toml',
+  const packResults = JSON.parse(stdout);
+  assert.equal(packResults.length, 1, 'npm pack JSON must contain exactly one package result.');
+  const [packed] = packResults;
+  assert.equal(packed.name, 'awa-ddd', 'npm pack returned an unexpected package name.');
+  assert.ok(Array.isArray(packed.files) && packed.files.length > 0, 'npm pack returned no file manifest.');
+  const packedPaths = packed.files.map(file => file.path);
+  assert.equal(packedPaths.length, new Set(packedPaths).size, 'npm pack manifest contains duplicate paths');
+  for (const file of packed.files) {
+    assert.ok(Number.isInteger(file.size), `npm pack manifest has no integer size for ${file.path}.`);
+    assert.ok(Number.isInteger(file.mode), `npm pack manifest has no integer mode for ${file.path}.`);
+  }
+  const files = new Set(packedPaths);
+  assert.equal(basename(packed.filename), packed.filename, 'npm pack filename must be a basename.');
+  const archive = assertLexicallyWithin(join(stage, packed.filename), stage);
+  await assertNoLinkComponents(archive, root);
+  await assertRealPathWithin(archive, await realpath(stage), false, 'npm archive');
+  const required = ['package.json', 'cordis.patch.yml', 'README.md', 'LICENSE', 'pyproject.toml', 'setup.py',
+    'icon.svg', 'locale/en.json', 'locale/zh.json',
     'src/index.mjs', 'src/bridge.mjs', 'src/tools.mjs', 'src/actions.mjs', 'src/tool-guidance.mjs',
     'src/parse-js.mjs', 'src/mode.mjs', 'src/src-mode.mjs', 'src/stop-policy.mjs', 'src/host-continuation.mjs', 'src/client.js',
     'scripts/invoke-request.mjs', 'scripts/Invoke-AwaDdd.ps1', 'skills/awa-ddd/SKILL.md',
@@ -312,10 +556,11 @@ try {
     'docs/UPGRADE-20261102.md', 'docs/UPGRADE-20261102-LEAN.md', 'docs/SESSION-20261102-ADAAE1EF.md',
     'docs/UPGRADE-20261103.md', 'docs/SESSION-20261103-CFF22367.md',
     'docs/V2-ARCHITECTURE.md', 'docs/V2-MIGRATION.md', 'docs/V2-ACCEPTANCE.md', 'docs/SRC-MODE.md', 'docs/INTEGRATION-DSH-PURGE.md',
-    'docs/REPRODUCTION.md', 'examples/assessment-hints.json',
+    'docs/REPRODUCTION.md', 'docs/REFACTOR-PLAN-20261121.md', 'docs/UPGRADE-20261121-SOURCE-LEDGER.md',
+    'docs/UPGRADE-20261122-HARDENING.md', 'examples/assessment-hints.json',
     'docs/WINDOWS_WSL.md', 'docs/INTERNAL_CONTRACT.md', 'docs/HOST_CONTRACT.md', 'docs/PLAYWRIGHT_TESTING.md',
     ...['__init__', '__main__', 'store', 'engine', 'scope', 'transport', 'assessment', 'scenario',
-      'discovery', 'importers', 'reporting_legacy', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
+      'discovery', 'source_inventory', 'importers', 'reporting_legacy', 'candidates', 'lineage', 'browser', 'browser_policy', 'external', 'contracts', 'continuation',
       'mcp_http', 'tscanplus',
       'workflow', 'runtime', 'wsl_runner', 'inputs', 'completeness', 'reproduction', 'publication',
       'parameter_coverage', 'oracle_contracts', 'assessment_hints', 'reconnaissance', 'recon_parsing',
@@ -324,14 +569,27 @@ try {
       'known_case', 'gap', 'review', 'common', 'repository'].map(module => `awa_ddd/domain/${module}.py`),
     ...['__init__', 'scheduler', 'known_cases', 'route_parser', 'hypotheses', 'coverage', 'campaign', 'migration'].map(module => `awa_ddd/planning/${module}.py`),
     ...['__init__', 'test_runner', 'browser_provider', 'external_provider', 'capabilities', 'fixtures',
-      'oracle_profiles', 'recipe_builder', 'review_engine'].map(module => `awa_ddd/execution/${module}.py`),
-    'awa_ddd/reporting/__init__.py', 'awa_ddd/reporting/matrix.py'];
+      'oracle_profiles', 'recipe_builder', 'review_engine', 'fixture_api'].map(module => `awa_ddd/execution/${module}.py`),
+    'awa_ddd/reporting/__init__.py', 'awa_ddd/reporting/matrix.py',
+    'awa_ddd/resources/__init__.py',
+    ...bundledResources.keys()];
   for (const file of required) assert.ok(files.has(file), `Release is missing ${file}`);
   for (const file of files) {
-    assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|node_modules|__pycache__|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|htmlcov|coverage|projects|tests|backups?)(?:\/|$)/);
+    const bundledResource = bundledResources.has(file);
+    assert.ok(bundledResource || !/(?:^|\/)node_modules(?:\/|$)/.test(file),
+      `Release contains an unapproved bundled Node.js module: ${file}`);
+    if (file.startsWith('awa_ddd/resources/')) assert.ok(
+      bundledResource || file === 'awa_ddd/resources/__init__.py',
+      `Release contains an unapproved runtime resource: ${file}`);
+    assert.doesNotMatch(file, /(?:^|\/)(?:\.validation|__pycache__|\.cache|\.pytest_cache|\.mypy_cache|\.ruff_cache|htmlcov|coverage|projects|tests|backups?)(?:\/|$)/);
     assert.doesNotMatch(file, /(?:\.py[co]|\.sqlite[^/]*|\.db(?:-wal|-shm|-journal)?|\.tgz|\.log|\.tmp|\.temp|\.bak|\.backup|\.orig|\.rej|~)$/i);
     const environment = /(?:^|\/)(?:\.env|[^/]+\.env)(?:\.[^/]*)?$/i.test(file);
     assert.ok(!environment || /\.(?:example|sample|template)$/i.test(file), `Release contains private environment configuration: ${file}`);
+  }
+  for (const [file, expectedDigest] of bundledResources) {
+    const bytes = await readFile(join(root, file));
+    assert.equal(createHash('sha256').update(bytes).digest('hex'), expectedDigest,
+      `Bundled runtime resource differs from its frozen SHA-256: ${file}`);
   }
 
   // HARD RULE: the archive must never vendor @deepseek-ai/*.
@@ -340,6 +598,8 @@ try {
   // which crashes session creation in the host. The SDK must always resolve to the
   // host's own copy, so it stays a peerDependency and is never shipped here.
   const manifest = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
+  assert.equal(manifest.dependencies?.acorn, undefined,
+    'Bundled Acorn must not also remain a direct npm runtime dependency.');
   for (const [name, range] of Object.entries(manifest.dependencies ?? {})) {
     assert.ok(!name.startsWith('@deepseek-ai/'),
       `dependencies must not include ${name}: shipping an SDK copy shadows the host's instance`);
@@ -348,13 +608,18 @@ try {
     assert.ok(manifest.peerDependencies?.[name],
       `${name} must stay a peerDependency so the host supplies the single instance`);
   }
-  const archive = join(stage, packed.filename);
+  finishPhase({ files: files.size, archive: packed.filename });
+  beginPhase('archive-extract');
   const destination = join(stage, 'unpacked');
   await mkdir(destination);
+  await assertNoLinkComponents(destination, root);
+  await assertRealPathWithin(destination, await realpath(stage), false, 'archive extraction directory');
   // Manual extraction supports Python 3.10 and rejects links and every path escape.
-  await run(pythonExecutable, ['-E', '-s', '-X', 'utf8', '-B', '-c', String.raw`
-import pathlib, sys, tarfile
+  const extraction = await run(pythonExecutable, ['-E', '-s', '-X', 'utf8', '-B', '-c', String.raw`
+import json, pathlib, sys, tarfile
 base = pathlib.Path(sys.argv[2]).resolve()
+files = []
+total_size = 0
 with tarfile.open(sys.argv[1], "r:gz") as archive:
     for member in archive.getmembers():
         name = pathlib.PurePosixPath(member.name)
@@ -368,12 +633,46 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
         elif member.isfile():
             if member.size > 16 * 1024 * 1024:
                 raise ValueError("Archive member exceeds budget")
+            total_size += member.size
+            if total_size > 256 * 1024 * 1024:
+                raise ValueError("Archive exceeds total unpacked-size budget")
+            relative = str(pathlib.PurePosixPath(*name.parts[1:]))
+            if any(row["path"] == relative for row in files):
+                raise ValueError("Duplicate archive file member")
+            if len(files) >= 10000:
+                raise ValueError("Archive exceeds member-count budget")
+            files.append({
+                "path": relative,
+                "size": member.size,
+                "mode": member.mode & 0o777,
+            })
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.extractfile(member) as source:
                 target.write_bytes(source.read())
         else:
             raise ValueError("Unsupported archive member")
+print(json.dumps({"files": sorted(files, key=lambda row: row["path"]), "total_size": total_size}, separators=(",", ":")))
 `, archive, destination], options);
+  const extracted = JSON.parse(extraction.stdout);
+  assert.deepEqual(extracted.files.map(file => file.path), [...files].sort(),
+    'The tar member set must exactly equal the npm pack manifest.');
+  const packEntries = new Map(packed.files.map(file => [file.path, file]));
+  for (const extractedFile of extracted.files) {
+    const packedFile = packEntries.get(extractedFile.path);
+    assert.ok(packedFile, `Archive member is absent from the npm pack manifest: ${extractedFile.path}`);
+    assert.equal(extractedFile.size, packedFile.size,
+      `Archive member size differs from npm pack metadata: ${extractedFile.path}`);
+    assert.equal(extractedFile.mode, packedFile.mode & 0o777,
+      `Archive member mode differs from npm pack metadata: ${extractedFile.path}`);
+  }
+  assert.ok(Number.isInteger(extracted.total_size) && extracted.total_size <= 256 * 1024 * 1024,
+    'Archive exceeds the total unpacked-size budget.');
+  finishPhase({
+    files: extracted.files.length,
+    total_size: extracted.total_size,
+    membership_exact: true,
+  });
+  beginPhase('package-smoke');
 
   // SDK dependencies resolve from the installed development host above stage;
   // application code and all Python modules come from the extracted archive.
@@ -403,7 +702,18 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
   assert.equal(installedManifest.version, manifest.version);
   assert.equal(packed.version, manifest.version);
   assert.equal(installedManifest.exports['./client'], './src/client.js');
+  assert.equal(installedManifest.exports['./icon'], './icon.svg');
+  assert.equal(installedManifest.exports['./locale/*.json'], './locale/*.json');
   assert.equal(installedManifest.dsh.client.platform, 'web');
+  for (const locale of ['en', 'zh']) {
+    const localized = JSON.parse(await readFile(join(installedRoot, 'locale', `${locale}.json`), 'utf8'));
+    assert.ok(localized.meta?.title?.trim(), `Missing ${locale} plugin title`);
+    assert.ok(localized.meta?.description?.trim(), `Missing ${locale} plugin description`);
+    assert.equal(localized.meta.detail, undefined, 'The README fallback is intentional without a feature preview');
+  }
+  const icon = await readFile(join(installedRoot, 'icon.svg'), 'utf8');
+  assert.ok(icon.includes('viewBox="0 0 36 36"') && !/<(?:script|image|foreignObject|style|text)\b/.test(icon),
+    'The plugin icon must be a self-contained 36px SVG');
 
   // HARD RULE: the client bundle id must derive from the package name.
   // The host keys client factories by `stripClientSuffix(id)`, which removes only a
@@ -472,7 +782,8 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.equal(inventory.registration_is_testing, false);
     const reconHelp = await dispatch('awa_project', 'action.help', { name: 'surface.recon' }, null);
     assert.equal(reconHelp.group, 'awa_surface');
-    assert.deepEqual(Object.keys(reconHelp.fields).sort(), ['limit', 'mode', 'offset', 'required_assessment_mode', 'section']);
+    assert.deepEqual(Object.keys(reconHelp.fields).sort(),
+      ['limit', 'mode', 'offset', 'refresh', 'required_assessment_mode', 'section']);
     assert.equal(typeof reconHelp.fields.required_assessment_mode, 'string');
     const reconPrepare = await dispatch('awa_surface', 'surface.recon', { mode: 'prepare', section: 'collection', limit: 1 });
     assert.equal(reconPrepare.requests_sent, 0);
@@ -655,21 +966,85 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
     assert.doesNotMatch(reportBytes.toString('utf8') + summaryBytes.toString('utf8'), new RegExp(credential));
     assert.equal((await readFile(join(workspace, 'projects', 'package-smoke', 'assessment.sqlite3'))).subarray(0, 15).toString(), 'SQLite format 3');
     const upgradeSmoke = await verifyUpgradeSmoke(dispatch, installedRoot, stage, workspace);
+    const sourceSmoke = await verifySourceInventorySmoke(dispatch, stage);
     assert.deepEqual(await shippedSourceManifest(files, installedRoot), publishedSource,
       'Release sources changed during package validation; rerun the check.');
-    const retainedArchive = join(validation, packed.filename);
-    await copyFile(archive, retainedArchive);
-    const archiveDigest = createHash('sha256').update(await readFile(retainedArchive)).digest('hex');
-    assert.equal(archiveDigest, createHash('sha256').update(await readFile(archive)).digest('hex'));
-    await writeFile(recordPath, JSON.stringify({
+    finishPhase({
+      native_tool_groups: registered.length,
+      upgrade_smoke: upgradeSmoke,
+      source_inventory_smoke: sourceSmoke,
+      source_manifest_sha256: createHash('sha256').update(JSON.stringify(publishedSource)).digest('hex'),
+    });
+    beginPhase('final-packlist-and-archive');
+    const runArchiveDirectory = join(archiveRoot, runId);
+    assertLexicallyWithin(runArchiveDirectory, archiveRoot);
+    await mkdir(runArchiveDirectory);
+    await assertNoLinkComponents(runArchiveDirectory, root);
+    await assertRealPathWithin(runArchiveDirectory, await realpath(archiveRoot), false, 'run archive directory');
+    const retainedArchive = assertLexicallyWithin(join(runArchiveDirectory, basename(packed.filename)), runArchiveDirectory);
+    const pendingArchive = join(runArchiveDirectory, `.${basename(packed.filename)}.${randomUUID()}.pending`);
+    await copyFile(archive, pendingArchive);
+    await assertNoLinkComponents(pendingArchive, root);
+    await assertRealPathWithin(pendingArchive, await realpath(runArchiveDirectory), false, 'pending archive');
+    const archiveDigest = createHash('sha256').update(await readFile(pendingArchive)).digest('hex');
+    assert.equal(archiveDigest, createHash('sha256').update(await readFile(archive)).digest('hex'),
+      'The run archive changed while it was being retained.');
+    assert.equal(basename(retainedArchive), packed.filename, 'Retained archive filename changed.');
+    await rename(pendingArchive, retainedArchive);
+    await assertNoLinkComponents(retainedArchive, root);
+    await assertRealPathWithin(retainedArchive, await realpath(runArchiveDirectory), false, 'retained archive');
+    assert.equal(createHash('sha256').update(await readFile(retainedArchive)).digest('hex'), archiveDigest,
+      'The retained archive changed before publication.');
+
+    const currentPackResult = await run(process.execPath, [process.env.npm_execpath, 'pack', '--ignore-scripts',
+      '--offline', '--dry-run', '--json', '--cache', join(stage, 'cache')], options);
+    const currentPackResults = JSON.parse(currentPackResult.stdout);
+    assert.equal(currentPackResults.length, 1, 'Final npm pack dry-run must contain exactly one package result.');
+    const [currentPack] = currentPackResults;
+    assert.equal(currentPack.name, packed.name, 'Final npm pack dry-run changed the package name.');
+    assert.equal(currentPack.version, packed.version, 'Final npm pack dry-run changed the package version.');
+    assert.ok(Array.isArray(currentPack.files) && currentPack.files.length > 0,
+      'Final npm pack dry-run returned no file manifest.');
+    const currentPaths = currentPack.files.map(file => file.path);
+    assert.equal(currentPaths.length, new Set(currentPaths).size,
+      'Final npm pack dry-run manifest contains duplicate paths.');
+    for (const file of currentPack.files) {
+      assert.ok(Number.isInteger(file.size), `Final npm pack manifest has no integer size for ${file.path}.`);
+      assert.ok(Number.isInteger(file.mode), `Final npm pack manifest has no integer mode for ${file.path}.`);
+    }
+    const initialMetadata = new Map(packed.files.map(file => [file.path, {
+      size: file.size, mode: file.mode,
+    }]));
+    const currentMetadata = new Map(currentPack.files.map(file => [file.path, {
+      size: file.size, mode: file.mode,
+    }]));
+    assert.deepEqual(currentMetadata, initialMetadata,
+      'The current npm pack metadata changed during package validation; rerun the check.');
+    const currentFiles = new Set(currentPack.files.map(file => file.path));
+    assert.deepEqual([...currentFiles].sort(), [...files].sort(),
+      'The current npm packlist changed during package validation; rerun the check.');
+    assert.deepEqual(await shippedSourceManifest(currentFiles, installedRoot), publishedSource,
+      'The final npm packlist no longer matches the extracted archive and frozen source bytes.');
+    const gitHead = (await run('git', ['rev-parse', 'HEAD'], options)).stdout.trim();
+    assert.match(gitHead, /^[a-f0-9]{40}$/, 'The release must record its exact Git source revision.');
+    const releaseSourceFingerprint = createHash('sha256').update(JSON.stringify(publishedSource)).digest('hex');
+    successRecord = {
+      schema_version: 1,
+      run_id: runId,
       package: packed.name, version: packed.version, files: files.size,
+      git_head: gitHead,
+      source_frozen: true,
+      release_source_fingerprint: releaseSourceFingerprint,
       archive_path: retainedArchive,
       archive_sha256: archiveDigest,
-      source_sha256: createHash('sha256').update(JSON.stringify(publishedSource)).digest('hex'),
+      archive_membership_exact: true,
+      final_packlist_unique: true,
+      final_packlist_sha256: createHash('sha256').update(JSON.stringify(currentPack.files)).digest('hex'),
+      source_sha256: releaseSourceFingerprint,
       source_files: publishedSource,
-      sdk_entry: 'extracted package/src/index.mjs', native_tool_groups: registered.length, upgrade_smoke: upgradeSmoke,
+      sdk_entry: 'extracted package/src/index.mjs', native_tool_groups: registered.length, upgrade_smoke: upgradeSmoke, source_inventory_smoke: sourceSmoke,
       checks: ['archive contents', 'current source byte equality before and after smoke', 'current packaged version and retained archive SHA-256', 'native SDK tool definitions', 'Python bridge', 'SQLite persistence',
-        'OpenAPI import', 'JavaScript AST/acorn import', 'private session summary', 'shared plan/coverage evaluator',
+        'OpenAPI import', 'JavaScript AST/acorn import', 'Actuator source preview/read/exact snapshot apply pages with zero target traffic', 'private session summary', 'shared plan/coverage evaluator',
         'stable gap projection', 'candidate ledger round-trip and unverified dismissal review', 'penetration mode module and client entry',
         'always-on exhaustion-only prompt and packaged public-hook registration',
         'active bound offline steering through the extracted entry with a fixture Agent',
@@ -691,18 +1066,162 @@ with tarfile.open(sys.argv[1], "r:gz") as archive:
         'ready/review work rejects completed finalization', 'caller-declared budget/user/authorization/blocked exits rejected',
         'final report without strict finalization rejected; interrupted work remains draft',
         'Chinese format-5 report export and complete manifest digests'],
-      network_requests: 0, result: 'passed', started_at: startedAt, finished_at: new Date().toISOString(),
-    }, null, 2) + '\n');
+      network_requests: 0,
+    };
+    finishPhase({
+      archive: retainedArchive,
+      archive_sha256: archiveDigest,
+      final_packlist_unique: true,
+      final_packlist_files: currentFiles.size,
+    });
   } finally {
-    dispose();
+    if (dispose) {
+      try {
+        await dispose();
+      } catch (error) {
+        disposeFailure = error;
+      }
+    }
   }
-  process.stdout.write('Package smoke passed: extracted entry/public hook, oracle/hint/parameter/sink/multipart and offline proof-preparation/binding fixtures, caller-block and candidate reconciliation, Python/SQLite, UTF-8 file CLI and draft report.\n');
 } catch (error) {
-  await writeFile(recordPath, JSON.stringify({ result: 'failed', started_at: startedAt,
-    finished_at: new Date().toISOString(), code: String(error.code || error.name || 'PACKAGE_CHECK_FAILED') }, null, 2) + '\n');
-  throw error;
+  mainFailure = error;
 } finally {
-  const delta = relative(validation, resolve(stage));
-  assert.ok(delta && !isAbsolute(delta) && delta !== '..' && !delta.startsWith(`..${sep}`), 'Cleanup must stay below .validation.');
-  await rm(stage, { recursive: true, force: true });
+  if (stage) {
+    try {
+      assertLexicallyWithin(stage, validation);
+      await assertNoLinkComponents(stage, root);
+      await assertRealPathWithin(stage, await realpath(validation), false, 'cleanup stage');
+      await rm(stage, { recursive: true, force: true });
+    } catch (error) {
+      addCleanupFailure('stage_cleanup', error);
+    }
+  }
+}
+
+if (!lockAcquired) {
+  const conflict = {
+    schema_version: 1,
+    run_id: runId,
+    result: 'failed',
+    phase: currentPhase,
+    error: errorRecord(mainFailure || new Error('Package-check lock was not acquired.')),
+    observed_at: new Date().toISOString(),
+    shared_result_untouched: true,
+  };
+  const conflictPath = join(validation, `package-check-conflict.${randomUUID()}.json`);
+  try {
+    await atomicWriteJson(conflictPath, conflict);
+  } catch (error) {
+    process.stderr.write(`Package check failed and its conflict record could not be written: ${error.message}\n`);
+  }
+  process.stderr.write(JSON.stringify(conflict) + '\n');
+  process.exitCode = 1;
+} else {
+  let exitFailure = mainFailure || cleanupErrors[0]?.error || disposeFailure || null;
+
+  if (!exitFailure) {
+    beginPhase('finalize');
+    try {
+      finishPhase({
+        record_finalized: true,
+        commit_status: 'committed',
+        requires_running_marker_absent: true,
+        requires_lock_absent: true,
+        cleanup_succeeded_before_marker_commit: true,
+      });
+      const committedRecord = {
+        ...successRecord,
+        result: 'passed',
+        record_finalized: true,
+        commit_status: 'committed',
+        requires_running_marker_absent: true,
+        requires_lock_absent: true,
+        cleanup_succeeded_before_marker_commit: true,
+        phases: [...phases],
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+      };
+      await atomicWriteJson(recordPath, committedRecord);
+
+      try {
+        await rm(runningRecordPath, { force: true });
+      } catch (error) {
+        addCleanupFailure('running_marker_commit', error);
+      }
+      if (cleanupErrors.length === 0) {
+        try {
+          await rm(lockPath, { force: true });
+          lockAcquired = false;
+        } catch (error) {
+          addCleanupFailure('lock_release', error);
+        }
+      }
+      exitFailure = cleanupErrors[0]?.error || disposeFailure || null;
+    } catch (error) {
+      exitFailure = error;
+    }
+  }
+
+  if (exitFailure) {
+    const failed = failureRecord(exitFailure, stage, {
+      cleanupErrors,
+      disposeError: disposeFailure,
+    });
+    failed['running_marker_removed'] = !(await lstat(runningRecordPath).then(() => true).catch(() => false));
+    failed['lock_released'] = !(await lstat(lockPath).then(() => true).catch(() => false));
+    let failureRecordCommitted = false;
+    try {
+      await atomicWriteJson(recordPath, failed);
+      failureRecordCommitted = true;
+    } catch (error) {
+      addCleanupFailure('failure_record_write', error);
+      process.stderr.write(`Package-check failure record could not be written: ${error.message}\n`);
+    }
+
+    if (failureRecordCommitted) {
+      let runningRemoved = false;
+      try {
+        await rm(runningRecordPath, { force: true });
+        runningRemoved = true;
+        failed['running_marker_removed'] = true;
+      } catch (error) {
+        addCleanupFailure('running_marker_cleanup', error);
+        failed['running_marker_removed'] = false;
+      }
+      if (runningRemoved) {
+        try {
+          await rm(lockPath, { force: true });
+          lockAcquired = false;
+          failed['lock_released'] = true;
+        } catch (error) {
+          addCleanupFailure('lock_cleanup', error);
+          failed['lock_released'] = false;
+        }
+      }
+    }
+    failed['cleanup_errors'] = cleanupErrors.map(item => ({
+      surface: item.surface,
+      error: errorRecord(item.error),
+    }));
+    if (failureRecordCommitted) {
+      try {
+        await atomicWriteJson(recordPath, failed);
+      } catch (error) {
+        process.stderr.write(`Final package-check failure record could not be rewritten: ${error.message}\n`);
+      }
+    }
+    process.stderr.write(JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      result: 'failed',
+      phase: currentPhase,
+      primary_error: errorRecord(exitFailure),
+      cleanup_errors: failed['cleanup_errors'],
+      running_marker_removed: failed['running_marker_removed'],
+      lock_released: failed['lock_released'],
+    }) + '\n');
+    process.exitCode = 1;
+  } else {
+    process.stdout.write('Package smoke passed: archive/source/final-pack membership and byte equality, extracted entry/public hook, oracle/hint/parameter/sink/multipart and offline proof-preparation/binding fixtures, caller-block and candidate reconciliation, Python/SQLite, UTF-8 file CLI and draft report.\n');
+  }
 }

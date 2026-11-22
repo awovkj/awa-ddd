@@ -8,7 +8,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from awa_ddd import runtime
+from awa_ddd import fingerprint, publication, runtime
 from awa_ddd.store import EngineError
 
 
@@ -62,6 +62,17 @@ class RuntimeProbeTests(unittest.TestCase):
         return [subprocess.CompletedProcess([], 0, listing.encode("utf-16-le"), b""),
                 subprocess.CompletedProcess([], 0, python_output if python_output is not None else json.dumps(self.metadata()).encode("utf-8"), b"")]
 
+    def test_core_manifest_binds_every_packaged_javascript_parser_resource(self):
+        manifest = fingerprint.core_manifest()
+        rows = {row["path"]: row["sha256"] for row in manifest["files"]}
+        expected = {
+            "awa_ddd/" + relative: sha256
+            for relative, sha256 in fingerprint.RUNTIME_RESOURCE_HASHES.items()
+        }
+        self.assertEqual({path: rows.get(path) for path in expected}, expected)
+        self.assertEqual(len(manifest["files"]), len(rows), "Core manifest paths must be unique.")
+        self.assertEqual(manifest["file_total"], len(manifest["files"]))
+
     def test_native_probe_does_not_launch_any_process_or_change_environment(self):
         before = dict(os.environ)
         with patch.object(runtime.subprocess, "run") as process:
@@ -72,6 +83,22 @@ class RuntimeProbeTests(unittest.TestCase):
         self.assertIn("stdout", result["native"]["encodings"])
         self.assertNotIn("wsl", result)
         self.assertFalse(result["target_traffic_sent"])
+        identity = result["runtime_identity"]
+        self.assertEqual("awa-runtime-identity/v1", identity["schema"])
+        self.assertEqual("installed_bytes", identity["source_identity"])
+        self.assertEqual("imported_function_bytecode", identity["loaded_identity"])
+        self.assertIs(identity["target_traffic_sent"], False)
+        self.assertGreater(identity["core_file_total"], 0)
+        self.assertGreater(identity["loaded_module_total"], 0)
+        self.assertRegex(identity["core_manifest_sha256"], r"^[a-f0-9]{64}$")
+        self.assertRegex(identity["loaded_code_sha256"], r"^[a-f0-9]{64}$")
+        for field in ("package_path", "entrypoint_path", "python_executable"):
+            self.assertIsInstance(identity[field], str)
+            self.assertTrue(identity[field])
+        schema = publication._schemas()[0]["runtime.probe"]["runtime_identity"]
+        self.assertTrue({"package_path", "entrypoint_path", "python_executable", "core_manifest_sha256",
+                         "loaded_code_sha256", "source_identity", "loaded_identity", "target_traffic_sent"}
+                        <= set(schema))
 
     def test_wsl_probe_is_a_fixed_utf8_metadata_command_and_catalog_only(self):
         with self.windows(), self.launcher(), patch.object(runtime.subprocess, "run", side_effect=self.results()) as process:
@@ -89,7 +116,9 @@ class RuntimeProbeTests(unittest.TestCase):
         self.assertTrue(runtime._WSL_SCRIPT.isascii())
         for call in process.call_args_list:
             self.assertFalse(call.kwargs["shell"])
-            self.assertNotIn("env", call.kwargs)
+            self.assertIn("env", call.kwargs)
+            self.assertNotIn("PYTHONPATH", call.kwargs["env"])
+            self.assertNotIn("NODE_OPTIONS", call.kwargs["env"])
         self.assertTrue(all(item["status"] == "catalog_only" and not item["target_traffic_sent"] for item in result["wsl"]["catalog"]))
         self.assertTrue(any("Node.js" in warning for warning in result["warnings"]))
         self.assertTrue(any("localhost" in warning for warning in result["warnings"]))
@@ -151,6 +180,27 @@ class RuntimeProbeTests(unittest.TestCase):
             result = runtime.probe({"backend": "wsl"})
         self.assertEqual(result["wsl"]["stderr_encoding"], "gb18030")
         self.assertEqual(result["wsl"]["reason_code"], "wsl_list_failed")
+
+
+    def test_non_posix_and_non_linux_hosts_skip_platform_probing(self):
+        for host_os, sys_platform in (("nt", "win32"), ("posix", "darwin")):
+            with self.subTest(host_os=host_os, sys_platform=sys_platform), \
+                    patch.object(runtime, "_host_platform", return_value=(host_os, sys_platform)), \
+                    patch.object(runtime.platform, "system") as system, \
+                    patch.object(runtime.platform, "release") as release:
+                self.assertEqual(runtime.execution_backend(), "native")
+            system.assert_not_called()
+            release.assert_not_called()
+
+    def test_linux_host_detection_distinguishes_native_and_wsl_kernels(self):
+        cases = (("6.8.0-64-generic", "native"), ("6.6.87.2-microsoft-standard-WSL2", "wsl"),
+                 ("5.15.153.1-wsl", "wsl"))
+        for kernel, expected in cases:
+            with self.subTest(kernel=kernel), \
+                    patch.object(runtime, "_host_platform", return_value=("posix", "linux")), \
+                    patch.object(runtime.platform, "system", return_value="Linux"), \
+                    patch.object(runtime.platform, "release", return_value=kernel):
+                self.assertEqual(runtime.execution_backend(), expected)
 
 
 class PathTranslationTests(unittest.TestCase):

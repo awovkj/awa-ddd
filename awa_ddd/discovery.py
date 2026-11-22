@@ -20,9 +20,29 @@ MAX_BYTES = 8 * 1024 * 1024
 MAX_ROWS = 10000
 MAX_DEPTH = 24
 MAX_NODES = 50000
-FORMATS = {"openapi", "javascript", "har", "artex", "sarif", "assessment_hints"}
+FORMATS = {
+    "openapi",
+    "javascript",
+    "har",
+    "artex",
+    "sarif",
+    "assessment_hints",
+    "actuator_mappings",
+}
+PARSER_VERSIONS = {
+    "openapi": 2,
+    "javascript": 1,
+    "har": 1,
+    "artex": 1,
+    "sarif": 1,
+    "assessment_hints": 1,
+    "actuator_mappings": 1,
+}
 METHODS = {"get", "put", "post", "delete", "options", "head", "patch", "trace"}
+_HTTP_METHODS = {method.upper() for method in METHODS}
 _MIME = re.compile(r"^[\w.+-]+/[\w.+-]+$")
+_ACTUATOR_EXECUTABLE_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+_PATH_VARIABLE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_-]*)\}", re.ASCII)
 
 
 def _pointer(value):
@@ -85,9 +105,12 @@ class _Output:
     def __init__(self, path, raw):
         self.path = str(path)
         self.sha256 = hashlib.sha256(raw).hexdigest()
+        self.byte_count = len(raw)
         self.operations = {}
         self.candidates = []
         self.limitations = []
+        self.source_record = None
+        self.inventory = None
         self._limits = set()
         self.nodes = 0
 
@@ -148,7 +171,16 @@ class _Output:
             self.operations[key] = row
 
     def result(self):
-        return {"operations": list(self.operations.values()), "candidates": self.candidates, "limitations": self.limitations}
+        result = {
+            "operations": list(self.operations.values()),
+            "candidates": self.candidates,
+            "limitations": self.limitations,
+        }
+        if self.source_record is not None:
+            result["source"] = self.source_record
+        if self.inventory is not None:
+            result["inventory"] = self.inventory
+        return result
 
 
 def _input(name, location, selector, source, **extra):
@@ -285,6 +317,36 @@ def _body(text, mime, source, out, locator):
     return [], "http", ""
 
 
+def _classify_path_template(pattern):
+    """Classify a declared path using the strict template syntax shared by adapters."""
+    if not isinstance(pattern, str) or not pattern or len(pattern) > 8192 \
+            or any(ord(character) < 32 for character in pattern) or "\\" in pattern:
+        return "candidate", "invalid_pattern", ()
+    if re.search(r"%(?:25)*(?:7b|7d)", pattern, re.ASCII | re.IGNORECASE):
+        return "candidate", "encoded_placeholder", ()
+    if re.search(r"%(?:25)*(?:2a|3f)", pattern, re.ASCII | re.IGNORECASE):
+        return "candidate", "encoded_wildcard", ()
+    if "*" in pattern:
+        return "candidate", "wildcard_pattern", ()
+    if not pattern.startswith("/") or pattern.startswith("//") \
+            or any(character in pattern for character in "?#;"):
+        return "candidate", "invalid_pattern", ()
+
+    variables = []
+    for segment in pattern.split("/")[1:]:
+        if "{" not in segment and "}" not in segment:
+            continue
+        variable = _PATH_VARIABLE.fullmatch(segment)
+        if variable is None:
+            if re.search(r"\{[^{}]*:[^{}]*\}", segment, re.ASCII):
+                return "candidate", "regex_pattern", ()
+            return "candidate", "partial_segment", ()
+        if variable.group(1) in variables:
+            return "candidate", "duplicate_variable", ()
+        variables.append(variable.group(1))
+    return ("template" if variables else "literal"), "", tuple(variables)
+
+
 def _openapi(spec, base_url, out):
     if not isinstance(spec, dict) or not str(spec.get("openapi", "")).startswith("3."):
         raise ValueError("openapi requires an OpenAPI 3.x JSON document")
@@ -399,6 +461,7 @@ def _openapi(spec, base_url, out):
         if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or "?" in path or "#" in path:
             out.limit("invalid_path_template", at)
             continue
+        path_kind, path_reason, path_variables = _classify_path_template(path)
         item = resolve(raw_path, at)
         path_bases = bases(item, global_bases, at)
         for method, raw_op in item.items():
@@ -431,13 +494,37 @@ def _openapi(spec, base_url, out):
             op_bases = bases(op, path_bases, op_at)
             if not op_bases:
                 out.limit("operation_has_no_resolved_server", op_at)
+            security = op.get("security", spec.get("security", []))
+            auth = "authenticated" if isinstance(security, list) and security \
+                and all(isinstance(alt, dict) and alt for alt in security) else "unknown"
             for base in op_bases:
                 for mime, body_fields in variants:
-                    security = op.get("security", spec.get("security", []))
-                    out.operation(base.rstrip("/") + path, method, list(params.values()) + body_fields,
-                                  op_at, "declared", content_type=mime,
-                                  auth="authenticated" if isinstance(security, list) and security and all(isinstance(alt, dict) and alt for alt in security) else "unknown",
-                                  path_template="{" in path or "}" in path)
+                    route_inputs = list(params.values()) + body_fields
+                    if path_kind == "template":
+                        route_inputs += [
+                            _input(name, "path", name, "declared", required=True)
+                            for name in path_variables
+                        ]
+                    extra = {"path_template": path_kind == "template"}
+                    if path_kind == "template":
+                        extra.update(native_input_requires_binding=True, requestable=False)
+                    elif path_kind == "candidate":
+                        extra.update(
+                            native_input_requires_binding=True,
+                            requestable=False,
+                            reason_code=path_reason,
+                        )
+                    out.operation(
+                        base.rstrip("/") + path,
+                        method,
+                        _dedupe_inputs(route_inputs),
+                        op_at,
+                        "declared",
+                        content_type=mime,
+                        auth=auth,
+                        candidate=path_kind == "candidate",
+                        **extra,
+                    )
     out.limit("specification_is_not_runtime_evidence")
 
 
@@ -689,6 +776,277 @@ def _sarif(doc, out):
     out.limit("sarif_messages_snippets_and_values_not_imported")
 
 
+def _actuator_path(pattern):
+    """Classify one explicit Spring path without interpreting fallback prose."""
+    kind, reason, variables = _classify_path_template(pattern)
+    return kind, "actuator_mapping_" + reason if reason else "", variables
+
+
+def _actuator_condition_inputs(conditions, out, locator):
+    """Keep only explicitly declared condition names, never their values."""
+    fields, malformed = [], False
+    for key, location in (("params", "query"), ("headers", "header")):
+        values = conditions.get(key, [])
+        if values is None:
+            values = []
+        if not isinstance(values, list):
+            out.limit("actuator_mapping_conditions_unresolved", locator + "/" + key)
+            malformed = True
+            continue
+        for index, value in enumerate(values):
+            at = locator + "/" + key + "/" + str(index)
+            if isinstance(value, dict):
+                name = value.get("name")
+                if not _name(name):
+                    out.limit("actuator_mapping_condition_name_unresolved", at)
+                    malformed = True
+                    continue
+                name = name.strip()
+            elif isinstance(value, str) and value and len(value) <= 1024 \
+                    and not any(ord(character) < 32 for character in value):
+                condition = value.strip()
+                if condition.startswith("!"):
+                    condition = condition[1:].lstrip()
+                name = condition.split("!=", 1)[0].split("=", 1)[0].strip()
+            else:
+                out.limit("actuator_mapping_condition_name_unresolved", at)
+                malformed = True
+                continue
+            if not _name(name):
+                out.limit("actuator_mapping_condition_name_unresolved", at)
+                malformed = True
+                continue
+            selector = name.lower() if location == "header" else name
+            fields.append(_input(name, location, selector, "declared"))
+    return _dedupe_inputs(fields), malformed
+
+
+def _actuator_mappings(doc, base_url, out):
+    """Parse explicit Spring Boot servlet and WebFlux mapping inventories."""
+    if not isinstance(doc, dict):
+        raise ValueError("actuator_mappings requires a mappings response object")
+    contexts = doc.get("contexts")
+    if not isinstance(contexts, dict):
+        raise ValueError("actuator_mappings requires contexts object")
+    if base_url is None:
+        raise ValueError("actuator_mappings requires an explicit absolute base_url")
+    try:
+        base, _ = _url("/", base_url)
+    except (ValueError, UnicodeError):
+        raise ValueError("actuator_mappings requires an explicit absolute base_url") from None
+
+    mapping_total = handler_total = unresolved = 0
+    handlers = set()
+    routes = {}
+    candidate_rows = {}
+
+    def merge_candidate(row):
+        identity = (row.get("url"), row.get("declared_path_pattern"), row.get("method"),
+                    row.get("reason_code"))
+        known = candidate_rows.get(identity)
+        if known is None:
+            candidate_rows[identity] = row
+            out.candidate(row)
+            return
+        known["inputs"] = _dedupe_inputs(known["inputs"] + row["inputs"])
+        if row["sources"][0] not in known["sources"]:
+            known["sources"].extend(row["sources"])
+
+    def candidate(pattern, method, reason, inputs, locator, path_template=False):
+        row = {
+            "kind": "operation_hint",
+            "method": method,
+            "protocol": "http",
+            "operation_name": "",
+            "content_type": "",
+            "inputs": _dedupe_inputs(inputs),
+            "sources": [out.source(locator, "declared")],
+            "path_template": bool(path_template),
+            "native_input_requires_binding": True,
+            "requestable": False,
+            "reason_code": reason,
+        }
+        if isinstance(pattern, str):
+            try:
+                clean, _ = _url(pattern, base)
+            except (ValueError, UnicodeError):
+                clean = ""
+            if clean:
+                row["url"] = clean
+            elif pattern.startswith("/") and not any(character in pattern for character in "?#;\\") \
+                    and not any(ord(character) < 32 for character in pattern):
+                row["declared_path_pattern"] = pattern
+        merge_candidate(row)
+
+    for context_name, context in contexts.items():
+        out.tick()
+        context_at = "#/contexts/" + _pointer(context_name)
+        if not isinstance(context, dict):
+            unresolved += 1
+            out.limit("actuator_mapping_context_unresolved", context_at)
+            continue
+        mappings = context.get("mappings")
+        if not isinstance(mappings, dict):
+            unresolved += 1
+            out.limit("actuator_mapping_mappings_unresolved", context_at + "/mappings")
+            continue
+        recognized_dispatcher = False
+        for dispatcher_name in ("dispatcherServlets", "dispatcherHandlers"):
+            groups = mappings.get(dispatcher_name)
+            if groups is None:
+                continue
+            recognized_dispatcher = True
+            dispatcher_at = context_at + "/mappings/" + dispatcher_name
+            if isinstance(groups, list):
+                group_rows = [("handlers", groups)]
+            elif isinstance(groups, dict):
+                group_rows = list(groups.items())
+            else:
+                unresolved += 1
+                out.limit("actuator_mapping_dispatcher_unresolved", dispatcher_at)
+                continue
+            for group_name, entries in group_rows:
+                out.tick()
+                group_at = dispatcher_at + "/" + _pointer(group_name)
+                if not isinstance(entries, list):
+                    unresolved += 1
+                    out.limit("actuator_mapping_handler_group_unresolved", group_at)
+                    continue
+                for index, entry in enumerate(entries):
+                    out.tick()
+                    locator = group_at + "/" + str(index)
+                    mapping_total += 1
+                    if not isinstance(entry, dict):
+                        unresolved += 1
+                        candidate("", None, "actuator_mapping_missing_structured", [], locator)
+                        continue
+                    handler = entry.get("handler")
+                    if isinstance(handler, str) and handler:
+                        handlers.add(handler)
+                    details = entry.get("details")
+                    conditions = details.get("requestMappingConditions") if isinstance(details, dict) else None
+                    if not isinstance(conditions, dict):
+                        unresolved += 1
+                        candidate("", None, "actuator_mapping_missing_structured", [], locator)
+                        continue
+
+                    missing_methods_contract = object()
+                    raw_methods = conditions.get("methods", missing_methods_contract)
+                    raw_patterns = conditions.get("patterns")
+                    methods_container_invalid = raw_methods is not missing_methods_contract \
+                        and not isinstance(raw_methods, list)
+                    if not isinstance(raw_methods, list):
+                        raw_methods = []
+                    if not isinstance(raw_patterns, list):
+                        raw_patterns = []
+                    methods, patterns = [], []
+                    seen_methods, seen_patterns = set(), set()
+                    structurally_unresolved = not raw_methods or not raw_patterns
+                    invalid_method_entry = False
+                    for method in raw_methods:
+                        if not isinstance(method, str) or not method \
+                                or len(method) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", method, re.ASCII):
+                            structurally_unresolved = True
+                            invalid_method_entry = True
+                            continue
+                        # Spring serializes its HTTP method contract as exact
+                        # uppercase names. Preserve other spellings as unknown
+                        # candidates rather than casing-normalizing them into GET.
+                        if method not in seen_methods:
+                            seen_methods.add(method)
+                            methods.append(method)
+                    for pattern in raw_patterns:
+                        if not isinstance(pattern, str) or not pattern:
+                            structurally_unresolved = True
+                            continue
+                        if pattern not in seen_patterns:
+                            seen_patterns.add(pattern)
+                            patterns.append(pattern)
+                    inputs, malformed_conditions = _actuator_condition_inputs(conditions, out, locator)
+                    entry_unresolved = structurally_unresolved or malformed_conditions
+                    invalid_method_entries = methods_container_invalid or invalid_method_entry
+                    if invalid_method_entries:
+                        candidate("", None, "actuator_mapping_invalid_method", inputs, locator)
+
+                    if not methods and not patterns:
+                        unresolved += bool(entry_unresolved)
+                        candidate("", None, "actuator_mapping_missing_method_and_pattern", inputs, locator)
+                        continue
+                    if not methods:
+                        unresolved += bool(entry_unresolved)
+                        for pattern in patterns:
+                            kind, reason, variables = _actuator_path(pattern)
+                            route_inputs = inputs + [
+                                _input(name, "path", name, "declared", required=True)
+                                for name in variables
+                            ]
+                            candidate(pattern, None,
+                                      reason or "actuator_mapping_missing_method",
+                                      route_inputs, locator, path_template=kind == "template")
+                        continue
+                    if not patterns:
+                        unresolved += bool(entry_unresolved)
+                        for method in methods:
+                            candidate("", method, "actuator_mapping_missing_pattern", inputs, locator)
+                        continue
+                    if len(methods) * len(patterns) > MAX_ROWS:
+                        raise ValueError("discovery row budget exceeded")
+
+                    route_unresolved = False
+                    for method in methods:
+                        for pattern in patterns:
+                            kind, reason, variables = _actuator_path(pattern)
+                            method_known = method in _HTTP_METHODS
+                            route_path = pattern
+                            if pattern.startswith("/"):
+                                try:
+                                    route_path, _ = _url(pattern, base)
+                                except (ValueError, UnicodeError):
+                                    pass
+                            route_key = method, route_path
+                            routes.setdefault(route_key, kind)
+                            if not method_known or method not in _ACTUATOR_EXECUTABLE_METHODS:
+                                route_unresolved = True
+                                out.limit("method_requires_specialized_executor", locator)
+                            if reason:
+                                route_unresolved = True
+                            route_inputs = inputs + [
+                                _input(name, "path", name, "declared", required=True)
+                                for name in variables
+                            ]
+                            if reason or not method_known or method not in _ACTUATOR_EXECUTABLE_METHODS:
+                                candidate(pattern, method, reason or "actuator_mapping_method_requires_binding",
+                                          route_inputs, locator, path_template=kind == "template")
+                                continue
+                            out.operation(
+                                pattern, method, route_inputs, locator, "declared", base_url,
+                                path_template=kind == "template",
+                                native_input_requires_binding=kind == "template",
+                                requestable=False,
+                            )
+                    unresolved += bool(entry_unresolved or route_unresolved)
+        if not recognized_dispatcher:
+            unresolved += 1
+            out.limit("actuator_mapping_dispatcher_inventory_missing", context_at + "/mappings")
+
+    method_counts = {
+        method: sum(1 for route_method, _ in routes if route_method == method)
+        for method in ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE", "TRACE")
+    }
+    out.inventory = {
+        "mapping_total": mapping_total,
+        "handler_total": len(handlers),
+        "route_total": len(routes),
+        "path_template_total": sum(kind == "template" for kind in routes.values()),
+        "method_counts": method_counts,
+        "unresolved_mapping_total": unresolved,
+        "completeness": "source_inventory",
+        "site_wide_discovery_allowed": False,
+    }
+    out.limit("actuator_mapping_handler_prose_and_condition_values_not_imported")
+    out.limit("actuator_mapping_source_declarations_are_not_runtime_authorization")
+
+
 def _client_sink_candidates(rows, out):
     """Join syntactic field names, not taint or execution, within this one bundle."""
     by_name = {}
@@ -740,16 +1098,26 @@ def _client_sink_candidates(rows, out):
         out.limit("client_sink_name_matches_are_not_taint_or_runtime_proof")
 
 
+def _javascript_helper():
+    """Prefer the installed package resource; retain a checkout-tree fallback."""
+    package_root = Path(__file__).resolve().parent
+    for helper in (package_root / "resources" / "js_parser" / "parse-js.mjs",
+                   package_root.parent / "src" / "parse-js.mjs"):
+        if helper.is_file():
+            return helper
+    return None
+
+
 def _javascript(text, base_url, out):
     node = shutil.which("node")
-    helper = Path(__file__).resolve().parents[1] / "src" / "parse-js.mjs"
-    if not node or not helper.is_file():
+    helper = _javascript_helper()
+    if not node or helper is None or not helper.is_file():
         out.limit("javascript_ast_parser_unavailable")
         return
     try:
         proc = subprocess.run([node, "--max-old-space-size=192", str(helper)],
                               input=json.dumps({"source": text}), text=True, encoding="utf-8",
-                              capture_output=True, timeout=15, cwd=str(helper.parent.parent))
+                              capture_output=True, timeout=15, cwd=str(helper.parent))
         if proc.returncode or len(proc.stdout.encode("utf-8")) > 16 * 1024 * 1024:
             out.limit("javascript_ast_parser_failed")
             return
@@ -797,6 +1165,13 @@ def discover(path, format, base_url=None):
     except UnicodeDecodeError as exc:
         raise ValueError("discovery input must be UTF-8") from exc
     out = _Output(path, raw)
+    out.source_record = {
+        "path": out.path,
+        "sha256": out.sha256,
+        "byte_count": out.byte_count,
+        "format": format,
+        "parser_version": PARSER_VERSIONS[format],
+    }
     if format == "javascript":
         _javascript(text, base_url, out)
     else:
@@ -809,6 +1184,8 @@ def discover(path, format, base_url=None):
             _artex(doc, base_url, out)
         elif format == "sarif":
             _sarif(doc, out)
+        elif format == "actuator_mappings":
+            _actuator_mappings(doc, base_url, out)
         else:
             from .assessment_hints import ingest
             ingest(doc, base_url, out)

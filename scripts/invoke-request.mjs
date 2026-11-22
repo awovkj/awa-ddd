@@ -50,7 +50,12 @@ try {
     }
   }
   const raw = await readRequestFile(options['--request-file']);
-  const request = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+  // PowerShell 5.1's UTF8 encoding writes a BOM.  Accept that byte-sequence
+  // only at the very start of a JSON document; all later parsing stays fatal
+  // UTF-8 and byte-exact bounded.
+  const decoded = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+  const text = decoded.charCodeAt(0) === 0xFEFF ? decoded.slice(1) : decoded;
+  const request = JSON.parse(text);
   if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.action !== 'string') {
     throw new Error('Request must contain action and args.');
   }

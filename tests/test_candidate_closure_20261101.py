@@ -57,7 +57,7 @@ class CandidateClosureTests(unittest.TestCase):
 
     def completed(self):
         self.fixture.checkpoint(self.fixture.frontier())
-        return self.fixture.finish(self.fixture.checkpoint(self.fixture.frontier()))
+        return self.fixture.finish(self.fixture.checkpoint(self.fixture.frontier(self.fixture.variant_evidence)))
 
     def outside_source(self):
         source = self.fixture.root / "outside-scope.openapi.json"

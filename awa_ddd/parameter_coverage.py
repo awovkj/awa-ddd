@@ -183,7 +183,7 @@ def snapshot(project, evaluated, *, inventory=None):
     profiles = inventory.get("parameter_profiles")
     if profiles is None:
         profiles = ObservationProfiles(operations)
-        for evidence in inventory.get("observations", project.list("evidence")):
+        for evidence in inventory.get("observations", project.list_chronological("evidence")):
             if evidence.get("kind") != "http":
                 continue
             try:

@@ -14,7 +14,7 @@
 | R08 KnownCase 三轨 | `domain/known_case.py` import/hint_assisted/blind；blind label withheld；`planning/known_cases.py` 不合并 source_group | `test_v2_domain_20261103.py::KnownCaseTrackTests` |
 | R09 Universe 未知分母 | `domain/universe.py` source levels、`site_wide_discovery_allowed`、unknown_counts/incomplete sources；route_parser 静态解析限制 | `test_v2_universe_scheduler_20261103.py` |
 | R10 Hypothesis 稳定键/Claim 失效依赖 | 稳定 identity 键；statement 不参与；claim 带 dependency/unknown_extent；recipe rebuild 后旧 recipe `assert_current` 失效 | `HypothesisIdentityTests` |
-| R11 fixture/会话生命周期 | `execution/fixtures.py` create→verify→lease→mutate→readback→cleanup；cleanup_failed 保持 unresolved；写 recipe 要求 fixture revision/lease | `test_v2_recipe_runner_20261103.py` 写用例；fixture 单元可直接调用 |
+| R11 fixture/会话生命周期 | `execution/fixtures.py` + `fixture_api.py` create→verify→lease→mutate→readback→cleanup；CAS/fence/TTL/resource 绑定；cleanup_failed 保持 unresolved | `test_fixture_api_20261122.py` 公开 dispatch 全生命周期；`test_v2_proof_fixture_upgrade_20261122.py` 双连接竞争 |
 | R12 竞态/异步/OAST/认证策略 | `oracle_profiles` 定义 race/token_lifecycle 契约；执行器保留有界顺序能力；异步 collector 标为边界 | 设计约束，见下文“未实现” |
 | R13 调度轮转/持久 claim | `planning/scheduler.py` family_gap/aging/readiness、两次失败 cooldown、round-robin cursor、claim lease | `test_v2_universe_scheduler_20261103.py` |
 | R14 capability readiness | `execution/capabilities.py` installed/configured/catalog_verified/profile_supported/authorized/ready，recipe-specific `ready_for` | `recon.capabilities` 输出与测试 |

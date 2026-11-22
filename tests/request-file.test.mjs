@@ -58,6 +58,39 @@ test('request-file CLI writes byte-exact UTF-8 without BOM and still prints the 
   assert.equal(parse(output).data.label, '\u4e2d\u6587 \uD83D\uDD12');
 });
 
+test('request-file CLI accepts a PowerShell UTF-8 BOM without hiding later parse errors', async t => {
+  const f = await fixture(t);
+  await invokeEngine({ workspace: f.workspace, timeoutMs: 5000 }, 'project.create', {
+    project_id: 'bom-file', target: 'http://fixture.invalid/', scope: ['http://fixture.invalid/'],
+  });
+  const request = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(JSON.stringify({ action: 'identity.actor', args: {
+      project_id: 'bom-file', actor_id: 'bom-actor', subject: 'subject', roles: [],
+    } }), 'utf8'),
+  ]);
+  await writeFile(f.input, request);
+  const result = await run(
+    process.execPath,
+    [cli, '--request-file', f.input, '--workspace', f.workspace, '--output-file', f.output],
+    f.directory,
+  );
+  assert.equal(result.code, 0, result.stderr.toString('utf8'));
+  assert.equal(parse(await readFile(f.output)).data.id, 'bom-actor');
+
+  const malformed = join(f.directory, 'malformed-bom.json');
+  await writeFile(malformed, Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from('{"action":"project.list","args":', 'utf8'),
+  ]));
+  const invalid = await run(process.execPath, [
+    cli, '--request-file', malformed,
+    '--output-file', join(f.directory, 'malformed-result.json'),
+  ], f.directory);
+  assert.equal(invalid.code, 2);
+  assert.equal(parse(invalid.stdout).error.code, 'REQUEST_FILE');
+});
+
 test('invalid request bytes and isolated JSON surrogates produce valid UTF-8 error result files', async t => {
   const f = await fixture(t);
   for (const [index, raw, code] of [[0, Buffer.from([0xff, 0xfe, 0x41, 0x00]), 'REQUEST_FILE'],

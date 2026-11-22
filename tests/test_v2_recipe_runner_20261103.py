@@ -1,6 +1,7 @@
 """2.0 frozen recipes, durable runs and oracle proof-scope regressions."""
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import patch
 
@@ -129,8 +130,15 @@ class FixtureLifecycleTests(unittest.TestCase):
         temporary, root = fx.workspace()
         self.addCleanup(temporary.cleanup)
         row = fx.project(root)
-        fixture = fixtures.create(row, operation_id="O-1", owner_actor_id="alice",
-                                  resource_id="R-1", initial_state={"v": 1}, cleanup_plan={})
+        operation = fx.register(row, "http://fixture.invalid/write", "POST", "public", [
+            {"name": "id", "location": "body", "selector": "id",
+             "consumer": "resource_reference"}])
+        engine.add_actor(row, {"actor_id": "alice", "subject": "alice", "roles": []})
+        resource = engine.add_resource(row, {
+            "operation_id": operation["id"], "owner_actor_id": "alice",
+            "external_id": "1", "request_binding": {"location": "body", "selector": "id"}})
+        fixture = fixtures.create(row, operation_id=operation["id"], owner_actor_id="alice",
+                                  resource_id=resource["id"], initial_state={"v": 1}, cleanup_plan={})
         fixtures.verify(row, fixture["id"], observed_state={"v": 1})
         fixtures.lease(row, fixture["id"], worker_id="a", ttl_seconds=60)
         with self.assertRaises(EngineError):
@@ -168,10 +176,21 @@ class TestRunTests(unittest.TestCase):
                                                           "recipe_id": recipe_id, "idempotency_key": "one"})
         self.assertEqual("supported", result["outcome"])
         self.assertEqual("machine_confirmed", result["finding"]["status"])
+        self.assertEqual(result["run"]["id"], result["proof_receipt"]["run_id"])
+        self.assertEqual(
+            result["proof_receipt"]["id"],
+            result["finding"]["proof_receipt_id"])
+        self.assertEqual(3, len(result["dispatch_receipts"]))
         self.assertEqual(3, transport.calls)
         row = fx.project(self.root)
         self.assertEqual(3, len(row.list("evidence")))
         self.assertEqual("evaluated", row.list("v2_run")[0]["status"])
+        self.assertEqual(1, len(row.list("v2_review_proof_receipt")))
+        self.assertEqual(3, len(row.list("execution_dispatch")))
+        for evidence in row.list("evidence"):
+            self.assertNotEqual(
+                result["run"]["id"], evidence["run_id"],
+                "the V1 capture receipt must not be used as the V2 TestRun identity")
         row.close()
 
     def test_idempotency_key_never_replays_a_request(self):
@@ -199,13 +218,119 @@ class TestRunTests(unittest.TestCase):
         self.assertIsNone(result.get("finding"))
         self.assertEqual(1, transport.calls)
 
-    def test_unknown_write_is_effect_unknown_and_not_replayed(self):
+    def test_multiple_write_controls_are_rejected_by_the_public_recipe_constructor(self):
+        with self.assertRaises(EngineError) as caught:
+            self._write_recipe(single_write=False)
+        self.assertEqual("v2_recipe_write_budget", caught.exception.code)
+        self.assertEqual(3, caught.exception.details["planned_writes"])
+        self.assertEqual(1, caught.exception.details["max_writes"])
+        row = fx.project(self.root)
+        self.assertEqual([], row.list("v2_run"))
+        self.assertEqual([], row.list("execution_dispatch"))
+        self.assertEqual("leased", row.list("v2_fixture")[0]["state"])
+        row.close()
+
+    def test_public_single_write_executes_and_records_the_real_fixture_mutation(self):
+        row, campaign_id, recipe, fixture, _hypothesis = self._write_recipe(single_write=True)
+        row.close()
+        calls = []
+
+        def transport(url, method, headers, body, timeout, max_bytes):
+            calls.append(1)
+            wire = json.dumps(body).encode("utf-8") if isinstance(body, (dict, list)) else body
+            return fx.observation(url, method, headers, wire, timeout, max_bytes, {"value": "49"})
+
+        with patch("awa_ddd.engine.request", side_effect=transport):
+            result = fx.dispatch(self.root, "test.run", {
+                "project_id": "v2", "campaign_id": campaign_id,
+                "recipe_id": recipe["id"], "idempotency_key": "public-single-write"})
+        self.assertEqual("inconclusive", result["outcome"])
+        self.assertIsNone(result["finding"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(1, len(result["dispatch_receipts"]))
+        row = fx.project(self.root)
+        current = Repository(row).get("fixture", fixture["id"])
+        self.assertEqual("mutated", current["state"])
+        self.assertEqual(1, len(current["mutations"]))
+        effect = current["mutations"][0]["intended_effect"]
+        self.assertEqual(result["run"]["evidence_ids"][0], effect["evidence_id"])
+        self.assertEqual(result["dispatch_receipts"][0]["id"], effect["dispatch_receipt_id"])
+        self.assertEqual("49", effect["actual"])
+        self.assertEqual(current["fence"], current["mutations"][0]["fence"])
+        row.close()
+        offline = fx.dispatch(self.root, "test.run", {
+            "project_id": "v2", "campaign_id": campaign_id,
+            "recipe_id": recipe["id"], "run_id": result["run"]["id"],
+            "mode": "verify", "idempotency_key": "verify-public-single-write"})
+        self.assertEqual("inconclusive", offline["outcome"])
+        self.assertEqual(0, offline["requests_sent"])
+        self.assertEqual(result["run"]["id"], offline["verification_of_run_id"])
+
+    def test_unknown_write_is_fenced_not_replayed_and_remains_reconcilable(self):
+        row, campaign_id, recipe, fixture, hypothesis = self._write_recipe(single_write=True)
+        row.close()
+        transport = fx.Sequence([{"value": "unreachable"}])
+
+        def disconnect(*_args):
+            transport.calls += 1
+            raise ConnectionError("connection dropped after submission")
+
+        with patch("awa_ddd.engine.request", side_effect=disconnect):
+            result = fx.dispatch(self.root, "test.run", {
+                "project_id": "v2",
+                "campaign_id": campaign_id,
+                "recipe_id": recipe["id"],
+                "idempotency_key": "unknown-write",
+            })
+            calls_after_unknown = transport.calls
+            replay = fx.dispatch(self.root, "test.run", {
+                "project_id": "v2",
+                "campaign_id": campaign_id,
+                "recipe_id": recipe["id"],
+                "idempotency_key": "unknown-write",
+            })
+        self.assertEqual("effect_unknown", result["outcome"])
+        self.assertTrue(result["requires_reconciliation"])
+        self.assertEqual(1, len(result["dispatch_receipts"]))
+        self.assertEqual(1, calls_after_unknown)
+        self.assertEqual(calls_after_unknown, transport.calls)
+        self.assertFalse(replay["replayed"])
+        self.assertEqual("effect_unknown", replay["run"]["status"])
+        row = fx.project(self.root)
+        runs = row.list("v2_run")
+        dispatches = row.list("execution_dispatch")
+        self.assertEqual(1, len(runs))
+        self.assertEqual("effect_unknown", runs[0]["status"])
+        self.assertTrue(runs[0]["effect"]["unknown"])
+        self.assertEqual([dispatches[0]["id"]], runs[0]["dispatch_receipt_ids"])
+        self.assertEqual(
+            {"max_requests": 1, "max_writes": 1,
+             "requests_used": 1, "writes_used": 1},
+            runs[0]["dispatch_budget"])
+        self.assertEqual("blocked", Repository(row).get("hypothesis", hypothesis["id"])["status"])
+        inspected = fx.dispatch(self.root, "test.inspect", {
+            "project_id": "v2", "run_id": runs[0]["id"]})
+        self.assertEqual("effect_unknown", inspected["run"]["status"])
+        self.assertEqual(recipe["id"], inspected["recipe"]["id"])
+        self.assertIs(False, inspected["recipe"]["executable"])
+        fixture_row = Repository(row).get("fixture", fixture["id"])
+        self.assertEqual("leased", fixture_row["state"])
+        self.assertEqual(runs[0]["id"], fixture_row["in_flight"]["run_id"])
+        with self.assertRaises(EngineError) as cleanup:
+            fx.dispatch(self.root, "test.fixture_cleanup", {
+                "project_id": "v2", "fixture_id": fixture["id"],
+                "worker_id": "local", "succeeded": False,
+            })
+        self.assertEqual("v2_fixture_state", cleanup.exception.code)
+        row.close()
+
+    def _write_recipe(self, *, single_write=True):
         row = fx.project(self.root)
         operation = fx.register(row, "http://fixture.invalid/write", "POST", "public", [
             {"name": "id", "location": "body", "selector": "id", "consumer": "resource_reference"},
             {"name": "label", "location": "body", "selector": "label",
              "consumer": "template_engine", "test_families": ["template_injection"]}])
-        actor = engine.add_actor(row, {"actor_id": "alice", "subject": "alice", "roles": []})
+        engine.add_actor(row, {"actor_id": "alice", "subject": "alice", "roles": []})
         resource = engine.add_resource(row, {"operation_id": operation["id"], "owner_actor_id": "alice",
                                              "external_id": "7", "request_binding": {"location": "body", "selector": "id"}})
         engine.update_project(row, {"allow_mutation": True})
@@ -222,46 +347,45 @@ class TestRunTests(unittest.TestCase):
         hypothesis = new_hypothesis(
             family="template_injection", security_property="unexpected_expression_evaluation",
             operation_id=operation["id"], input_key=None, scope_epoch=campaign["campaign"]["scope_epoch"],
-            target_build=target_build, source_kind="declared_family", statement="write expression")
+            target_build=target_build, source_kind="declared_family", statement="write expression",
+            campaign_id=campaign_id,
+            universe_id=Repository(row).get("campaign", campaign_id)["universe_id"])
         Repository(row).add("hypothesis", hypothesis, immutable=False)
-        recipe = new_recipe(
-            hypothesis=hypothesis, provider={"name": "http", "profile": "native_http_fixture_write", "version": "1"},
-            bindings={"scope_epoch": campaign["campaign"]["scope_epoch"], "target_build": target_build,
-                      "operation_id": operation["id"], "operation_signature": engine.operation_signature(operation),
-                      "session": None, "resource": {"resource_id": resource["id"], "revision": resource.get("revision", 1)},
-                      "fixture": {"fixture_id": fixture["id"], "revision": fixture["revision"]}},
-            control_groups=[{"id": "primary", "identity_role": "alice", "controls": [
-                {"id": "normal", "role": "normal", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL"}},
-                 "expected": {"selector": "/value", "value": "AWA-NORMAL"}},
-                {"id": "attack", "role": "attack", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "7*7"}},
-                 "expected": {"selector": "/value", "value": "49"}},
-                {"id": "negative", "role": "negative", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL-2"}},
-                 "expected": {"selector": "/value", "value": "AWA-NORMAL-2"}},
-            ]}],
-            oracle={"id": "OR-1", "type": "unexpected_expression_evaluation", "version": "1",
-                    "proof_scope": "unexpected_expression_evaluation", "selector": "/value", "expected_value": "49"},
-            steps=["write"], limits={"step_total": 3, "time_ms": 10000, "max_writes": 1,
-                                      "effect": "test_resource_write"},
-            variables={"label": {"source": "caller"}},
-            private_manifest={"control_groups": [{"id": "primary", "identity_role": "alice", "controls": [
-                {"id": "normal", "role": "normal", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL"}},
-                 "expected": {"selector": "/value", "value": "AWA-NORMAL"}},
-                {"id": "attack", "role": "attack", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "7*7"}},
-                 "expected": {"selector": "/value", "value": "49"}},
-                {"id": "negative", "role": "negative", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL-2"}},
-                 "expected": {"selector": "/value", "value": "AWA-NORMAL-2"}},
-            ]}]})
+        controls = [
+            {"id": "normal", "role": "normal", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL"}},
+             "expected": {"selector": "/value", "value": "AWA-NORMAL"}},
+            {"id": "attack", "role": "attack", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "7*7"}},
+             "expected": {"selector": "/value", "value": "49"}},
+            {"id": "negative", "role": "negative", "request": {"url": "http://fixture.invalid/write", "method": "POST", "body": {"id": "7", "label": "AWA-NORMAL-2"}},
+             "expected": {"selector": "/value", "value": "AWA-NORMAL-2"}},
+        ]
+        group = {"id": "primary", "identity_role": "alice", "controls": controls}
+        limits = {"step_total": 3, "time_ms": 10000, "max_writes": 1,
+                  "effect": "test_resource_write"}
+        if single_write:
+            group["execution_strategy"] = "single_write_attack_only"
+            limits["control_strategy"] = "single_write_attack_only"
+            for control in controls:
+                control["dispatch"] = control["role"] == "attack"
+        bindings = {"scope_epoch": campaign["campaign"]["scope_epoch"], "target_build": target_build,
+                    "operation_id": operation["id"], "operation_signature": engine.operation_signature(operation),
+                    "session": None, "resource": {"resource_id": resource["id"], "revision": resource.get("revision", 1)},
+                    "fixture": {"fixture_id": fixture["id"], "revision": fixture["revision"]}}
+        try:
+            recipe = new_recipe(
+                hypothesis=hypothesis, provider={"name": "http", "profile": "native_http_fixture_write", "version": "1"},
+                bindings=bindings, control_groups=[group],
+                oracle={"id": "OR-1", "type": "unexpected_expression_evaluation", "version": "1",
+                        "proof_scope": "unexpected_expression_evaluation", "selector": "/value", "expected_value": "49"},
+                steps=["write"], limits=limits,
+                variables={"label": {"source": "caller"}},
+                private_manifest={"control_groups": [group], "bindings": bindings},
+                campaign_id=campaign_id, universe_id=universe["id"])
+        except Exception:
+            row.close()
+            raise
         Repository(row).add("recipe", recipe, immutable=True)
-        row.close()
-        with patch("awa_ddd.engine.request", side_effect=OSError("connection dropped after dispatch")):
-            result = fx.dispatch(self.root, "test.run", {"project_id": "v2", "campaign_id": campaign_id,
-                                                          "recipe_id": recipe["id"], "idempotency_key": "write-one"})
-        self.assertEqual("effect_unknown", result["outcome"])
-        row = fx.project(self.root)
-        run_row = row.list("v2_run")[0]
-        self.assertEqual("effect_unknown", run_row["status"])
-        self.assertTrue(run_row["effect"]["unknown"])
-        row.close()
+        return row, campaign_id, recipe, fixture, hypothesis
 
 
 if __name__ == "__main__":

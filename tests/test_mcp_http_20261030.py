@@ -126,6 +126,34 @@ class MCPHTTPTests(unittest.TestCase):
         client.initialize()
         self.assertEqual(len(self.server.calls), 4)
 
+    def test_request_level_202_fails_closed_without_resending(self):
+        self.override("tools/list", lambda request: {
+            "status": 202,
+            "body": b"",
+            "headers": [],
+        })
+        client = self.client()
+        client.initialize()
+        before = len(self.server.calls)
+        error = self.assert_code("mcp_protocol", client.list_tools)
+        self.assertIn("no automatic resume", str(error))
+        self.assertEqual(before + 1, len(self.server.calls))
+        self.assert_code(
+            "mcp_closed",
+            lambda: client.call_tool("fixture_tool", {}),
+        )
+        self.assertEqual(before + 1, len(self.server.calls))
+
+    def test_utf8_bom_json_response_is_decoded_but_strict_json_stays_strict(self):
+        self.override("tools/list", lambda request: {
+            "body": b"\xef\xbb\xbf" + json.dumps(
+                envelope(request, {"tools": []})).encode("utf-8"),
+        })
+        client = self.client()
+        client.initialize()
+        self.assertEqual([], client.list_tools())
+        self.assertTrue(client.exchanges[-1]["matching_response_received"])
+
     def test_json_close_delimited_eof_and_chunked_eof_are_complete(self):
         def body(request):
             return json.dumps(envelope(request, {"tools": []})).encode()
@@ -391,15 +419,28 @@ class MCPHTTPTests(unittest.TestCase):
         client = self.client()
         client.initialize()
         self.assertEqual([tool["name"] for tool in client.list_tools()], ["fixture_0", "fixture_1", "fixture_2"])
+        self.assertEqual({
+            "complete": True,
+            "pages": 3,
+            "tool_count": 3,
+            "last_page_count": 1,
+            "continuation_received": False,
+            "limit_reason": None,
+        }, client.catalog_info)
         self.override("tools/list", lambda request: {"body": json.dumps(envelope(request, {"tools": [], "nextCursor": "repeat"})).encode()})
         loop = self.client()
         loop.initialize()
         self.assert_code("mcp_budget", loop.list_tools)
+        self.assertFalse(loop.catalog_info["complete"])
+        self.assertEqual("mcp_budget", loop.catalog_info["limit_reason"])
         self.override("tools/list", page)
         limited = self.client()
         limited.initialize()
         with patch.object(mcp_http, "MAX_CATALOG_PAGES", 2):
             self.assert_code("mcp_budget", limited.list_tools)
+        self.assertEqual(2, limited.catalog_info["pages"])
+        self.assertTrue(limited.catalog_info["continuation_received"])
+        self.assertFalse(limited.catalog_info["complete"])
 
     def test_tools_catalog_duplicate_names_and_tool_count_limit_are_rejected(self):
         for tools in ([{"name": "same", "inputSchema": {}}, {"name": "same", "inputSchema": {}}],

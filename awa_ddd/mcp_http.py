@@ -72,7 +72,8 @@ def _decode_json(raw):
         return result
 
     try:
-        result = json.loads(raw.decode("utf-8", errors="strict"), object_pairs_hook=unique_pairs,
+        text = raw.decode("utf-8", errors="strict").removeprefix("\ufeff")
+        result = json.loads(text, object_pairs_hook=unique_pairs,
                             parse_float=finite, parse_constant=lambda value: (_ for _ in ()).throw(ValueError()))
         _validate_json(result)
         return result
@@ -116,6 +117,7 @@ class _LoopbackConnection(http.client.HTTPConnection):
         super().__init__(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
                          timeout=client._remaining())
         self.client, self.scheme, self.wire, self.active_socket = client, parsed.scheme, bytearray(), None
+        self.deadline_aborted = False
         connection = self
 
         class Response(http.client.HTTPResponse):
@@ -138,7 +140,9 @@ class _LoopbackConnection(http.client.HTTPConnection):
             self.sock.settimeout(self.client._remaining())
             self.sock.do_handshake()
 
-    def abort(self):
+    def abort(self, *, deadline_expired=False):
+        if deadline_expired:
+            self.deadline_aborted = True
         if self.active_socket is not None:
             try:
                 self.active_socket.shutdown(socket.SHUT_RDWR)
@@ -157,6 +161,14 @@ class StreamableHTTPClient:
         self.deadline = time.monotonic() + timeout
         self.sequence, self.bytes_received = 0, 0
         self.exchanges, self.last_tool_result = [], None
+        self.catalog_info = {
+            "complete": False,
+            "pages": 0,
+            "tool_count": 0,
+            "last_page_count": 0,
+            "continuation_received": False,
+            "limit_reason": None,
+        }
         self.protocol_version, self.session_id, self.server_info, self.capabilities = None, None, None, None
         self._initialized, self._closed, self._failed, self._initial_result = False, False, False, None
         self._active_connection, self._lock = None, threading.RLock()
@@ -281,7 +293,7 @@ class StreamableHTTPClient:
         self.exchanges.append(exchange)
         connection = self._active_connection = _LoopbackConnection(self)
         # A peer must not extend TLS/header/SSE reads by trickling bytes forever.
-        watchdog = threading.Timer(self._remaining(), connection.abort)
+        watchdog = threading.Timer(self._remaining(), connection.abort, kwargs={"deadline_expired": True})
         watchdog.daemon = True
         watchdog.start()
         response = None
@@ -339,7 +351,9 @@ class StreamableHTTPClient:
             raise MCPHTTPError("mcp_protocol", "MCP event streams require strict UTF-8") from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             self._failed = True
-            code = "mcp_timeout" if time.monotonic() >= self.deadline or isinstance(exc, (socket.timeout, TimeoutError)) else "mcp_io"
+            timed_out = connection.deadline_aborted or time.monotonic() >= self.deadline \
+                or isinstance(exc, (socket.timeout, TimeoutError))
+            code = "mcp_timeout" if timed_out else "mcp_io"
             exchange["error_code"] = code
             raise MCPHTTPError(code, "The MCP HTTP exchange timed out or failed; execution may be uncertain") from None
         finally:
@@ -383,11 +397,20 @@ class StreamableHTTPClient:
             if not isinstance(self.capabilities.get("tools"), dict):
                 raise MCPHTTPError("mcp_protocol", "The MCP server did not advertise tools capability")
             entries, cursor, seen_cursors, names = [], None, set(), set()
+            self.catalog_info = {
+                "complete": False,
+                "pages": 0,
+                "tool_count": 0,
+                "last_page_count": 0,
+                "continuation_received": False,
+                "limit_reason": None,
+            }
             try:
                 for _ in range(MAX_CATALOG_PAGES):
                     result = self._request("tools/list", {"cursor": cursor} if cursor is not None else {})
                     if not isinstance(result, dict) or not isinstance(result.get("tools"), list):
                         raise MCPHTTPError("mcp_protocol", "The MCP tools catalog must contain a tools array")
+                    page_count = len(result["tools"])
                     for tool in result["tools"]:
                         name = tool.get("name") if isinstance(tool, dict) else None
                         if not isinstance(name, str) or not name or len(name) > 200 or name in names \
@@ -399,14 +422,25 @@ class StreamableHTTPClient:
                     if len(entries) > MAX_CATALOG_TOOLS:
                         raise MCPHTTPError("mcp_budget", "The MCP tools catalog exceeded its tool budget")
                     cursor = result.get("nextCursor")
+                    self.catalog_info.update(
+                        pages=self.catalog_info["pages"] + 1,
+                        tool_count=len(entries),
+                        last_page_count=page_count,
+                        continuation_received=cursor not in (None, ""),
+                    )
                     if cursor is None or cursor == "":
+                        self.catalog_info["complete"] = True
                         self._remaining()
                         return entries
                     if not isinstance(cursor, str) or len(cursor) > 1024 or cursor in seen_cursors:
                         raise MCPHTTPError("mcp_budget", "The MCP tools catalog cursor is invalid or repeated")
                     seen_cursors.add(cursor)
                 raise MCPHTTPError("mcp_budget", "The MCP tools catalog exceeded its pagination budget")
-            except MCPHTTPError:
+            except MCPHTTPError as exc:
+                self.catalog_info.update(
+                    complete=False,
+                    limit_reason=exc.code,
+                )
                 self._failed = True
                 raise
 

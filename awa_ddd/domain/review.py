@@ -23,7 +23,8 @@ SOURCE_TRUST = {"verified", "declared", "unverified"}
 
 def new_review_contract(*, hypothesis, run, mechanism, identity, control_groups,
                         observation, consumer_point, source_trust, reviewer,
-                        proof_scope, material, verification):
+                        proof_scope, material, verification,
+                        review_proof_receipt_id=None, reason=None):
     """Validate and freeze a review contract.  Currency checks happen in execution/review."""
     mapping(mechanism, "mechanism")
     for field in ("family", "security_property", "operation_id"):
@@ -87,6 +88,8 @@ def new_review_contract(*, hypothesis, run, mechanism, identity, control_groups,
     verification = mapping(verification, "verification")
     contract = {
         "schema": 2,
+        "campaign_id": hypothesis.get("campaign_id"),
+        "universe_id": hypothesis.get("universe_id"),
         "hypothesis_id": hypothesis["id"],
         "run_id": run.get("id") if run else None,
         "mechanism": {key: mechanism.get(key) for key in (
@@ -105,6 +108,9 @@ def new_review_contract(*, hypothesis, run, mechanism, identity, control_groups,
         "verification": {"version": text(verification.get("version", "1"), "verification_version", maximum=32),
                          "method": text(verification.get("method", "manual_review"), "verification_method", maximum=128),
                          "checked_at": verification.get("checked_at") or utc_now()},
+        "review_proof_receipt_id": optional_text(
+            review_proof_receipt_id, "review_proof_receipt_id", maximum=128),
+        "reason": optional_text(reason, "review_reason", maximum=4096),
         "created_at": utc_now(),
     }
     contract["id"] = stable_id("REV", contract)
@@ -136,7 +142,8 @@ def validate_cross_role(contract, *, hypothesis, run):
 def public_view(contract):
     return {
         key: contract.get(key) for key in (
-            "id", "hypothesis_id", "run_id", "mechanism", "identity", "control_groups",
+            "id", "campaign_id", "universe_id", "hypothesis_id", "run_id", "mechanism", "identity", "control_groups",
             "observation", "consumer_point", "source_trust", "reviewer", "proof_scope",
-            "verification", "created_at", "contract_hash")
+            "verification", "review_proof_receipt_id", "reason", "created_at",
+            "contract_hash")
     }

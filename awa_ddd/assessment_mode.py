@@ -12,6 +12,20 @@ SRC_MAX_TIMEOUT = 15
 SRC_DENIED_ACTIONS = frozenset({
     "tool.sqlmap", "tool.yakit_replay", "tool.tscanplus_request",
     "test.run_external", "scenario.run", "test.run_scenario",
+    "test.fixture_create", "test.fixture_lease", "test.fixture_cleanup",
+})
+LEGACY_READ_ONLY_ALLOWED_ACTIONS = frozenset({
+    "action.help", "runtime.probe", "project.list", "project.status",
+    "project.migrate", "project.rollback", "project.projection",
+    "surface.sources", "surface.list", "surface.inspect",
+    "plan.list", "plan.why", "plan.audit", "scenario.preflight",
+    "run.inspect", "execution.reconcile", "finding.list", "evidence.inspect",
+    "report.coverage", "candidate.list", "candidate.inspect", "page.coverage",
+    "tool.inspect", "tool.artifact", "campaign.status", "campaign.next",
+    "recon.snapshot", "recon.routes", "recon.hypotheses", "recon.capabilities",
+    "test.inspect", "test.fixture_inspect", "review.evidence", "report.matrix", "report.compare",
+    "report.artifact",
+    "integration.export",
 })
 
 
@@ -37,6 +51,11 @@ def require_mode(project, args):
 
 def require_action(project, action, args):
     require_mode(project, args)
+    if project.get_metadata("storage_mode") == "legacy_read_only" \
+            and action not in LEGACY_READ_ONLY_ALLOWED_ACTIONS:
+        raise EngineError("read_only", "The rolled-back compatibility view is read-only; newer execution facts remain preserved",
+                          {"action": action, "requests_sent": 0, "requests_replayed": 0,
+                           "next_action": "project.migrate"})
     if mode(project) == "src" and action in SRC_DENIED_ACTIONS:
         raise EngineError("src_action_denied",
                           "SRC uses bounded read-only discovery and offline evidence review; this execution action is unavailable",

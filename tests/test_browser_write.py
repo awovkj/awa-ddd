@@ -72,6 +72,12 @@ class BrowserWritePolicyTests(unittest.TestCase):
         raw = _raw(blocked_requests=[{"reason": "write_out_of_origin", "method": "POST"}])
         self.assertFalse(browser._successful(self.project, raw))
 
+    def test_incomplete_request_guard_always_fails_even_with_complete_observation(self):
+        self.assertEqual("failed", browser._terminal_run_status(False, True))
+        self.assertEqual("failed", browser._terminal_run_status(False, False))
+        self.assertEqual("succeeded", browser._terminal_run_status(True, True))
+        self.assertEqual("interrupted", browser._terminal_run_status(True, False))
+
 
 class BrowserWriteGateTests(unittest.TestCase):
     def _visit_args(self, **extra):
@@ -86,7 +92,7 @@ class BrowserWriteGateTests(unittest.TestCase):
             browser.visit(project, self._visit_args(allow_write=True))
         self.assertEqual(caught.exception.code, "browser_write_not_authorized")
 
-    def test_allow_write_defaults_to_project_permission(self):
+    def test_project_permission_does_not_implicitly_enable_page_writes(self):
         project = mock.MagicMock()
         project.config = {"scope": ["http://example.test/"], "exclude": [], "allow_mutation": True}
         with mock.patch.object(browser, "_browser_identity",
@@ -94,6 +100,16 @@ class BrowserWriteGateTests(unittest.TestCase):
                 mock.patch.object(browser, "probe", return_value={"available": False, "reason": "test"}):
             with self.assertRaises(EngineError) as caught:
                 browser.visit(project, self._visit_args())
+        self.assertEqual(caught.exception.code, "browser_unavailable")
+
+    def test_allow_write_true_still_defaults_write_budget_to_zero(self):
+        project = mock.MagicMock()
+        project.config = {"scope": ["http://example.test/"], "exclude": [], "allow_mutation": True}
+        with mock.patch.object(browser, "_browser_identity",
+                               return_value=({}, {}, None, [], None, None)), \
+                mock.patch.object(browser, "probe", return_value={"available": False, "reason": "test"}):
+            with self.assertRaises(EngineError) as caught:
+                browser.visit(project, self._visit_args(allow_write=True))
         self.assertEqual(caught.exception.code, "browser_unavailable")
 
     def test_allow_write_false_opts_one_visit_out(self):
@@ -105,6 +121,15 @@ class BrowserWriteGateTests(unittest.TestCase):
             with self.assertRaises(EngineError) as caught:
                 browser.visit(project, self._visit_args(allow_write=False))
         self.assertEqual(caught.exception.code, "browser_unavailable")
+
+    def test_explicit_write_budget_requires_exact_fixture_ids(self):
+        project = mock.MagicMock()
+        project.config = {"scope": ["http://example.test/"], "exclude": [], "allow_mutation": True}
+        with mock.patch.object(browser, "_browser_identity",
+                               return_value=({}, {}, None, [], None, None)):
+            with self.assertRaises(EngineError) as caught:
+                browser.visit(project, self._visit_args(allow_write=True, max_writes=1))
+        self.assertEqual(caught.exception.code, "resource_binding")
 
 
 if __name__ == "__main__":

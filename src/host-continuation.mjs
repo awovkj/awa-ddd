@@ -5,36 +5,74 @@ import { compactContinuation, invokeEngine, resolveConfig } from './bridge.mjs';
 
 export const name = 'awa-ddd-host-continuation';
 export const TURN_STOPPING_EVENT = 'agent/turn-stopping';
-const EXECUTION_ARM_ACTIONS = ['http.capture', 'scenario.run', 'browser.visit', 'identity.verify',
-  'tool.sqlmap', 'tool.yakit_replay', 'tool.tscanplus_request', 'plan.build', 'plan.next'];
+const V1_EXECUTION_ARM_ACTIONS = ['http.capture', 'scenario.run', 'browser.visit', 'identity.verify',
+  'tool.sqlmap', 'tool.yakit_replay', 'tool.tscanplus_request', 'tool.tscanplus_ingest',
+  'plan.build', 'plan.next'];
+const V2_EXECUTION_ARM_ACTIONS = ['campaign.start', 'campaign.status', 'campaign.next', 'campaign.checkpoint',
+  'campaign.finish', 'recon.import', 'test.run', 'test.run_browser', 'test.run_scenario', 'test.run_external',
+  'test.record_external', 'review.finding', 'review.bind', 'review.disposition', 'report.build',
+  'tool.tscanplus_ingest'];
+const EXECUTION_ARM_ACTIONS = [...V1_EXECUTION_ARM_ACTIONS, ...V2_EXECUTION_ARM_ACTIONS];
 const EXECUTION_ARM_SET = new Set(EXECUTION_ARM_ACTIONS);
-const TARGET_EXECUTION_SET = new Set(EXECUTION_ARM_ACTIONS.filter(action => !['plan.build', 'plan.next'].includes(action)));
-export const ARM_ACTIONS = Object.freeze([...EXECUTION_ARM_ACTIONS, 'assessment.prepare', 'assessment.evaluate',
-  'evidence.inspect', 'finding.record', 'finding.bind', 'plan.review', 'page.adopt', 'run.recover']);
-const ARM_SET = new Set(ARM_ACTIONS);
-const ACTIVITY_SET = new Set([...ARM_ACTIONS.filter(action => !['plan.build', 'plan.next'].includes(action)),
+const NON_TARGET_ARM = new Set(['plan.build', 'plan.next', 'campaign.start', 'campaign.status', 'campaign.next',
+  'campaign.checkpoint', 'campaign.finish', 'recon.import', 'review.finding', 'review.bind',
+  'review.disposition', 'test.record_external', 'report.build', 'tool.tscanplus_ingest']);
+const TARGET_EXECUTION_SET = new Set(EXECUTION_ARM_ACTIONS.filter(action => !NON_TARGET_ARM.has(action)));
+export const ARM_ACTIONS = Object.freeze([...V1_EXECUTION_ARM_ACTIONS, 'assessment.prepare', 'assessment.evaluate',
+  'evidence.inspect', 'finding.record', 'finding.bind', 'plan.review', 'plan.accept_partial',
+  'page.adopt', 'run.recover']);
+const V2_ARM_ACTIONS = [...V2_EXECUTION_ARM_ACTIONS, 'test.inspect', 'review.evidence', 'report.matrix',
+  'report.artifact'];
+const V1_ARM_SET = new Set(ARM_ACTIONS);
+const V2_ARM_SET = new Set(V2_ARM_ACTIONS);
+const V1_ACTIVITY_SET = new Set([...ARM_ACTIONS.filter(action => !['plan.build', 'plan.next'].includes(action)),
   'candidate.inspect', 'candidate.link', 'candidate.reopen', 'surface.inspect', 'surface.declare_consumer',
-  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'page.mark', 'run.inspect', 'plan.disposition']);
+  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'page.mark', 'run.inspect',
+  'plan.disposition']);
+const V2_ACTIVITY_SET = new Set([...V2_ARM_ACTIONS.filter(action => !['campaign.status', 'campaign.next'].includes(action)),
+  'campaign.start', 'campaign.status', 'campaign.next', 'campaign.checkpoint', 'campaign.finish',
+  'recon.snapshot', 'recon.routes', 'recon.hypotheses', 'recon.capabilities',
+  'test.inspect', 'review.evidence', 'report.matrix', 'report.artifact']);
 const OFFLINE_TASKS = new Set(['evidence.inspect', 'assessment.prepare', 'assessment.evaluate', 'finding.record',
-  'finding.bind', 'page.adopt', 'page.mark', 'plan.review', 'plan.disposition', 'run.inspect', 'run.recover',
+  'finding.bind', 'page.adopt', 'page.mark', 'plan.review', 'plan.accept_partial', 'plan.disposition',
+  'run.inspect', 'run.recover',
   'candidate.inspect', 'candidate.link', 'candidate.reopen', 'surface.inspect', 'surface.declare_consumer',
-  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'action.help', 'project.status']);
+  'surface.register', 'identity.actor', 'identity.session', 'identity.resource', 'action.help', 'project.status',
+  'campaign.start', 'campaign.status', 'campaign.next', 'campaign.checkpoint', 'campaign.finish', 'recon.import',
+  'recon.snapshot', 'recon.routes', 'recon.hypotheses', 'recon.capabilities', 'test.inspect', 'review.evidence',
+  'report.matrix', 'report.build', 'report.artifact', 'tool.tscanplus_ingest']);
 const TARGET_TASKS = new Set(['http.preflight', 'scenario.preflight', 'http.capture', 'scenario.run',
-  'browser.visit', 'identity.verify', 'tool.sqlmap', 'tool.yakit_replay', 'tool.tscanplus_request']);
+  'browser.visit', 'identity.verify', 'tool.sqlmap', 'tool.yakit_replay', 'tool.tscanplus_request',
+  'test.run', 'test.run_browser', 'test.run_scenario', 'test.run_external']);
 const PAGE_ACTIONS = new Set(['plan.next', 'plan.audit']);
 const COUNTS = ['ready_total', 'review_total', 'blocked_total', 'unresolved_total', 'actionable_total'];
 const MESSAGE_PROJECT_LIMIT = 8;
 const TASK_PAGE_LIMIT = 3;
 const TASK_PAGE_READ_LIMIT = 3;
 const ACTIVITY_LIMIT = 50000;
+const ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
+const CAMPAIGN_PATTERN = /^CAM-[A-Za-z0-9_-]{1,124}$/;
+const QUERY_BUDGET_EXHAUSTED = Symbol('awa-ddd:continuation-query-budget');
 
 function workKey(current) {
   const value = current.continuation;
   // A state PR includes caller dispositions. New engines additionally distinguish
   // actual closure/preparation; compatible engines retain their original key.
   const progress = value.semantic_progress_id || value.progress_id || value.snapshot_id;
-  return JSON.stringify([progress, current.kind, value.frontier_rounds,
+  return JSON.stringify([current.campaign_id, progress, current.kind, value.frontier_rounds,
     value.frontier_review_required, value.can_finalize, value.coverage_status]);
+}
+
+function stableIdentity(value, campaign = false) {
+  return typeof value === 'string' && (campaign ? CAMPAIGN_PATTERN : ID_PATTERN).test(value) ? value : undefined;
+}
+
+function campaignIdentity(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const nested = value.campaign && typeof value.campaign === 'object' && !Array.isArray(value.campaign)
+    ? value.campaign : undefined;
+  const candidates = new Set([value.campaign_id, nested?.id].filter(item => stableIdentity(item, true)));
+  return candidates.size === 1 ? [...candidates][0] : undefined;
 }
 
 function signalLike(signal) {
@@ -55,26 +93,37 @@ function pendingInput(agent, state) {
   return agent.inbox.nextStep.some(pending) || agent.inbox.nextTurn.some(pending);
 }
 
-function auditState(envelope) {
-  const value = envelope?.ok === true ? envelope.data?.continuation : undefined;
+function auditState(envelope, { project_id: projectId, campaign_id: campaignId } = {}) {
+  const data = envelope?.ok === true ? envelope.data : undefined;
+  const value = data?.continuation;
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || value.contract_version !== 2 || value.stop_policy_version !== 1
-    || value.stop_policy !== 'exhaustion_only' || typeof value.continue_required !== 'boolean'
+    || value.stop_policy !== 'exhaustion_only'
+    || !['continue_required', 'automatic_stop_allowed', 'can_finalize', 'can_claim_complete',
+      'frontier_review_required'].every(key => typeof value[key] === 'boolean')
+    || !Number.isSafeInteger(value.frontier_rounds) || value.frontier_rounds < 0
     || COUNTS.some(key => !Number.isSafeInteger(value[key]) || value[key] < 0)
     || value.actionable_total !== value.ready_total + value.review_total
     || value.unresolved_total !== value.actionable_total + value.blocked_total
     || typeof value.snapshot_id !== 'string' || !value.snapshot_id) return undefined;
+  const observedCampaign = campaignIdentity(data) || campaignIdentity(value);
+  if (campaignId) {
+    if (observedCampaign !== campaignId) return undefined;
+    const declaredProject = data?.project_id ?? data?.campaign?.project_id ?? value.project_id;
+    if (declaredProject !== undefined && declaredProject !== projectId) return undefined;
+  }
   const zero = COUNTS.every(key => value[key] === 0);
   const complete = value.continue_required === false && value.automatic_stop_allowed === true
     && value.can_finalize === true && value.can_claim_complete === true && value.coverage_status === 'complete'
     && value.frontier_review_required === false && Number.isSafeInteger(value.frontier_rounds)
     && value.frontier_rounds >= 2 && value.state === 'finalized'
     && typeof value.finalization_id === 'string' && value.finalization_id && zero;
-  if (complete) return { kind: 'completed', continuation: value };
+  const identity = campaignId ? { campaign_id: campaignId } : {};
+  if (complete) return { kind: 'completed', continuation: value, ...identity };
   if (value.continue_required !== true) return undefined;
-  if (value.actionable_total > 0) return { kind: 'work', continuation: value };
-  if (value.blocked_total > 0 || value.unresolved_total > 0) return { kind: 'blocked', continuation: value };
-  return { kind: 'frontier', continuation: value };
+  if (value.actionable_total > 0) return { kind: 'work', continuation: value, ...identity };
+  if (value.blocked_total > 0 || value.unresolved_total > 0) return { kind: 'blocked', continuation: value, ...identity };
+  return { kind: 'frontier', continuation: value, ...identity };
 }
 
 function taskFrom(row, offlineOnly) {
@@ -99,7 +148,8 @@ function taskFrom(row, offlineOnly) {
   const identity = obligation || row.id || input.evidence_id || input.page_visit_id || input.candidate_id || input.run_id;
   if (typeof identity !== 'string' || !identity || identity.length > 200) return undefined;
   const task = { id: identity, action, input_template: input, offline: OFFLINE_TASKS.has(action) };
-  for (const field of ['kind', 'operation_id', 'obligation_id', 'input_location', 'input_selector', 'schema_branch',
+  for (const field of ['kind', 'campaign_id', 'recipe_id', 'hypothesis_id', 'review_id',
+    'operation_id', 'obligation_id', 'input_location', 'input_selector', 'schema_branch',
     'hypothesis_family', 'hypothesis_note_zh', 'runtime_binding_modes', 'evidence_ids', 'missing_prerequisites', 'required_experiment_fields',
     'assessment_followup_action', 'assessment_followup_input', 'browser_testing', 'preparation_actions',
     'actor_id', 'baseline_actor_id', 'session_id', 'session_generation', 'resource_id', 'resource_signature',
@@ -139,7 +189,8 @@ function taskContext(row, input) {
   // No global PR/checkpoint, disposition, prose or attempt counters: another
   // task's progress cannot erase this task's failed material/context history.
   const context = {};
-  for (const field of ['operation_id', 'obligation_id', 'input_location', 'input_selector', 'schema_branch',
+  for (const field of ['campaign_id', 'recipe_id', 'hypothesis_id', 'review_id', 'operation_id', 'obligation_id',
+    'input_location', 'input_selector', 'schema_branch',
     'hypothesis_family', 'actor_id', 'baseline_actor_id', 'session_id', 'session_generation', 'resource_id',
     'resource_signature', 'operation_signature', 'input_signature', 'source_signature', 'scope_epoch',
     'evidence_ids', 'control_candidate_evidence_ids', 'decision_id', 'proof_decision_id']) {
@@ -159,7 +210,12 @@ function taskContext(row, input) {
 }
 
 function activityReferences(action, input) {
-  const fields = action === 'assessment.evaluate' ? ['obligation_id']
+  const fields = action.startsWith('campaign.') ? ['campaign_id']
+    : action.startsWith('test.') ? ['campaign_id', 'recipe_id', 'hypothesis_id', 'run_id']
+    : action.startsWith('review.') ? ['campaign_id', 'hypothesis_id', 'run_id', 'review_id', 'finding_id']
+    : action === 'report.build' ? ['campaign_id']
+    : action === 'tool.tscanplus_ingest' ? ['campaign_id', 'snapshot_id', 'source_id']
+    : action === 'assessment.evaluate' ? ['obligation_id']
     : action === 'assessment.prepare' ? ['obligation_id', 'evidence_id', 'finding_id', 'operation_id']
     : action.startsWith('candidate.') ? ['candidate_id']
     : action.startsWith('finding.') ? ['finding_id', 'decision_id', 'obligation_id']
@@ -173,7 +229,8 @@ function activityReferences(action, input) {
 
 function referenceKeys(input) {
   const result = [];
-  for (const field of ['obligation_id', 'evidence_id', 'finding_id', 'decision_id', 'candidate_id',
+  for (const field of ['campaign_id', 'recipe_id', 'hypothesis_id', 'review_id',
+    'obligation_id', 'evidence_id', 'finding_id', 'decision_id', 'candidate_id',
     'page_visit_id', 'page_id', 'run_id', 'checklist_id', 'operation_id', 'actor_id', 'session_id', 'resource_id']) {
     if (typeof input?.[field] === 'string') result.push(field + ':' + input[field]);
   }
@@ -259,6 +316,11 @@ function recoveryMessage(projects) {
 /** Instantiate before tool registration; attach only after the core tools have registered. */
 export function createController(config = {}, { signal: ownerSignal, invoke = invokeEngine, onDiagnostic } = {}) {
   const settings = resolveConfig(config);
+  const v2 = settings.assessmentModel === 'v2';
+  const statusAction = v2 ? 'campaign.status' : 'plan.audit';
+  const checkpointAction = v2 ? 'campaign.checkpoint' : 'plan.checkpoint';
+  const armSet = v2 ? V2_ARM_SET : V1_ARM_SET;
+  const activitySet = v2 ? V2_ACTIVITY_SET : V1_ACTIVITY_SET;
   const lifetime = new AbortController();
   const states = new Map();
   const tickets = new WeakMap();
@@ -267,10 +329,65 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
   const metrics = { observed_pre_steps: 0, observed_boundaries: 0, steers: 0, recovery_steers: 0,
     blocked_checkpoints: 0, stalled_checkpoints: 0, duplicate_work_suppressed: 0,
     audit_failures: 0, missing_execution_context: 0, concrete_handoffs: 0, review_activity_receipts: 0,
-    failed_task_attempts: 0, administrative_activity_receipts: 0, task_failure_deferrals: 0 };
+    failed_task_attempts: 0, administrative_activity_receipts: 0, task_failure_deferrals: 0,
+    continuation_deadlines: 0, continuation_budget_exhaustions: 0 };
   let registered = false;
   let disposed = false;
   let reason = 'not_attached';
+
+  function expectedCampaign(invocation) {
+    return stableIdentity(invocation?.campaign_id, true)
+      || stableIdentity(invocation?.input?.campaign_id, true);
+  }
+
+  function bindingKey(project_id, campaign_id) {
+    return campaign_id ? project_id + '\u0000' + campaign_id : project_id;
+  }
+
+  function eventIdentity(event, invocation) {
+    const value = event?.identity;
+    if (value === null) return { campaign_id: expectedCampaign(invocation) };
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return { campaign_id: expectedCampaign(invocation) };
+    }
+    if (value.project_id !== undefined && value.project_id !== invocation.project_id) return null;
+    const campaign_id = value.campaign_id === undefined ? undefined : stableIdentity(value.campaign_id, true);
+    const expected = expectedCampaign(invocation);
+    if (value.campaign_id !== undefined && !campaign_id) return null;
+    if (expected && campaign_id && expected !== campaign_id) return null;
+    const result = { campaign_id: campaign_id || expected };
+    for (const field of ['recipe_id', 'hypothesis_id', 'run_id', 'review_id', 'finding_id']) {
+      if (stableIdentity(value[field])) result[field] = value[field];
+    }
+    return result;
+  }
+
+  function projectBindings(state, project_id) {
+    return [...state.projects.values()].filter(binding => binding.project_id === project_id);
+  }
+
+  function findBinding(state, project_id, campaign_id) {
+    if (campaign_id) return state.projects.get(bindingKey(project_id, campaign_id));
+    const rows = projectBindings(state, project_id);
+    return rows.length === 1 ? rows[0] : undefined;
+  }
+
+  function createBinding(state, project_id, campaign_id, action) {
+    const key = bindingKey(project_id, campaign_id);
+    let binding = state.projects.get(key);
+    if (binding) return binding;
+    binding = {
+      project_id, campaign_id: campaign_id || null, key,
+      blocked_snapshot: null, recovery_notified: false, observed_key: null,
+      notified_keys: new Set(), stalled_keys: new Set(), execution_armed: TARGET_EXECUTION_SET.has(action),
+      activities: new Set(), activity_version: 0, scan_version: 0, task_states: new Map(),
+      known_references: new Set(), task_records: new Map(), reference_tasks: new Map(),
+      attempted_tasks: new Set(), failed_attempts: new Map(), pending_pages: new Map(),
+      last_scheduled: 0, deferred_task_priority: false,
+    };
+    state.projects.set(key, binding);
+    return binding;
+  }
 
   function diagnose(code) {
     reason = code;
@@ -342,7 +459,7 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
         if (state) clearState(state);
         state = { context: { turn: payload.turn, signal: payload.signal, session: agent.session,
           agent_id: agent.id, user_id: userId }, cancelled: false, projects: new Map(), signals: new Map(),
-          steering_ids: new Set(), audit: null };
+          steering_ids: new Set(), audit: null, schedule_clock: 0 };
         states.set(agent, state);
         addTurnSignal(state, payload.signal);
       }
@@ -357,10 +474,11 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     if (event.phase === 'start') {
       const agent = invocation.agent;
       const state = states.get(agent);
-      const arm = ARM_SET.has(invocation.action);
-      const bound = state?.projects.get(invocation.project_id);
+      const arm = armSet.has(invocation.action);
+      const campaign_id = expectedCampaign(invocation);
+      const bound = state ? findBinding(state, invocation.project_id, campaign_id) : undefined;
       const pageKey = pageRequestKey(invocation.action, invocation.input);
-      if (!arm && !(bound && (ACTIVITY_SET.has(invocation.action) || bound.pending_pages.has(pageKey)))) return;
+      if (!arm && !(bound && (activitySet.has(invocation.action) || bound.pending_pages.has(pageKey)))) return;
       if (!runtimeAgent(agent) || !state || !signalLike(invocation.callerSignal)
         || !signalLike(invocation.signal) || !usable(agent, state, state.context.signal, state.context.turn)) {
         metrics.missing_execution_context++;
@@ -371,7 +489,7 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
       if (invocation.callerSignal.aborted || invocation.signal.aborted) return;
       if (typeof invocation.project_id !== 'string'
         || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(invocation.project_id)) return;
-      tickets.set(invocation, { state, agent, project_id: invocation.project_id, arm });
+      tickets.set(invocation, { state, agent, project_id: invocation.project_id, campaign_id, arm });
       return;
     }
     const ticket = tickets.get(invocation);
@@ -379,13 +497,13 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     if (!ticket || !usable(ticket.agent, ticket.state, ticket.state.context.signal, ticket.state.context.turn)) return;
     const settled = event.phase === 'success' && event.ok === true;
     const uncertain = event.phase === 'failure' && (event.claimed_run === true || event.dispatch_uncertain === true);
-    if (ticket.arm && (settled || uncertain) && !ticket.state.projects.has(ticket.project_id)) ticket.state.projects.set(ticket.project_id,
-      { blocked_snapshot: null, recovery_notified: false, observed_key: null,
-        notified_keys: new Set(), stalled_keys: new Set(), execution_armed: EXECUTION_ARM_SET.has(invocation.action),
-        activities: new Set(), activity_version: 0, scan_version: 0, task_states: new Map(), known_references: new Set(),
-        task_records: new Map(), reference_tasks: new Map(), attempted_tasks: new Set(), failed_attempts: new Map(),
-        pending_pages: new Map() });
-    const binding = ticket.state.projects.get(ticket.project_id);
+    const identity = eventIdentity(event, invocation);
+    if (identity === null) return;
+    const campaign_id = identity.campaign_id || ticket.campaign_id;
+    if (ticket.arm && (settled || uncertain) && (!v2 || campaign_id)) {
+      createBinding(ticket.state, ticket.project_id, campaign_id, invocation.action);
+    }
+    const binding = findBinding(ticket.state, ticket.project_id, campaign_id || ticket.campaign_id);
     if (!binding) return;
     if ((settled || uncertain) && TARGET_EXECUTION_SET.has(invocation.action)) binding.execution_armed = true;
     const pageKey = pageRequestKey(invocation.action, invocation.input);
@@ -393,10 +511,11 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     const recoveredPage = settled && typeof pageProgress === 'string' && pageProgress === binding.observed_key;
     if (recoveredPage) binding.pending_pages.delete(pageKey);
     const failed = event.phase === 'failure' || event.phase === 'success' && event.ok === false;
-    const knownFailure = failed && knownFailedActivity(binding, invocation.action, invocation.input);
-    if (recoveredPage || ACTIVITY_SET.has(invocation.action) && (settled || uncertain || knownFailure)) {
+    const activityInput = { ...invocation.input, ...identity };
+    const knownFailure = failed && knownFailedActivity(binding, invocation.action, activityInput);
+    if (recoveredPage || activitySet.has(invocation.action) && (settled || uncertain || knownFailure)) {
       const matched = new Map();
-      for (const reference of activityReferences(invocation.action, invocation.input)) {
+      for (const reference of activityReferences(invocation.action, activityInput)) {
         for (const key of binding.reference_tasks.get(reference) || []) {
           const record = binding.task_records.get(key);
           if (record && (record.task.action === invocation.action
@@ -404,7 +523,7 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
         }
       }
       const contexts = [...new Set([...matched.values()].map(record => record.task.context))].sort();
-      const key = canonical([failed ? 'failure' : 'receipt', invocation.action, invocation.input || {}, contexts,
+      const key = canonical([failed ? 'failure' : 'receipt', invocation.action, invocation.input || {}, identity, contexts,
         ...(recoveredPage ? [pageProgress] : [])]);
       if (!binding.activities.has(key) && binding.activities.size < ACTIVITY_LIMIT) {
         binding.activities.add(key);
@@ -439,7 +558,108 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     }
   }
 
-  async function currentTasks(project_id, binding, key, current, signal, stillUsable) {
+  async function currentCampaignTasks(state, project_id, binding, key, current, query, stillUsable) {
+    const previous = binding.task_states.get(key) || {
+      last_activity: -1, attempted: false, issued: false, shown: new Set(),
+    };
+    if (previous.attempted && binding.scan_version <= previous.last_activity) return undefined;
+    const next = { ...previous, shown: new Set(previous.shown), attempted: true,
+      last_activity: binding.scan_version };
+    if (!stillUsable()) return undefined;
+    let page;
+    try {
+      page = await query('campaign.next', { project_id, campaign_id: binding.campaign_id, limit: TASK_PAGE_LIMIT });
+    } catch (error) {
+      if (error === QUERY_BUDGET_EXHAUSTED) {
+        return { project_id, campaign_id: binding.campaign_id, binding, budget_exhausted: true };
+      }
+      if (!stillUsable()) return undefined;
+      return { project_id, campaign_id: binding.campaign_id, binding, recovery_required: true };
+    }
+    if (!stillUsable()) return undefined;
+    if (page?.ok !== true || campaignIdentity(page.data) !== binding.campaign_id
+      || !Array.isArray(page.data?.recipes) || !Array.isArray(page.data?.preparation)) {
+      return { project_id, campaign_id: binding.campaign_id, binding, recovery_required: true };
+    }
+    let fresh;
+    try {
+      fresh = auditState(await query(statusAction, { project_id, campaign_id: binding.campaign_id }),
+        { project_id, campaign_id: binding.campaign_id });
+    } catch (error) {
+      if (error === QUERY_BUDGET_EXHAUSTED) {
+        return { project_id, campaign_id: binding.campaign_id, binding, budget_exhausted: true };
+      }
+      if (!stillUsable()) return undefined;
+      return { project_id, campaign_id: binding.campaign_id, binding, recovery_required: true };
+    }
+    if (!stillUsable()) return undefined;
+    if (!fresh) return { project_id, campaign_id: binding.campaign_id, binding, recovery_required: true };
+    if (fresh.kind === 'completed') {
+      state.projects.delete(binding.key);
+      return { project_id, campaign_id: binding.campaign_id, completed: true };
+    }
+    const freshKey = workKey(fresh);
+    if (freshKey !== key) return !binding.notified_keys.has(freshKey)
+      ? { project_id, ...fresh, binding, key: freshKey } : undefined;
+
+    const tasks = [];
+    const add = task => {
+      if (!task || tasks.some(item => item.key === task.key)) return;
+      for (const reference of [...referenceKeys(task), ...referenceKeys(task.input_template)]) {
+        if (binding.known_references.size < ACTIVITY_LIMIT) {
+          binding.known_references.add(reference);
+          if (!binding.reference_tasks.has(reference)) binding.reference_tasks.set(reference, new Set());
+          if (binding.reference_tasks.get(reference).size < TASK_PAGE_LIMIT * TASK_PAGE_READ_LIMIT) {
+            binding.reference_tasks.get(reference).add(task.key);
+          }
+        }
+      }
+      const record = binding.task_records.get(task.key);
+      if (!record || record.task.context !== task.context) {
+        binding.task_records.set(task.key, { task, status: 'available' });
+      }
+      if (!binding.attempted_tasks.has(task.attempt_key)) tasks.push(task);
+    };
+    for (const row of page.data.recipes.slice(0, TASK_PAGE_LIMIT)) {
+      const recipe_id = row?.recipe?.id;
+      const hypothesis_id = row?.hypothesis?.id;
+      if (!stableIdentity(recipe_id) || !stableIdentity(hypothesis_id)) continue;
+      add(taskFrom({
+        id: recipe_id, campaign_id: binding.campaign_id, recipe_id, hypothesis_id,
+        action: 'test.run', input_template: { campaign_id: binding.campaign_id, recipe_id },
+        expected_outcome: row.expected_outcome,
+      }, !binding.execution_armed));
+    }
+    for (const row of page.data.preparation.slice(0, TASK_PAGE_LIMIT)) {
+      const hypothesis_id = stableIdentity(row?.hypothesis_id);
+      if (!hypothesis_id) continue;
+      const supported = (Array.isArray(row.preparation_actions) ? row.preparation_actions : [])
+        .find(item => OFFLINE_TASKS.has(item?.action) || TARGET_TASKS.has(item?.action));
+      const action = OFFLINE_TASKS.has(row.next_action) || TARGET_TASKS.has(row.next_action)
+        ? row.next_action : supported?.action;
+      if (!action) continue;
+      const input = { campaign_id: binding.campaign_id, hypothesis_id };
+      for (const field of ['operation_id', 'run_id', 'review_id', 'evidence_id']) {
+        if (stableIdentity(row[field])) input[field] = row[field];
+      }
+      if (Array.isArray(row.evidence_ids) && row.evidence_ids.length <= 25) input.evidence_ids = row.evidence_ids;
+      const task = taskFrom({ ...row, id: hypothesis_id, action, input_template: input }, !binding.execution_armed);
+      if (task) task.required_experiment_fields = [...new Set([
+        ...(task.required_experiment_fields || []), ...(row.missing_context || row.missing || []),
+      ])];
+      add(task);
+    }
+    const visible = tasks.slice(0, TASK_PAGE_LIMIT);
+    if (!visible.length) {
+      binding.task_states.set(key, next);
+      return { project_id, campaign_id: binding.campaign_id, binding, recovery_required: true };
+    }
+    return { project_id, campaign_id: binding.campaign_id, ...current, binding, key,
+      tasks: visible, deferred: [], task_state: next };
+  }
+
+  async function currentTasks(state, project_id, binding, key, current, query, stillUsable) {
+    if (v2) return currentCampaignTasks(state, project_id, binding, key, current, query, stillUsable);
     const previous = binding.task_states.get(key) || {
       queue_offset: 0, review_offset: 0, last_activity: -1, attempted: false, issued: false, shown: new Set(),
     };
@@ -454,10 +674,13 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
         if (!stillUsable()) return undefined;
         let envelope;
         try {
-          envelope = await invoke(settings, action, { project_id, offset: next[cursor], limit: TASK_PAGE_LIMIT,
-            ...(action === 'plan.next' ? { parameter_limit: 1 } : {}) }, { signal });
-        } catch {
-          if (!stillUsable() || signal.aborted) return undefined;
+          envelope = await query(action, { project_id, offset: next[cursor], limit: TASK_PAGE_LIMIT,
+            ...(action === 'plan.next' ? { parameter_limit: 1 } : {}) });
+        } catch (error) {
+          if (error === QUERY_BUDGET_EXHAUSTED) {
+            return { project_id, binding, budget_exhausted: true };
+          }
+          if (!stillUsable()) return undefined;
           break;
         }
         if (!stillUsable()) return undefined;
@@ -525,8 +748,8 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
   }
 
   function includeFreshCheckpoint(state, project_id, binding, envelope, work) {
-    const updated = auditState(envelope);
-    if (updated?.kind === 'completed') { state.projects.delete(project_id); return; }
+    const updated = auditState(envelope, { project_id, campaign_id: binding.campaign_id });
+    if (updated?.kind === 'completed') { state.projects.delete(binding.key); return; }
     if (updated?.kind !== 'work' && updated?.kind !== 'frontier') return;
     const key = workKey(updated);
     // A concurrent worker may make genuine progress while the checkpoint awaits.
@@ -534,7 +757,7 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
       binding.observed_key = key;
       binding.pending_pages.clear();
       binding.recovery_notified = false;
-      work.push({ project_id, ...updated, binding, key });
+      work.push({ project_id, campaign_id: binding.campaign_id, ...updated, binding, key });
     }
   }
 
@@ -547,31 +770,85 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
     metrics.observed_boundaries++;
     const control = new AbortController();
     state.audit = control;
+    const deadline = new AbortController();
+    let deadlineReached = false;
+    const deadlineTimer = setTimeout(() => {
+      if (!deadline.signal.aborted) {
+        deadlineReached = true;
+        deadline.abort(new Error('awa-ddd continuation deadline'));
+      }
+    }, settings.continuationTimeoutMs);
+    deadlineTimer.unref();
     const signal = AbortSignal.any([payload.signal, lifetime.signal, control.signal,
       ...(ownerSignal ? [ownerSignal] : []), ...state.signals.keys()]);
+    const querySignal = AbortSignal.any([signal, deadline.signal]);
     const work = [];
     const recovery = [];
+    const queryCounts = new Map();
+    let queryTotal = 0;
     let blocked = 0;
+
+    const callerStopped = () => payload.signal.aborted || lifetime.signal.aborted || control.signal.aborted
+      || ownerSignal?.aborted || [...state.signals.keys()].some(item => item.aborted);
+    const stillUsable = () => usable(agent, state, payload.signal, payload.turn)
+      && !pendingInput(agent, state) && !callerStopped();
+    const addRecovery = (binding, recoveryReason) => {
+      if (!binding) return;
+      if (binding.recovery_notified && binding.recovery_reason === recoveryReason) return;
+      if (recovery.some(item => item.binding === binding && item.recovery_reason === recoveryReason)) return;
+      recovery.push({ project_id: binding.project_id, campaign_id: binding.campaign_id,
+        binding, recovery_reason: recoveryReason });
+    };
+    const query = async (action, args) => {
+      if (deadline.signal.aborted) throw QUERY_BUDGET_EXHAUSTED;
+      if (queryTotal >= settings.continuationQueryBudget) throw QUERY_BUDGET_EXHAUSTED;
+      const projectKey = args.project_id;
+      if ((queryCounts.get(projectKey) || 0) >= settings.continuationProjectQueryBudget) {
+        throw QUERY_BUDGET_EXHAUSTED;
+      }
+      queryTotal++;
+      queryCounts.set(projectKey, (queryCounts.get(projectKey) || 0) + 1);
+      return invoke(settings, action, args, { signal: querySignal });
+    };
+
+    const ordered = [...state.projects.values()].sort((left, right) =>
+      Number(right.deferred_task_priority) - Number(left.deferred_task_priority)
+      || left.last_scheduled - right.last_scheduled);
     try {
-      for (const [project_id, binding] of state.projects) {
-        if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
+      for (let index = 0; index < ordered.length; index++) {
+        const binding = ordered[index];
+        const { project_id, campaign_id } = binding;
+        if (!state.projects.has(binding.key)) continue;
+        if (!stillUsable()) return;
+        binding.last_scheduled = ++state.schedule_clock;
+        const auditArgs = v2
+          ? { project_id, campaign_id }
+          : { project_id, offset: 0, limit: 1 };
         let current;
-        try { current = auditState(await invoke(settings, 'plan.audit', { project_id, offset: 0, limit: 1 }, { signal })); }
-        catch {
-          if (signal.aborted || !usable(agent, state, payload.signal, payload.turn)) return;
+        try {
+          current = auditState(await query(statusAction, auditArgs), { project_id, campaign_id });
+        } catch (error) {
+          if (callerStopped()) return;
+          if (error === QUERY_BUDGET_EXHAUSTED) {
+            metrics.continuation_budget_exhaustions++;
+            diagnose(deadlineReached ? 'continuation_deadline_unfinished' : 'continuation_budget_unfinished');
+            for (const remaining of ordered.slice(index)) addRecovery(remaining,
+              deadlineReached ? 'continuation_deadline' : 'query_budget');
+            break;
+          }
           metrics.audit_failures++;
           diagnose('audit_unavailable_unfinished');
-          if (!binding.recovery_notified) recovery.push({ project_id, binding });
+          addRecovery(binding, 'audit_unavailable');
           continue;
         }
-        if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
+        if (!stillUsable()) return;
         if (!current) {
           metrics.audit_failures++;
           diagnose('audit_contract_unavailable_unfinished');
-          if (!binding.recovery_notified) recovery.push({ project_id, binding });
+          addRecovery(binding, 'audit_contract_unavailable');
           continue;
         }
-        if (current.kind === 'completed') { state.projects.delete(project_id); continue; }
+        if (current.kind === 'completed') { state.projects.delete(binding.key); continue; }
         const key = workKey(current);
         if (binding.observed_key !== key) {
           if (!binding.notified_keys.has(key)) binding.recovery_notified = false;
@@ -584,14 +861,20 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           if (binding.blocked_snapshot !== key) {
             binding.blocked_snapshot = key;
             try {
-              const checkpoint = await invoke(settings, 'plan.checkpoint', { project_id,
-                label: 'Host boundary: blocked work remains unfinished; no target replay' }, { signal });
-              if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
+              const checkpoint = await query(checkpointAction, { project_id,
+                ...(campaign_id ? { campaign_id } : {}),
+                label: 'Host boundary: blocked work remains unfinished; no target replay' });
+              if (!stillUsable()) return;
               if (checkpoint?.ok !== true) { diagnose('blocked_checkpoint_unavailable_unfinished'); continue; }
               metrics.blocked_checkpoints++;
               includeFreshCheckpoint(state, project_id, binding, checkpoint, work);
-            } catch {
-              if (signal.aborted || !usable(agent, state, payload.signal, payload.turn)) return;
+            } catch (error) {
+              if (callerStopped()) return;
+              if (error === QUERY_BUDGET_EXHAUSTED) {
+                metrics.continuation_budget_exhaustions++;
+                addRecovery(binding, deadlineReached ? 'continuation_deadline' : 'query_budget');
+                continue;
+              }
               diagnose('blocked_checkpoint_unavailable_unfinished');
             }
           }
@@ -603,40 +886,54 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           if (!binding.stalled_keys.has(key)) {
             binding.stalled_keys.add(key);
             try {
-              const checkpoint = await invoke(settings, 'plan.checkpoint', { project_id,
-                label: 'Host boundary: unchanged closure progress; assessment remains unfinished' }, { signal });
-              if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
+              const checkpoint = await query(checkpointAction, { project_id,
+                ...(campaign_id ? { campaign_id } : {}),
+                label: 'Host boundary: unchanged closure progress; assessment remains unfinished' });
+              if (!stillUsable()) return;
               if (checkpoint?.ok === true) {
                 metrics.stalled_checkpoints++;
                 includeFreshCheckpoint(state, project_id, binding, checkpoint, work);
               }
               else diagnose('stalled_checkpoint_unavailable_unfinished');
-            } catch {
-              if (signal.aborted || !usable(agent, state, payload.signal, payload.turn)) return;
+            } catch (error) {
+              if (callerStopped()) return;
+              if (error === QUERY_BUDGET_EXHAUSTED) {
+                metrics.continuation_budget_exhaustions++;
+                addRecovery(binding, deadlineReached ? 'continuation_deadline' : 'query_budget');
+                continue;
+              }
               diagnose('stalled_checkpoint_unavailable_unfinished');
             }
           }
-          if (!usable(agent, state, payload.signal, payload.turn) || pendingInput(agent, state)) return;
-          if (!state.projects.has(project_id) || work.some(item => item.project_id === project_id)) continue;
-          const handoff = await currentTasks(project_id, binding, key, current, signal,
-            () => usable(agent, state, payload.signal, payload.turn) && !pendingInput(agent, state));
-          if (handoff?.completed) state.projects.delete(project_id);
+          if (!stillUsable()) return;
+          if (!state.projects.has(binding.key) || work.some(item => item.binding === binding)) continue;
+          const handoff = await currentTasks(state, project_id, binding, key, current, query, stillUsable);
+          if (handoff?.completed) state.projects.delete(binding.key);
+          else if (handoff?.budget_exhausted) addRecovery(binding, 'query_budget');
+          else if (handoff?.recovery_required) addRecovery(binding, 'no_actionable_page');
           else if (handoff) work.push(handoff);
           continue;
         }
-        work.push({ project_id, ...current, binding, key });
+        work.push({ project_id, campaign_id, ...current, binding, key });
       }
-      if ((!work.length && !recovery.length) || !usable(agent, state, payload.signal, payload.turn)
-        || pendingInput(agent, state)) return;
+      if (deadlineReached) {
+        metrics.continuation_deadlines++;
+        diagnose('continuation_deadline_unfinished');
+        for (const binding of state.projects.values()) addRecovery(binding, 'continuation_deadline');
+      }
+      if ((!work.length && !recovery.length) || !stillUsable()) return;
       // steer is synchronous: no await separates the final cancellation check from inbox publication.
       // Unnotified projects retain precedence over corrective pages from others.
-      work.sort((a, b) => Boolean(a.tasks) - Boolean(b.tasks));
-      const projects = recovery.map(item => item.project_id);
+      work.sort((a, b) => Number(b.binding.deferred_task_priority) - Number(a.binding.deferred_task_priority)
+        || Boolean(a.tasks) - Boolean(b.tasks));
+      const projects = recovery.map(item => ({ project_id: item.project_id, campaign_id: item.campaign_id,
+        recovery_reason: item.recovery_reason }));
       const message = work.length ? continuationMessage(work, blocked, projects) : recoveryMessage(projects);
       state.steering_ids.add(message.id);
       agent.steer(message);
       // Only shown projects were handed off; omitted projects get their next page.
       for (const item of work.slice(0, MESSAGE_PROJECT_LIMIT)) {
+        item.binding.deferred_task_priority = false;
         if (item.binding.observed_key !== item.key) {
           item.binding.observed_key = item.key;
           item.binding.pending_pages.clear();
@@ -658,13 +955,20 @@ export function createController(config = {}, { signal: ownerSignal, invoke = in
           metrics.concrete_handoffs++;
         }
       }
-      for (const item of recovery.slice(0, MESSAGE_PROJECT_LIMIT)) item.binding.recovery_notified = true;
+      for (const item of work.slice(MESSAGE_PROJECT_LIMIT)) {
+        if (item.tasks) item.binding.deferred_task_priority = true;
+      }
+      for (const item of recovery.slice(0, MESSAGE_PROJECT_LIMIT)) {
+        item.binding.recovery_notified = true;
+        item.binding.recovery_reason = item.recovery_reason;
+      }
       metrics.steers++;
       if (recovery.length) metrics.recovery_steers++;
       diagnose(work.length ? 'current_work_steered' : 'offline_recovery_steered_unfinished');
     } catch {
-      if (!signal.aborted && usable(agent, state, payload.signal, payload.turn)) diagnose('steering_unavailable_unfinished');
+      if (!callerStopped() && stillUsable()) diagnose('steering_unavailable_unfinished');
     } finally {
+      clearTimeout(deadlineTimer);
       if (state.audit === control) state.audit = null;
     }
   }

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
 from urllib.parse import quote
 
-from awa_ddd import candidates, engine, tscanplus
+from awa_ddd import candidates, engine, execution_coordinator, ipc, tscanplus
 from awa_ddd.store import EngineError, Project
 
 
@@ -44,6 +45,14 @@ class FakeClient:
 
     def list_tools(self):
         self.exchanges.append({"direction": "request", "message": {"method": "tools/list"}})
+        self.catalog_info = {
+            "complete": True,
+            "pages": 1,
+            "tool_count": len(self.tools),
+            "last_page_count": len(self.tools),
+            "continuation_received": False,
+            "limit_reason": None,
+        }
         return deepcopy(self.tools)
 
     def call_tool(self, name, arguments):
@@ -137,6 +146,10 @@ class TscanPlusUpgradeTests(unittest.TestCase):
     def test_probe_does_not_read_database_and_uses_server_compatible_namespace(self):
         result = self.probe()
         self.assertTrue(result["available"])
+        self.assertTrue(result["catalog_complete"])
+        self.assertEqual(1, result["catalog_pages"])
+        self.assertEqual(len(catalog()), result["catalog_returned_count"])
+        self.assertFalse(result["catalog_continuation_received"])
         self.assertLessEqual(len(result["scanner_project"]), 20)
         self.assertNotEqual(result["scanner_project"], "MCP")
         self.assertEqual(FakeClient.calls, [])
@@ -722,6 +735,103 @@ class TscanPlusUpgradeTests(unittest.TestCase):
                 self.assertEqual(engine.evaluate_coverage(self.project)["completion"]["failed_partial_tools"], 0)
         self.assertTrue(all(name == "http_request" for name, _ in FakeClient.calls))
         self.assertEqual(self.project.list("evidence"), [])
+
+    def test_request_and_existing_result_reads_emit_dispatch_before_each_tool_call(self):
+        probed = self.probe()
+        operation = engine.register_operation(
+            self.project,
+            {"url": self.base + "/dispatch", "method": "GET", "auth": "public"},
+        )
+        dispatches = []
+        pre_call_states = []
+
+        def record_dispatch(action, run_id, request_hash):
+            persisted = self.project.get("run", run_id)
+            self.assertEqual(request_hash, persisted["dispatch_hash"])
+            self.assertTrue(persisted["dispatch_attempted"])
+            dispatches.append(
+                (action, run_id, request_hash, len(FakeClient.calls))
+            )
+
+        def handler(name, values):
+            receipt = self.project.list("execution_dispatch")[-1]
+            budget = self.project.connection.execute(
+                "SELECT * FROM execution_budget WHERE name=?",
+                ("tscanplus:" + receipt["run_id"],),
+            ).fetchone()
+            lease = self.project.connection.execute(
+                "SELECT * FROM execution_leases WHERE name=?",
+                ("tscanplus:" + receipt["run_id"],),
+            ).fetchone()
+            pre_call_states.append((receipt["run_id"], dict(budget), dict(lease)))
+            if name == "http_request":
+                return mcp_result({"status_code": 200, "response_truncated": False,
+                                   "results_complete": True})
+            return mcp_result({"results": [{"url": self.base + "/dispatch", "method": "GET",
+                                             "project": probed["scanner_project"]}],
+                               "table": "urlscan", "total": 1, "matched": 1, "result_limit": 25,
+                               "project": probed["scanner_project"]})
+
+        FakeClient.handler = handler
+        with patch.object(ipc, "emit_dispatch", side_effect=record_dispatch):
+            request_result = tscanplus.request_run(
+                self.project, {"operation_id": operation["id"]}
+            )
+            query_result = tscanplus.query_results(self.project, {})
+
+        self.assertEqual(
+            ["tool.tscanplus_request", "tool.tscanplus_results"],
+            [row[0] for row in dispatches],
+        )
+        self.assertEqual([0, 1], [row[3] for row in dispatches])
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", row[2]) for row in dispatches))
+        request_run = self.project.get("run", request_result["run_id"])
+        query_run = self.project.get("run", query_result["run_id"])
+        self.assertEqual(dispatches[0][2], request_run["dispatch_hash"])
+        self.assertEqual(dispatches[1][2], query_run["dispatch_hash"])
+        self.assertTrue(request_run["target_traffic_sent"])
+        self.assertFalse(query_run["target_traffic_sent"])
+        self.assertEqual([request_run["id"], query_run["id"]],
+                         [state[0] for state in pre_call_states])
+        self.assertTrue(all(state[1]["requests_used"] == 1 and state[1]["writes_used"] == 0
+                            for state in pre_call_states))
+        self.assertTrue(all(state[2]["dispatched"] == 1 for state in pre_call_states))
+        self.assertTrue(request_run["lease_released"] and query_run["lease_released"])
+        for run in (request_run, query_run):
+            self.assertIsNone(self.project.connection.execute(
+                "SELECT 1 FROM execution_leases WHERE name=?",
+                ("tscanplus:" + run["id"],),
+            ).fetchone())
+
+    def test_unknown_remote_result_retains_dispatched_lease_for_reconciliation(self):
+        self.probe()
+
+        def fail(name, values):
+            raise OSError("synthetic connection loss after dispatch")
+
+        FakeClient.handler = fail
+        with self.assertRaises(EngineError) as caught:
+            tscanplus.query_results(self.project, {})
+        self.assertEqual(caught.exception.code, "tscanplus_failed")
+        run = self.project.get("run", caught.exception.details["run_id"])
+        self.assertEqual("failed", run["status"])
+        self.assertTrue(run["dispatch_attempted"])
+        self.assertTrue(run["remote_may_continue"])
+        self.assertFalse(run["lease_released"])
+        row = self.project.connection.execute(
+            "SELECT * FROM execution_leases WHERE name=?", ("tscanplus:" + run["id"],)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(1, row["dispatched"])
+        budget = self.project.connection.execute(
+            "SELECT * FROM execution_budget WHERE name=?", ("tscanplus:" + run["id"],)
+        ).fetchone()
+        self.assertEqual((1, 0), (budget["requests_used"], budget["writes_used"]))
+        self.assertEqual("valid", tscanplus.inspect(self.project, {"run_id": run["id"]})["integrity"])
+        self.assertTrue(execution_coordinator.release(self.project, dict(row), reconciled=True))
+        self.assertIsNone(self.project.connection.execute(
+            "SELECT 1 FROM execution_leases WHERE name=?", ("tscanplus:" + run["id"],)
+        ).fetchone())
 
     def assert_remote_review_remains_blocked(self, result):
         from awa_ddd import completeness, continuation

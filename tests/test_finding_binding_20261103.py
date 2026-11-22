@@ -14,6 +14,7 @@ from awa_ddd.assessment import evaluate, record_finding
 from awa_ddd.finding_binding import bind_finding
 from awa_ddd.scenario import run_scenario
 from awa_ddd.store import EngineError, Project, now
+from awa_test_support import record_observation
 
 
 class FindingBindingTests(unittest.TestCase):
@@ -228,7 +229,7 @@ class FindingBindingTests(unittest.TestCase):
         engine.build_plan(self.project)
         attack = self.capture("<img src=x onerror=alert('" + marker + "')>", operation=operation)
         url = self.project.read_artifact(attack)["request"]["url"]
-        visit = browser._record_observation(self.project, {"url": url, "finalUrl": url, "status": 200, "signals": {"forms": 1},
+        visit = record_observation(self.project, {"url": url, "finalUrl": url, "status": 200, "signals": {"forms": 1},
             "dialogs": [{"type": "alert", "message": marker, "action_index": None}],
             "network": [{"url": url, "method": "GET", "type": "document", "status": 200, "request_headers": {}}]},
             self.project.id("PV"), "local_playwright")

@@ -12,7 +12,7 @@ test('the development SDK uses fixed Zod without vendoring another host SDK', as
   assert.equal(lock.packages['node_modules/zod'].dev, true);
   assert.equal(manifest.devDependencies['@deepseek-ai/dsh-tools'], '0.2.1-rc.3');
   assert.equal(manifest.devDependencies['@deepseek-ai/dsh-llm'], '0.2.1-rc.3');
-  assert.ok(Object.keys(manifest.dependencies).every(name => !name.startsWith('@deepseek-ai/')));
+  assert.ok(Object.keys(manifest.dependencies ?? {}).every(name => !name.startsWith('@deepseek-ai/')));
   assert.ok(Object.hasOwn(manifest.peerDependencies, '@deepseek-ai/dsh-tools'));
   assert.ok(Object.hasOwn(manifest.peerDependencies, '@deepseek-ai/dsh-llm'));
   assert.ok(manifest.files.includes('!**/node_modules/**'));

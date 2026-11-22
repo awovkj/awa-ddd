@@ -13,7 +13,7 @@ import hashlib
 from .. import engine
 from ..domain.hypothesis import FAMILIES, new_hypothesis
 from ..domain.repository import Repository
-from ..store import canonical
+from ..store import EngineError, canonical
 from .campaign import build_universe
 
 
@@ -89,35 +89,62 @@ def project_legacy(project, *, apply=False, confirm=False):
         "v1_writable": True,
         "v2_access": "shadow_read_only" if not apply else "migrated",
     }
-    projection["projection_sha256"] = hashlib.sha256(canonical(projection).encode()).hexdigest()
+    # Generated hypothesis timestamps are construction metadata, not a new
+    # legacy source generation.  Excluding them makes preview/apply/reapply
+    # idempotent for identical durable v1 facts.
+    projection_identity = {
+        **projection,
+        "hypotheses": [
+            {key: value for key, value in row.items()
+             if key not in {"created_at", "updated_at"}}
+            for row in projection["hypotheses"]
+        ],
+    }
+    projection["projection_sha256"] = hashlib.sha256(
+        canonical(projection_identity).encode()).hexdigest()
     if apply:
         if not confirm:
-            from ..store import EngineError
-            raise EngineError("v2_migration_confirm", "Migration apply requires confirm:true")
-        if repository.list("migration", limit=1)[0]:
-            from ..store import EngineError
-            raise EngineError("v2_migration_exists", "A migration ledger already exists; use rollback before re-applying")
-        ledger = {
-            "id": "MIG-" + projection["projection_sha256"][:24],
-            "schema": 2,
-            "source_schema": "v1",
-            "source_counts": projection["source_counts"],
-            "projection_sha256": projection["projection_sha256"],
-            "synthetic_test_runs": 0,
-            "applied_at": __import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc).isoformat(),
-            "rollback": "config.assessment_model=v1; v2 records remain immutable history",
+            raise EngineError(
+                "v2_migration_confirm", "Migration apply requires confirm:true")
+        ledger_id = "MIG-" + projection["projection_sha256"][:24]
+        with project.transaction():
+            ledger = repository.get(
+                "migration", ledger_id, required=False)
+            reused = ledger is not None
+            writes = 0
+            if ledger is None:
+                ledger = {
+                    "id": ledger_id,
+                    "schema": 2,
+                    "source_schema": "v1",
+                    "source_counts": projection["source_counts"],
+                    "projection_sha256": projection["projection_sha256"],
+                    "synthetic_test_runs": 0,
+                    "applied_at": __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc).isoformat(),
+                    "rollback": "config.assessment_model=v1; v2 records remain immutable history",
+                }
+                repository.add("migration", ledger, immutable=True)
+                writes += 1
+            for hypothesis in projection["hypotheses"]:
+                if repository.get(
+                        "hypothesis", hypothesis["id"], required=False) is None:
+                    repository.add("hypothesis", hypothesis, immutable=False)
+                    writes += 1
+            for evaluation in projection["legacy_evaluations"]:
+                if repository.get(
+                        "legacy_evaluation", evaluation["id"], required=False) is None:
+                    repository.add("legacy_evaluation", evaluation, immutable=True)
+                    writes += 1
+            config = dict(project.config)
+            config["assessment_model"] = "v2"
+            project.set_config(config)
+        return {
+            "ledger": ledger,
+            "projection": _summary(projection),
+            "writes": writes,
+            "reused": reused,
         }
-        repository.add("migration", ledger, immutable=True)
-        for hypothesis in projection["hypotheses"]:
-            if repository.get("hypothesis", hypothesis["id"], required=False) is None:
-                repository.add("hypothesis", hypothesis, immutable=False)
-        for evaluation in projection["legacy_evaluations"]:
-            repository.add("legacy_evaluation", evaluation, immutable=True)
-        config = dict(project.config)
-        config["assessment_model"] = "v2"
-        project.set_config(config)
-        return {"ledger": ledger, "projection": _summary(projection)}
     return {"projection": _summary(projection), "writes": 0}
 
 
@@ -141,8 +168,9 @@ def rollback(project, args):
     ledger_id = args.get("ledger_id")
     repository = Repository(project)
     ledger = repository.get("migration", ledger_id)
-    config = dict(project.config)
-    config["assessment_model"] = "v1"
-    project.set_config(config)
+    with project.transaction():
+        config = dict(project.config)
+        config["assessment_model"] = "v1"
+        project.set_config(config)
     return {"rolled_back_to": "v1", "ledger_id": ledger["id"],
             "v2_history_preserved": True}

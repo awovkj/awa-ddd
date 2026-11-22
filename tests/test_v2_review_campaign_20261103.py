@@ -7,8 +7,19 @@ from unittest.mock import patch
 import v2_fixtures as fx
 from awa_ddd import engine
 from awa_ddd.assessment import evaluate
-from awa_ddd.domain import new_hypothesis, new_review_contract
+from awa_ddd.domain import (
+    new_applicability_receipt,
+    new_hypothesis,
+    new_review_contract,
+)
 from awa_ddd.domain.repository import Repository
+from awa_ddd.domain.receipt import (
+    entity_dependency,
+    evidence_dependencies,
+    scope_dependency,
+    target_build_dependency,
+)
+from awa_ddd.domain.hypothesis import transition
 from awa_ddd.domain.review import validate_cross_role
 from awa_ddd.store import EngineError
 
@@ -97,17 +108,82 @@ class CampaignDeliveryTests(unittest.TestCase):
                                                         "reason": "completed", "explanation": "premature"})
         self.assertEqual("v2_campaign_not_exhausted", caught.exception.code)
 
-    def test_all_not_applicable_or_blocked_never_grants_exhaustion(self):
+    def test_invalid_not_applicable_or_blocked_never_grants_exhaustion(self):
         row = fx.project(self.root)
-        hypotheses = Repository(row).list("hypothesis", limit=None)[0]
+        repository = Repository(row)
+        campaign = repository.get("campaign", self.campaign)
+        universe = repository.get("universe", campaign["universe_id"])
+        hypotheses = repository.list_campaign(
+            "hypothesis", self.campaign, limit=None)[0]
+        operation = next(
+            item for item in row.list("operation")
+            if item.get("method") == "GET")
+        with patch(
+                "awa_ddd.engine.request",
+                side_effect=fx.Sequence([{"value": "AWA-NORMAL"}])):
+            evidence = engine.capture(row, {
+                "operation_id": operation["id"],
+                "url": operation["url"] + "?label=not-applicable",
+                "idempotency_key": "applicability-source",
+            })
+        evidence, _artifact = engine.verify_current_evidence(
+            row, evidence["id"])
         for item in hypotheses:
-            item["status"] = "not_applicable"
-            item["applicability_basis"] = {"business_fact": "fixture says no"}
-            Repository(row).save("hypothesis", item)
+            dependencies = [
+                scope_dependency(row),
+                target_build_dependency(row, universe),
+                entity_dependency(
+                    row, "campaign", campaign["id"],
+                    fingerprint_fields=(
+                        "id", "project_id", "target", "objective", "model",
+                        "scope_snapshot", "exclude_snapshot", "scope_epoch",
+                        "max_rounds", "allow_mutation")),
+                entity_dependency(
+                    row, "universe", universe["id"],
+                    fingerprint_fields=("id", "snapshot_hash", "scope_epoch")),
+                entity_dependency(
+                    row, "hypothesis", item["id"],
+                    fingerprint_fields=(
+                        "id", "campaign_id", "universe_id",
+                        "mechanism_key", "identity_hash")),
+                *evidence_dependencies(row, [evidence["id"]]),
+            ]
+            receipt = new_applicability_receipt(
+                campaign_id=campaign["id"],
+                hypothesis_id=item["id"],
+                security_property=item["security_property"],
+                input_key=item.get("input_key"),
+                input_branch={},
+                predicate={
+                    "operator": "equals",
+                    "subject": "declared_consumer_family",
+                    "expected": "not-present",
+                },
+                verifier={
+                    "type": "fixture_assertion",
+                    "id": "NA-FIXTURE-1",
+                    "version": "1",
+                },
+                evidence_ids=[evidence["id"]],
+                digests={evidence["id"]: evidence["sha256"]},
+                reviewer={
+                    "type": "human_independent",
+                    "id": "reviewer-1",
+                    "source": "test",
+                },
+                dependencies=dependencies,
+                reason="The fixture proves the tested mechanism is absent.",
+                decision="proposed",
+            )
+            repository.add(
+                "applicability_receipt", receipt, immutable=True)
+            item["applicability_receipt_id"] = receipt["id"]
+            transition(item, "not_applicable", reason=receipt["reason"])
+            repository.save("hypothesis", item)
         row.close()
         matrix = fx.dispatch(self.root, "report.matrix", {"project_id": "v2", "campaign_id": self.campaign})
         self.assertFalse(matrix["delivery"]["exhausted_authority"])
-        self.assertEqual(0, matrix["dimensions"]["hypothesis"]["denominator"])
+        self.assertEqual(1, matrix["dimensions"]["hypothesis"]["denominator"])
 
     def test_report_matrix_lists_12_families_and_denominators(self):
         result = fx.dispatch(self.root, "report.matrix", {"project_id": "v2", "campaign_id": self.campaign})

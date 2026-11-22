@@ -1,10 +1,11 @@
 /** Bounded, cancellable argv-only bridge to the packaged Python engine. */
 import { spawn } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { types } from 'node:util';
-import { ALL_ACTIONS as VALID_ACTIONS } from './actions.mjs';
+import { ALL_ACTIONS as VALID_ACTIONS, isReadOnlyAction } from './actions.mjs';
 export { ACTIONS } from './actions.mjs';
 
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -15,6 +16,19 @@ export const MAX_STDERR_BYTES = 64 * 1024;
 export const MAX_JSON_DEPTH = 64;
 export const MAX_JSON_NODES = 100000;
 export const ENGINE_DISPATCH_UNCERTAIN = Symbol('awa-ddd:engine-dispatch-uncertain');
+export const ENGINE_DISPATCH_PHASE = Symbol('awa-ddd:engine-dispatch-phase');
+export const IPC_NONCE_ENV = 'AWA_DDD_REQUEST_NONCE';
+export const TRUSTED_SQLMAP_ENV = 'AWA_DDD_ADMIN_SQLMAP';
+export const TRUSTED_YAK_ENV = 'AWA_DDD_ADMIN_YAK';
+export const BROWSER_TLS_ENV = 'AWA_DDD_ADMIN_BROWSER_IGNORE_HTTPS_ERRORS';
+const PRIVATE_CONFIG_ENVS = Object.freeze({
+  trustedSqlmapPath: TRUSTED_SQLMAP_ENV,
+  trustedYakPath: TRUSTED_YAK_ENV,
+});
+const IPC_SCHEMA = 'awa-ddd-ipc/v1';
+const IPC_PHASES = new Set(['startup', 'accepted', 'dispatch']);
+const HASH = /^[a-f0-9]{64}$/;
+const RUN_ID = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/;
 const LONE_SURROGATE = /\p{Surrogate}/u;
 const QUOTED_VALUE = String.raw`(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')`;
 const COOKIE_ASSIGNMENT = new RegExp(String.raw`\b(?:set[_-]?cookie|(?:anonymous[_-]?)?cookie)["']?\s*[:=]\s*(?:${QUOTED_VALUE}|[^\r\n]+)`, 'gi');
@@ -26,6 +40,20 @@ const CONTINUATION_COUNTS = ['actionable_total', 'ready_total', 'review_total', 
 const CONTINUATION_VERSIONS = ['contract_version', 'stop_policy_version'];
 const CONTINUATION_CODES = ['state', 'reason_code', 'next_action', 'snapshot_id', 'checkpoint_id', 'finalization_id',
   'progress_id', 'semantic_progress_id', 'coverage_status', 'stop_policy'];
+// These facade actions execute scoped captures underneath one accepted request.
+// The dispatch receipt must name the actual wire-level action so an interrupted
+// scenario/test remains discoverable and actionable after the child exits.
+const NESTED_DISPATCH_ACTIONS = Object.freeze({
+  'scenario.run': new Set(['http.capture']),
+  'test.run': new Set(['http.capture']),
+  'test.run_scenario': new Set(['http.capture']),
+  // External providers and the owned browser announce one invocation receipt
+  // before launch and one request-slot receipt immediately before every wire
+  // request. Both receipts retain the outer accepted-request hash.
+  'browser.visit': new Set(['browser.visit']),
+  'tool.sqlmap': new Set(['tool.sqlmap']),
+});
+const MULTI_DISPATCH_ACTIONS = new Set(Object.keys(NESTED_DISPATCH_ACTIONS));
 
 /** Dynamic error prose is data, not a channel for credentials or raw URLs. */
 export function safeErrorText(value, limit = 1600) {
@@ -78,7 +106,8 @@ export function safeErrorDetails(details) {
     const continuation = compactContinuation(safe.continuation, limit);
     if (!continuation || add('continuation', continuation)) break;
   }
-  for (const key of ['next_action', 'checkpoint_action', 'run_id', 'operation_id', 'action', 'field', 'help_action',
+  for (const key of ['next_action', 'checkpoint_action', 'project_id', 'campaign_id', 'recipe_id',
+    'hypothesis_id', 'run_id', 'review_id', 'operation_id', 'action', 'field', 'help_action',
     'resource_id', 'evidence_id', 'obligation_id', 'decision_id', 'finding_id', 'import_id', 'candidate_id']) {
     if (typeof safe[key] === 'string') add(key, safeErrorText(safe[key], 200));
   }
@@ -89,7 +118,8 @@ export function safeErrorDetails(details) {
     framing_issue: ['utf8_bom', 'invalid_multipart'],
     repair: ['rewrite_utf8_without_bom', 'rebuild_exact_multipart'],
     reason_code: ['not_configured', 'backend_mismatch', 'overescaped_path', 'not_absolute', 'file_missing',
-      'wrong_filename', 'invalid_path', 'source_input_mismatch', 'consumption_chain_required'],
+      'wrong_filename', 'invalid_path', 'source_input_mismatch', 'consumption_chain_required',
+      'admin_not_configured', 'untrusted_path', 'sha256_mismatch'],
     execution_backend: ['native', 'wsl'],
     assessment_mode: ['assessment', 'src'],
     required_assessment_mode: ['assessment', 'src'],
@@ -140,6 +170,36 @@ function contained(parent, candidate) {
   return delta === '' || (!isAbsolute(delta) && delta !== '..' && !delta.startsWith(`..${sep}`));
 }
 
+function trustedToolConfig(value, label) {
+  if (value === undefined || value === null || value === '') return Object.freeze({ path: '', sha256: '' });
+  const normalized = typeof value === 'string' ? { path: value, sha256: '' } : value;
+  if (!normalized || typeof normalized !== 'object' || Array.isArray(normalized)
+    || Object.keys(normalized).some(key => !['path', 'sha256'].includes(key))) {
+    throw new BridgeError('INVALID_CONFIG', `${label} must be a path string or {path, sha256} object.`);
+  }
+  const path = normalized.path;
+  const sha256 = normalized.sha256 ?? '';
+  if (path === '' && sha256 === '') return Object.freeze({ path: '', sha256: '' });
+  if (typeof path !== 'string' || !path.trim() || path.length > 4096 || /[\u0000-\u001f\u007f]/.test(path)
+    || typeof sha256 !== 'string' || sha256 && !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new BridgeError('INVALID_CONFIG', `${label} requires a bounded path and an optional lowercase SHA-256 digest.`);
+  }
+  return Object.freeze({ path, sha256 });
+}
+
+export function cleanProcessEnvironment(source = process.env) {
+  const environment = { ...source };
+  const exact = new Set(['NODE_OPTIONS', 'NODE_PATH', 'NODE_EXTRA_CA_CERTS', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+    'DYLD_INSERT_LIBRARIES', 'DYLD_LIBRARY_PATH', 'SSLKEYLOGFILE', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+    'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE']);
+  for (const key of Object.keys(environment)) {
+    const upper = key.toUpperCase();
+    if (exact.has(upper) || upper.startsWith('PYTHON') || upper.startsWith('NPM_CONFIG_')
+      || key.toLowerCase().endsWith('_proxy')) delete environment[key];
+  }
+  return environment;
+}
+
 export function resolveConfig(config = {}) {
   if (config === null || typeof config !== 'object' || Array.isArray(config)) {
     throw new BridgeError('INVALID_CONFIG', 'awa-ddd configuration must be an object.');
@@ -152,6 +212,12 @@ export function resolveConfig(config = {}) {
   const wslPythonExecutable = config.wslPythonExecutable ?? 'python3';
   const assessmentModel = config.assessmentModel ?? 'v1';
   const assessmentMode = config.assessmentMode ?? 'assessment';
+  const trustedSqlmapPath = trustedToolConfig(config.trustedSqlmapPath, 'trustedSqlmapPath');
+  const trustedYakPath = trustedToolConfig(config.trustedYakPath, 'trustedYakPath');
+  const browserIgnoreHTTPSErrors = config.browserIgnoreHTTPSErrors ?? false;
+  const continuationTimeoutMs = config.continuationTimeoutMs ?? 15000;
+  const continuationQueryBudget = config.continuationQueryBudget ?? 32;
+  const continuationProjectQueryBudget = config.continuationProjectQueryBudget ?? 8;
   if (typeof workspace !== 'string' || !isAbsolute(workspace) || workspace.includes('\0')) {
     throw new BridgeError('INVALID_CONFIG', 'workspace must be an absolute local directory.');
   }
@@ -182,8 +248,24 @@ export function resolveConfig(config = {}) {
   if (!['assessment', 'src'].includes(assessmentMode)) {
     throw new BridgeError('INVALID_CONFIG', 'assessmentMode must be assessment or src.');
   }
+  if (typeof browserIgnoreHTTPSErrors !== 'boolean') {
+    throw new BridgeError('INVALID_CONFIG', 'browserIgnoreHTTPSErrors must be a boolean administrator setting.');
+  }
+  if (!Number.isInteger(continuationTimeoutMs) || continuationTimeoutMs < 100 || continuationTimeoutMs > 120000) {
+    throw new BridgeError('INVALID_CONFIG', 'continuationTimeoutMs must be an integer from 100 to 120000.');
+  }
+  if (!Number.isInteger(continuationQueryBudget) || continuationQueryBudget < 1 || continuationQueryBudget > 256) {
+    throw new BridgeError('INVALID_CONFIG', 'continuationQueryBudget must be an integer from 1 to 256.');
+  }
+  if (!Number.isInteger(continuationProjectQueryBudget) || continuationProjectQueryBudget < 1
+    || continuationProjectQueryBudget > 64) {
+    throw new BridgeError('INVALID_CONFIG',
+      'continuationProjectQueryBudget must be an integer from 1 to 64.');
+  }
   return Object.freeze({ workspace: resolve(workspace), pythonExecutable, timeoutMs,
-    executionBackend, wslDistribution, wslPythonExecutable, assessmentModel, assessmentMode });
+    executionBackend, wslDistribution, wslPythonExecutable, assessmentModel, assessmentMode,
+    trustedSqlmapPath, trustedYakPath, browserIgnoreHTTPSErrors,
+    continuationTimeoutMs, continuationQueryBudget, continuationProjectQueryBudget });
 }
 
 /** SRC is a persisted project policy; this transport guard cannot downgrade it. */
@@ -322,6 +404,17 @@ const PRIVATE_KEYS = new Set([
 ]);
 const RAW_KEYS = new Set(['request', 'response', 'body', 'bodypreview', 'bodybase64',
   'requestbody', 'responsebody', 'requestbodybase64', 'responsebodybase64', 'raw', 'rawhttp', 'rawbody']);
+const TSCAN_PRIVATE_KEYS = new Set(['mcpurl', 'artifactpath', 'controlendpoint', 'sourceartifact',
+  'instructions', 'instruction', 'prompt', 'providerprompt']);
+
+function redactTscanLocator(key, value) {
+  const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!TSCAN_PRIVATE_KEYS.has(normalized)) return value;
+  if (['instructions', 'instruction', 'prompt', 'providerprompt'].includes(normalized)) {
+    return '[provider instruction text omitted]';
+  }
+  return '[private provider locator]';
+}
 
 /** Redact the canonical value too: PTC callers can access more than rendered text. */
 export function redactResult(value, depth = 0) {
@@ -339,7 +432,19 @@ export function redactResult(value, depth = 0) {
 
 /** Static help field descriptions are schema text, never captured header/body values. */
 export function redactActionResult(action, value) {
-  const safe = redactResult(value);
+  let safe = redactResult(value);
+  if (typeof action === 'string' && action.startsWith('tool.tscanplus_')) {
+    const visit = node => {
+      if (Array.isArray(node)) return node.map(visit);
+      if (node === null || typeof node !== 'object') return node;
+      const result = Object.create(null);
+      for (const [key, child] of Object.entries(node)) {
+        result[key] = redactTscanLocator(key, visit(child));
+      }
+      return result;
+    };
+    safe = visit(safe);
+  }
   if (action !== 'action.help' || !value || typeof value !== 'object' || Array.isArray(value)
       || !value.fields || typeof value.fields !== 'object' || Array.isArray(value.fields)) return safe;
   const fields = Object.create(null);
@@ -360,14 +465,89 @@ export function redactActionResult(action, value) {
   return safe;
 }
 
+function validIpcAction(value) {
+  return typeof value === 'string' && VALID_ACTIONS.includes(value);
+}
+
+/**
+ * Validate one nonce-scoped Python progress receipt. Unrelated stderr remains
+ * private diagnostics. A malformed line carrying the live nonce fails closed
+ * because accepting it could conceal a false phase or action attribution.
+ */
+function applyIpcReceipt(line, { nonce, action, expectedRequestHash }, state) {
+  let receipt;
+  try {
+    const decoded = new TextDecoder('utf-8', { fatal: true }).decode(line);
+    if (!decoded.trimStart().startsWith('{')) return;
+    receipt = JSON.parse(decoded);
+  } catch {
+    if (line.includes(Buffer.from(nonce, 'ascii'))) {
+      throw new BridgeError('ENGINE_IPC_INVALID', 'Engine emitted a malformed progress receipt.');
+    }
+    return;
+  }
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return;
+  if (receipt.nonce !== nonce) return;
+  const keys = new Set(Object.keys(receipt));
+  for (const key of keys) {
+    if (!['schema', 'nonce', 'phase', 'seq', 'action', 'run_id', 'request_hash', 'dispatch_hash'].includes(key)) {
+      throw new BridgeError('ENGINE_IPC_INVALID', 'Engine emitted an unsupported progress receipt.');
+    }
+  }
+  if (receipt.schema !== IPC_SCHEMA || !IPC_PHASES.has(receipt.phase)
+    || !Number.isSafeInteger(receipt.seq) || receipt.seq !== state.seq + 1) {
+    throw new BridgeError('ENGINE_IPC_INVALID', 'Engine emitted an invalid progress receipt sequence.');
+  }
+  state.seq = receipt.seq;
+  if (receipt.phase === 'startup') {
+    if (state.started || state.accepted || state.dispatches || keys.size !== 4) {
+      throw new BridgeError('ENGINE_IPC_INVALID', 'Engine emitted an invalid startup receipt.');
+    }
+    state.started = true;
+    state.phase = 'started';
+    return;
+  }
+  if (!state.started || !validIpcAction(receipt.action)) {
+    throw new BridgeError('ENGINE_IPC_INVALID', 'Engine progress receipt does not match the requested action.');
+  }
+  if (receipt.phase === 'accepted') {
+    if (state.accepted || state.dispatches || keys.size !== 6
+      || receipt.action !== action
+      || typeof receipt.request_hash !== 'string' || receipt.request_hash !== expectedRequestHash) {
+      throw new BridgeError('ENGINE_IPC_INVALID', 'Engine acceptance receipt does not match the sent request.');
+    }
+    state.accepted = true;
+    state.phase = 'accepted';
+    return;
+  }
+  const allowedDispatchActions = NESTED_DISPATCH_ACTIONS[action] ?? new Set([action]);
+  if (!allowedDispatchActions.has(receipt.action) || !state.accepted || keys.size !== 8
+    || state.dispatches && !MULTI_DISPATCH_ACTIONS.has(action)
+    || typeof receipt.request_hash !== 'string' || receipt.request_hash !== expectedRequestHash
+    || typeof receipt.run_id !== 'string' || !RUN_ID.test(receipt.run_id)
+    || typeof receipt.dispatch_hash !== 'string' || !HASH.test(receipt.dispatch_hash)
+    || state.dispatchKeys.has(`${receipt.action}:${receipt.run_id}:${receipt.dispatch_hash}`)) {
+    throw new BridgeError('ENGINE_IPC_INVALID', 'Engine dispatch receipt is incomplete or inconsistent.');
+  }
+  state.dispatches++;
+  state.dispatchKeys.add(`${receipt.action}:${receipt.run_id}:${receipt.dispatch_hash}`);
+  state.phase = 'dispatched';
+}
+
 /**
  * Spawn only the configured interpreter and fixed module argv. stdin/stdout own
  * the JSON protocol. Cancellation rejects after the owned process has closed.
  */
 export function invokeEngine(config, action, args, { signal, spawnProcess = spawn } = {}) {
   const resolved = resolveConfig(config);
-  const input = validateRequest(action, assessmentArguments(resolved, action, args));
+  const validatedRequest = validateRequest(action, assessmentArguments(resolved, action, args));
+  const request = JSON.parse(validatedRequest);
   if (signal?.aborted) return Promise.reject(new BridgeError('ABORTED_BEFORE_DISPATCH', 'Assessment action was cancelled before execution.'));
+  const wireInput = validatedRequest + '\n';
+  const nonce = randomBytes(32).toString('hex');
+  const expectedRequestHash = createHash('sha256').update(Buffer.from(wireInput, 'utf8')).digest('hex');
+  const ipc = { seq: 0, started: false, accepted: false, dispatches: 0, dispatchKeys: new Set(),
+    phase: 'not_started' };
   return new Promise((fulfill, reject) => {
     let child;
     let timer;
@@ -378,6 +558,7 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     let submitted = false;
     let outputLength = 0;
     let stderrLength = 0;
+    let stderrPending = Buffer.alloc(0);
     const output = [];
 
     const cleanup = () => {
@@ -387,8 +568,12 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     };
     const finish = (error, value, accounted = false) => {
       if (settled) return;
-      if (error && submitted && child?.pid && !accounted) {
-        Object.defineProperty(error, ENGINE_DISPATCH_UNCERTAIN, { value: true });
+      if (error) {
+        Object.defineProperty(error, ENGINE_DISPATCH_PHASE, { value: ipc.phase });
+        if (child?.pid && !accounted && submitted
+          && (ipc.phase === 'dispatched' || !isReadOnlyAction(action, request.args))) {
+          Object.defineProperty(error, ENGINE_DISPATCH_UNCERTAIN, { value: true });
+        }
       }
       settled = true;
       cleanup();
@@ -414,7 +599,7 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
         } else if (process.platform === 'win32') {
           // taskkill receives only the pid of the child created by this call.
           const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'],
-            { shell: false, windowsHide: true, stdio: 'ignore' });
+            { shell: false, windowsHide: true, stdio: 'ignore', env: cleanProcessEnvironment() });
           killer.on('error', forceKill);
           killer.on('close', code => { if (code !== 0) forceKill(); });
         } else {
@@ -434,9 +619,26 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
           '-E', '-s', '-X', 'utf8', '-B', '-m', 'awa_ddd.wsl_runner', '--workspace', resolved.workspace,
           '--deadline-ms', String(resolved.timeoutMs)]
         : ['-E', '-s', '-X', 'utf8', '-B', '-m', 'awa_ddd', '--workspace', resolved.workspace];
+      const environment = cleanProcessEnvironment();
+      environment[IPC_NONCE_ENV] = nonce;
+      for (const [field, variable] of Object.entries(PRIVATE_CONFIG_ENVS)) {
+        const trusted = resolved[field];
+        if (trusted.path) environment[variable] = JSON.stringify(trusted);
+        else delete environment[variable];
+      }
+      if (resolved.browserIgnoreHTTPSErrors) environment[BROWSER_TLS_ENV] = '1';
+      else delete environment[BROWSER_TLS_ENV];
+      if (wsl) {
+        // Never inherit arbitrary WSLENV translations: only private settings
+        // reviewed by this bridge cross the Windows/Linux boundary.
+        environment.WSLENV = [IPC_NONCE_ENV,
+          ...Object.values(PRIVATE_CONFIG_ENVS).filter(variable => environment[variable]),
+          ...(environment[BROWSER_TLS_ENV] ? [BROWSER_TLS_ENV] : [])]
+          .map(variable => `${variable}/u`).join(':');
+      }
       child = spawnProcess(executable, argv,
         { cwd: PACKAGE_ROOT, shell: false, windowsHide: true,
-          detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] });
+          detached: process.platform !== 'win32', env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch {
       finish(new BridgeError('PYTHON_START_FAILED', 'Could not start the configured Python executable.'));
       return;
@@ -454,6 +656,20 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     child.stderr.on('data', chunk => {
       stderrLength += chunk.length;
       if (stderrLength > MAX_STDERR_BYTES) stop('DIAGNOSTICS_TOO_LARGE', 'Engine diagnostics exceeded their limit. Diagnostic contents were not published.');
+      if (failure) return;
+      stderrPending = Buffer.concat([stderrPending, chunk]);
+      let newline;
+      while ((newline = stderrPending.indexOf(0x0a)) >= 0) {
+        const line = stderrPending.subarray(0, newline);
+        stderrPending = stderrPending.subarray(newline + 1);
+        try {
+          applyIpcReceipt(line, { nonce, action, expectedRequestHash }, ipc);
+        } catch (error) {
+          stop(error.code ?? 'ENGINE_IPC_INVALID',
+            'Engine emitted an invalid nonce-scoped progress receipt; its dispatch state is not trusted.');
+          break;
+        }
+      }
     });
     child.on('close', (code, killedBySignal) => {
       if (failure) { finish(failure); return; }
@@ -473,7 +689,12 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
         if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$/.test(error.code)) {
           finish(new BridgeError('INVALID_RESPONSE', 'Engine returned an invalid error code.')); return;
         }
-        try { finish(new BridgeError(error.code, error.message, error.details), undefined, error.code !== 'engine_error'); }
+        try {
+          // A structured backend error is not proof that a prior wire dispatch
+          // had no effect. Preserve the bridge's independent uncertainty fact.
+          finish(new BridgeError(error.code, error.message, error.details), undefined,
+            ipc.phase !== 'dispatched');
+        }
         catch (invalid) { finish(new BridgeError('INVALID_RESPONSE', 'Engine returned invalid recovery metadata.')); }
         return;
       }
@@ -490,8 +711,8 @@ export function invokeEngine(config, action, args, { signal, spawnProcess = spaw
     if (!failure) {
       submitted = true;
       try {
-        if (resolved.executionBackend === 'wsl') child.stdin.write(input + '\n', 'utf8');
-        else child.stdin.end(input + '\n', 'utf8');
+        if (resolved.executionBackend === 'wsl') child.stdin.write(wireInput, 'utf8');
+        else child.stdin.end(wireInput, 'utf8');
       } catch { stop('ENGINE_IO_ERROR', 'The engine did not establish a complete request outcome; inspect its persisted state before any retry.'); }
     } else if (resolved.executionBackend !== 'wsl') child.stdin.destroy();
   });

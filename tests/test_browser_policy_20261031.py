@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from awa_ddd import browser, browser_policy, engine, workflow
 from awa_ddd.store import Project
+from awa_test_support import record_observation
 import test_analyst_binding_20261030 as runtime_fixtures
 
 
@@ -215,6 +216,47 @@ class BrowserPolicyTests(unittest.TestCase):
                     entry=operation["inputs"][0], linked_pages=context.linked_pages(operation)))
                 self.assert_policy(policy, expected)
 
+    def test_page_link_index_preserves_scope_method_query_identity_and_page_order(self):
+        operation = self.operation()
+        exact = {**operation, "url": operation["url"] + "?view=exact"}
+        context = browser_policy.Context(self.project)
+        context.pages = [
+            {"id": "PG-id", "url": self.base + "/ui-id", "functions": [
+                {"apis": [{"operation_id": operation["id"]}]}]},
+            {"id": "PG-query", "url": self.base + "/ui-query", "functions": [
+                {"apis": [exact["url"]]}]},
+            {"id": "PG-excluded", "url": self.base + "/excluded/page", "functions": [
+                {"apis": [{"operation_id": operation["id"]}, operation["url"]]}]},
+            {"id": "PG-method", "url": self.base + "/ui-method", "functions": [
+                {"apis": [{"url": operation["url"], "method": "POST"}]}]},
+            {"id": "PG-direct", "url": operation["url"], "functions": []},
+        ]
+        with patch.object(browser_policy, "require_scope", wraps=browser_policy.require_scope) as scoped:
+            self.assertEqual(["PG-id", "PG-direct"], [row["id"] for row in context.linked_pages(operation)])
+            self.assertEqual(["PG-id", "PG-query"], [row["id"] for row in context.linked_pages(exact)])
+            self.assertEqual(["PG-id", "PG-method", "PG-direct"], [row["id"] for row in
+                context.linked_pages({**operation, "method": "POST"})])
+            for index in range(80):
+                context.linked_pages({**operation, "id": "OP-unlinked-" + str(index),
+                                      "url": self.base + "/other/" + str(index)})
+        self.assertEqual(len(context.pages), scoped.call_count)
+
+    def test_replacing_growing_or_truncating_pages_rebuilds_links(self):
+        operation = self.operation()
+        context = browser_policy.Context(self.project)
+        self.assertEqual([], context.linked_pages(operation))
+        first = {"id": "PG-first", "url": operation["url"], "functions": []}
+        second = {"id": "PG-second", "url": self.base + "/ui", "functions": [
+            {"apis": [{"operation_id": operation["id"]}]}]}
+        context.pages = [first]
+        self.assertEqual([first], context.linked_pages(operation))
+        context.pages.append(second)
+        self.assertEqual([first, second], context.linked_pages(operation))
+        context.pages.pop(0)
+        self.assertEqual([second], context.linked_pages(operation))
+        context.pages = []
+        self.assertEqual([], context.linked_pages(operation))
+
     def test_same_input_sql_and_xss_work_items_have_independent_browser_policies(self):
         operation = self.operation(consumer="sql_like", inputs=[{"name": "q", "location": "query", "consumer": "sql_like",
             "test_families": ["sql_injection", "xss"]}])
@@ -310,7 +352,7 @@ class BrowserPolicyTests(unittest.TestCase):
         linked = self.linked_page(operation)
         raw = {"url": linked["url"], "finalUrl": linked["url"], "status": 200, "signals": {"forms": 1},
                "network": [{"url": linked["url"], "method": "GET", "type": "document", "status": 200, "request_headers": {}}]}
-        browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
+        record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
         row = self.work_row(self.planned(limit=25), operation, "generic")
         self.assert_handoff(row["browser_testing"], "required")
         self.assertFalse(row["browser_testing"]["native_supported"])

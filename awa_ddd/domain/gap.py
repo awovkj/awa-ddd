@@ -9,15 +9,25 @@ NEXT_ACTIONS = {"recon.snapshot", "recon.import", "recon.routes", "recon.capabil
                 "review.disposition", "test.run", "campaign.next", "preparation"}
 
 
-def new_gap(*, kind, scope, reason, next_action, detail=None, hypothesis_id=None):
+def new_gap(*, kind, scope, reason, next_action, detail=None, hypothesis_id=None,
+            campaign_id=None, universe_id=None):
     enum(kind, "gap_kind", KINDS)
     text(scope, "gap_scope", maximum=512)
     text(reason, "gap_reason", maximum=1024)
     enum(next_action, "gap_next_action", NEXT_ACTIONS)
-    identity = {"kind": kind, "scope": scope, "reason": reason, "hypothesis": hypothesis_id}
+    identity = {
+        "campaign_id": campaign_id,
+        "universe_id": universe_id,
+        "kind": kind,
+        "scope": scope,
+        "reason": reason,
+        "hypothesis": hypothesis_id,
+    }
     return {
         "id": stable_id("GAP", identity),
         "schema": 2,
+        "campaign_id": optional_text(campaign_id, "campaign_id", maximum=128),
+        "universe_id": optional_text(universe_id, "universe_id", maximum=128),
         "kind": kind,
         "scope": scope,
         "reason": reason,

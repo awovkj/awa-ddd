@@ -1,0 +1,13 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+include awa_ddd/resources/__init__.py
+include awa_ddd/resources/js_parser/manifest.json
+include awa_ddd/resources/js_parser/parse-js.mjs
+include awa_ddd/resources/js_parser/vendor/acorn/LICENSE
+include awa_ddd/resources/js_parser/vendor/acorn/package.json
+include awa_ddd/resources/js_parser/vendor/acorn/dist/acorn.mjs
+prune tests
+recursive-exclude awa_ddd tests_*.py
+global-exclude *.py[cod]

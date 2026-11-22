@@ -99,8 +99,11 @@ def machine_proof(*, current_findings, machine_confirmed):
 
 
 def delivery(*, exhausted, partial_accepted, remaining):
+    # A partial acceptance is final for its own immutable delivery record, but
+    # it can never borrow the exhaustion authority of the current work state.
+    exhausted = bool(exhausted and not partial_accepted)
     return {
-        "exhausted_authority": bool(exhausted),
+        "exhausted_authority": exhausted,
         "delivery_status": "completed" if exhausted else "partial_accepted" if partial_accepted else "in_progress",
         "remaining": list(remaining),
         "computed_by": "engine",

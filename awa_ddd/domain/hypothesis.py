@@ -7,7 +7,8 @@ build``.  A statement may change wording without creating a second task.
 """
 from __future__ import annotations
 
-from .common import digest, enum, mapping, optional_text, sequence, stable_id, string_list, text, utc_now
+from .common import digest, enum, mapping, optional_text, stable_id, string_list, text, utc_now
+from .taxonomy import FAMILIES, require_family
 
 STATUSES = {"unplanned", "ready", "running", "supported", "refuted", "inconclusive", "blocked", "not_applicable"}
 TERMINAL = {"supported", "refuted", "inconclusive", "not_applicable"}
@@ -21,9 +22,6 @@ TRANSITIONS = {
     "refuted": {"ready"},
     "not_applicable": {"ready"},
 }
-FAMILIES = ("access_control", "sql_injection", "xss", "ssrf", "xxe", "path_traversal",
-            "command_injection", "template_injection", "deserialization", "file_upload",
-            "business_logic", "generic")
 SOURCE_KINDS = {"known_case", "declared_family", "field_semantics", "access_policy",
                 "page_function", "imported_hint", "legacy_obligation", "manual"}
 MISSING_CONTEXT = {
@@ -35,6 +33,7 @@ MISSING_CONTEXT = {
     "replay_semantics", "state_readback", "token_issuance_context", "lifecycle_policy",
     "required_factor_policy", "retry_window_policy", "exact_authorized_url", "current_http_observation",
     "normal_business_assertion", "property_specific_controls", "scope_epoch", "target_build",
+    "authorized_test_account",
 }
 
 
@@ -55,8 +54,9 @@ def identity(**kwargs):
 def new_hypothesis(*, family, security_property, operation_id, input_key=None, relation=None,
                    business_precondition=None, scope_epoch, target_build, source_kind,
                    protocol="http", statement, label=None, source_ref=None, priority=None,
-                   missing_context=None, status="unplanned", known_case_id=None):
-    enum(family, "hypothesis_family", set(FAMILIES))
+                   missing_context=None, status="unplanned", known_case_id=None,
+                   campaign_id=None, universe_id=None):
+    family = require_family(family, error_prefix="hypothesis_family")
     enum(source_kind, "hypothesis_source", SOURCE_KINDS)
     enum(status, "hypothesis_status", STATUSES)
     security_property = text(security_property, "security_property", maximum=128)
@@ -68,9 +68,19 @@ def new_hypothesis(*, family, security_property, operation_id, input_key=None, r
         input_key=input_key, relation=relation_row,
         business_precondition=business_precondition, scope_epoch=scope_epoch,
         target_build=target_build, source_kind=source_kind, protocol=protocol)
-    hypothesis_id = stable_id("HYP", identity_row)
+    mechanism_key = stable_id("MECH", identity_row)
+    instance_identity = {
+        "mechanism_key": mechanism_key,
+        "campaign_id": optional_text(campaign_id, "campaign_id", maximum=128),
+        "universe_id": optional_text(universe_id, "universe_id", maximum=128),
+    }
+    hypothesis_id = stable_id("HYP", instance_identity)
     return {
         "id": hypothesis_id,
+        "campaign_id": instance_identity["campaign_id"],
+        "universe_id": instance_identity["universe_id"],
+        "mechanism_key": mechanism_key,
+        "instance_identity": instance_identity,
         "identity": identity_row,
         "identity_hash": digest(identity_row),
         "family": family,
@@ -118,9 +128,10 @@ def transition(hypothesis, status, *, reason=None, missing_context=None):
     if status not in TRANSITIONS.get(current, set()):
         from .common import fail
         fail("v2_hypothesis_transition", f"Hypothesis cannot move from {current} to {status}")
-    if status == "not_applicable" and not hypothesis.get("applicability_basis"):
+    if status == "not_applicable" and not hypothesis.get("applicability_receipt_id"):
         from .common import fail
-        fail("v2_hypothesis_applicability", "not_applicable requires a business-fact applicability basis")
+        fail("v2_hypothesis_applicability",
+             "not_applicable requires an accepted, current ApplicabilityReceipt")
     hypothesis["status"] = status
     hypothesis["state_reason"] = optional_text(reason, "state_reason")
     if missing_context is not None:
@@ -165,8 +176,10 @@ def requires_preparation(hypothesis):
 def public_view(hypothesis):
     return {
         key: hypothesis.get(key) for key in (
-            "id", "family", "security_property", "operation_id", "input_key", "input_id", "protocol",
+            "id", "campaign_id", "universe_id", "mechanism_key", "identity_hash",
+            "family", "security_property", "operation_id", "input_key", "input_id", "protocol",
             "relation", "business_precondition", "source_kind", "source_ref", "known_case_id",
             "statement", "label", "status", "state_reason", "missing_context", "attempt",
-            "recipe_ids", "run_ids", "finding_ids", "revision", "superseded")
+            "applicability_receipt_id", "recipe_ids", "run_ids", "finding_ids", "revision",
+            "superseded")
     }

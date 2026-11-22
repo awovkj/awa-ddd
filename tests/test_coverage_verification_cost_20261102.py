@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from awa_ddd import completeness, engine, workflow
+from awa_ddd import completeness, continuation, engine, workflow
 from awa_ddd.store import Project, now
 
 
@@ -52,6 +52,33 @@ class CoverageVerificationCostTests(unittest.TestCase):
         self.assertEqual(3, len(inventory["observations"]))
         self.assertEqual(["GET"], evaluated["method_coverage"][0]["observed_methods"])
         self.assertEqual([], evaluated["method_coverage"][0]["tested"])
+
+    def test_inventory_reuses_evaluator_records_and_groups_current_run_states_once(self):
+        operation = self.operation()
+        engine.build_plan(self.project)
+        self.capture(operation)
+        with patch.object(self.project, "list", wraps=self.project.list) as listed:
+            evaluated, inventory = completeness.evaluate_with_inventory(self.project)
+        self.assertEqual(1, len(inventory["operations"]))
+        self.assertEqual(1, evaluated["operations"])
+        # Continuation also reads its independent material snapshot. Inventory
+        # and method coverage reuse the evaluator's already validated records.
+        self.assertEqual(2, sum(call.args == ("operation",) for call in listed.call_args_list))
+        self.assertEqual(2, sum(call.args == ("obligation",) for call in listed.call_args_list))
+        self.assertEqual(2, sum(call.args == ("run",) for call in listed.call_args_list))
+
+    def test_continuation_material_checks_measure_bytes_and_recheck_the_next_call(self):
+        evidence = self.capture(self.operation())
+        path = self.project.base / evidence["artifact_path"]
+        before = self.project.metrics["material_bytes_hashed"]
+        original = continuation._material(self.project, evidence)
+        self.assertEqual(evidence["sha256"], original[0]["actual"])
+        self.assertEqual(path.stat().st_size, self.project.metrics["material_bytes_hashed"] - before)
+        before = self.project.metrics["material_bytes_hashed"]
+        path.write_bytes(b"{}")
+        changed = continuation._material(self.project, evidence)
+        self.assertNotEqual(evidence["sha256"], changed[0]["actual"])
+        self.assertEqual(2, self.project.metrics["material_bytes_hashed"] - before)
 
     def test_next_call_rechecks_bytes_and_does_not_cache_current_observations(self):
         operation = self.operation()

@@ -75,9 +75,21 @@ def decode_console(raw):
         raise EngineError("runtime_encoding", "Console output is not valid " + encoding + "; no replacement decoding was applied") from exc
 
 
+def _host_platform():
+    return os.name, sys.platform
+
+
 def _is_wsl():
-    release = platform.release().lower()
-    return os.name == "posix" and platform.system() == "Linux" and ("microsoft" in release or "wsl" in release)
+    host_os, sys_platform = _host_platform()
+    if host_os != "posix" or sys_platform != "linux":
+        return False
+    if platform.system() != "Linux":
+        return False
+    release = platform.release()
+    if not isinstance(release, str):
+        return False
+    release = release.lower()
+    return "microsoft" in release or "wsl" in release
 
 
 def execution_backend():
@@ -187,6 +199,33 @@ def _process_options():
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
 
 
+_UNSAFE_ENVIRONMENT = frozenset({
+    "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "SSLKEYLOGFILE", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+})
+
+
+def clean_environment(overrides=None):
+    """Return a subprocess environment without interpreter/proxy injection.
+
+    The bridge's nonce and administrator-only tool settings are deliberately
+    retained: nested guards need the former, and executable verification needs
+    the latter. Python isolation flags and module search use the package cwd,
+    never an inherited PYTHONPATH.
+    """
+    environment = os.environ.copy()
+    for key in list(environment):
+        upper = key.upper()
+        lower = key.lower()
+        if upper in _UNSAFE_ENVIRONMENT or upper.startswith("PYTHON") \
+                or upper.startswith("NPM_CONFIG_") or lower.endswith("_proxy"):
+            environment.pop(key, None)
+    if overrides is not None:
+        environment.update(overrides)
+    return environment
+
+
 def translate_path(value):
     if not isinstance(value, str):
         raise EngineError("runtime_path", "A filesystem path must be a string")
@@ -197,7 +236,7 @@ def translate_path(value):
     try:
         completed = subprocess.run(["wslpath", "-a", "-u", value], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5,
-                                   check=False, shell=False)
+                                   check=False, shell=False, env=clean_environment())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise EngineError("runtime_path", "WSL could not translate this Windows filesystem path; no path was rewritten") from exc
     if completed.returncode != 0 or len(completed.stdout) > MAX_CONSOLE_BYTES or len(completed.stderr) > MAX_CONSOLE_BYTES:
@@ -233,7 +272,16 @@ def translate_request_paths(action, args):
 
 
 def _native_metadata():
-    return {"available": True, "os": platform.system(), "kernel": platform.release(),
+    host_os, sys_platform = _host_platform()
+    if host_os == "nt" or sys_platform.startswith("win"):
+        version = sys.getwindowsversion()
+        os_name = "Windows"
+        kernel = f"{version.major}.{version.minor}.{version.build}"
+    else:
+        uname = os.uname()
+        os_name = uname.sysname
+        kernel = uname.release
+    return {"available": True, "os": os_name, "kernel": kernel,
             "python_version": platform.python_version(), "python_executable": sys.executable,
             "encodings": {"stdin": sys.stdin.encoding, "stdout": sys.stdout.encoding,
                           "stderr": sys.stderr.encoding, "filesystem": sys.getfilesystemencoding(),
@@ -245,7 +293,7 @@ def _native_metadata():
 def _run_console(command, timeout):
     completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, timeout=timeout, check=False, shell=False,
-                               **_process_options())
+                               env=clean_environment(), **_process_options())
     if len(completed.stdout) > MAX_CONSOLE_BYTES or len(completed.stderr) > MAX_CONSOLE_BYTES:
         raise EngineError("runtime_output_budget", "Runtime probe output exceeded 64 KiB")
     return completed
@@ -334,7 +382,9 @@ def probe(args):
     timeout = args.get("timeout", 15)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 30:
         raise EngineError("runtime_timeout", "Runtime timeout must be 1..30 seconds")
+    from .fingerprint import loaded_identity
     result = {"backend": backend, "execution_backend": execution_backend(), "target_traffic_sent": False,
+              "runtime_identity": loaded_identity(),
               "verification_level": "runtime_metadata", "configuration_hint": {"executionBackend": "native"},
               "sqlmap_candidates": [],
               "warnings": [

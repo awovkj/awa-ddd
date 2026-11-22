@@ -86,28 +86,59 @@ class Context:
         self.project, self.pages = project, project.list("page")
         self.visits = project.list("page_visit")[-20:]
         self._verified, self._proofs, self._links, self._captures = {}, {}, {}, {}
+        self._url_links, self._id_links, self._method_links = {}, {}, {}
+        self._page_links_source = None
 
-    def linked_pages(self, operation):
-        if operation["id"] in self._links:
-            return self._links[operation["id"]]
-        pages = []
-        for page in self.pages:
+    def _ensure_page_links(self):
+        source = self._page_links_source
+        if source is not None and source[0] is self.pages and source[1] == len(self.pages):
+            return
+        self._url_links, self._id_links, self._method_links = {}, {}, {}
+        self._links.clear()
+        config = self.project.config
+        for index, page in enumerate(self.pages):
             try:
-                require_scope(self.project.config, page["url"])
-            except (EngineError, KeyError):
+                page_url = require_scope(config, page["url"])
+            except (EngineError, KeyError, ValueError, TypeError):
                 continue
-            related = _same_url(page["url"], operation["url"])
+            self._url_links.setdefault(page_url, set()).add(index)
             for function in page.get("functions", []):
                 for reference in function.get("apis", []):
                     if isinstance(reference, str):
-                        related |= reference == operation["id"] or _same_url(reference, operation["url"])
+                        self._id_links.setdefault(reference, set()).add(index)
+                        url, method = reference, None
                     elif isinstance(reference, dict):
-                        related |= reference.get("operation_id") == operation["id"] or (
-                            _same_url(reference.get("url"), operation["url"])
-                            and (reference.get("method") is None or reference["method"] == operation["method"]))
-            if related:
-                pages.append(page)
-        self._links[operation["id"]] = pages
+                        identity = reference.get("operation_id")
+                        if isinstance(identity, str):
+                            self._id_links.setdefault(identity, set()).add(index)
+                        url, method = reference.get("url"), reference.get("method")
+                    else:
+                        continue
+                    try:
+                        url = normalize_url(url)
+                    except (EngineError, ValueError, TypeError):
+                        continue
+                    if method is None:
+                        self._url_links.setdefault(url, set()).add(index)
+                    elif isinstance(method, str):
+                        self._method_links.setdefault((url, method), set()).add(index)
+        self._page_links_source = (self.pages, len(self.pages))
+
+    def linked_pages(self, operation):
+        self._ensure_page_links()
+        key = (operation["id"], operation["url"], operation["method"])
+        if key in self._links:
+            return self._links[key]
+        indices = set(self._id_links.get(operation["id"], ()))
+        try:
+            url = normalize_url(operation["url"])
+        except (EngineError, ValueError, TypeError):
+            pass
+        else:
+            indices.update(self._url_links.get(url, ()))
+            indices.update(self._method_links.get((url, operation["method"]), ()))
+        pages = [self.pages[index] for index in sorted(indices)]
+        self._links[key] = pages
         return pages
 
     def verified_visit(self, visit, target):

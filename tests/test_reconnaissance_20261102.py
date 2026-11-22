@@ -141,6 +141,29 @@ class ReconnaissanceTests(unittest.TestCase):
         self.assertNotIn("fixture-query-secret", canonical(records))
         self.assertNotIn("fixture-field-secret", canonical(records))
 
+    def test_warm_profile_uses_sql_material_metadata_without_hydrating_history(self):
+        operation = self.operation()
+        evidence = self.capture(operation)
+        page = self.page()
+        visit = self.visit(page)
+        browser.mark(self.project, {"page_id": page["id"], "target": "page", "status": "visited",
+                                    "page_visit_id": visit["id"]})
+        self.aggregate("overview")
+        self.project.metrics["artifact_stats"] = 0
+        with patch.object(self.project, "list", side_effect=AssertionError("historical entity hydration")):
+            reused = profile(self.project, {"mode": "aggregate", "section": "overview"})
+        self.assert_nonproof(reused)
+        self.assertIs(reused["projection_reused"], True)
+        self.assertEqual(2, self.project.metrics["artifact_stats"])
+
+        artifact = self.project.base / evidence["artifact_path"]
+        artifact.write_bytes(artifact.read_bytes() + b" ")
+        self.assertTrue((self.project.base / visit["artifact_path"]).is_file())
+        self.project.metrics["artifact_stats"] = 0
+        changed = profile(self.project, {"mode": "aggregate", "section": "overview", "refresh": True})
+        self.assertIs(changed["projection_reused"], False)
+        self.assertEqual(2, self.project.metrics["artifact_stats"])
+
     def test_framework_server_and_ui_markers_remain_source_bound_hints(self):
         operation = self.operation()
         evidence = self.capture(operation)

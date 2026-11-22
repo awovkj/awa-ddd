@@ -17,9 +17,13 @@ from urllib.parse import parse_qsl, urlsplit
 from . import __version__
 from .store import EngineError, canonical, contained, now
 from .scope import bind_operation, require_scope, normalize_url, origin
+from .runtime import clean_environment
 
 
 MAX_LOG_BYTES = 8 * 1024 * 1024
+MAX_MCP_LINE_BYTES = 1024 * 1024
+TRUSTED_SQLMAP_ENV = "AWA_DDD_ADMIN_SQLMAP"
+TRUSTED_YAK_ENV = "AWA_DDD_ADMIN_YAK"
 SQLITE_DATABASE_QUERY = "SELECT name FROM pragma_database_list ORDER BY seq LIMIT 1"
 
 
@@ -28,6 +32,35 @@ def _timeout(args, default=30):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 5 <= value <= 120:
         raise EngineError("tool_timeout", "Tool timeout must be 5..120 seconds")
     return float(value)
+
+
+def _trusted_tool(name):
+    variable = TRUSTED_SQLMAP_ENV if name == "sqlmap_path" else TRUSTED_YAK_ENV
+    raw = os.environ.get(variable)
+    if raw is None:
+        return None
+    try:
+        if len(raw) > 8192:
+            raise ValueError("trusted tool setting is too large")
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) - {"path", "sha256"}:
+            raise ValueError("trusted tool setting has unsupported fields")
+        path, digest = value.get("path"), value.get("sha256", "")
+        if not isinstance(path, str) or not path or len(path) > 4096 \
+                or not isinstance(digest, str) or digest and not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise ValueError("trusted tool setting is invalid")
+        return {"path": path, "sha256": digest}
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise EngineError("tool_path", "The administrator tool-path setting is malformed",
+                          {"reason_code": "admin_not_configured", "path_field": name}) from exc
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _executable(value, name, *, configured=False, configured_backend=None):
@@ -44,6 +77,24 @@ def _executable(value, name, *, configured=False, configured_backend=None):
         if path is not None and (name == "sqlmap_path" and path.name.lower() != "sqlmap.py"
                                  or name == "yak_path" and path.name.lower() not in {"yak", "yak.exe"}):
             reason = "wrong_filename"
+    if reason is None:
+        trusted = _trusted_tool(name)
+        if trusted is None:
+            reason = "admin_not_configured"
+        else:
+            try:
+                trusted_path = Path(trusted["path"]).resolve()
+                same_path = os.path.normcase(str(trusted_path)) == os.path.normcase(str(path))
+            except (OSError, ValueError, RuntimeError):
+                same_path = False
+            if not same_path:
+                reason = "untrusted_path"
+            elif trusted["sha256"]:
+                try:
+                    if _file_sha256(path) != trusted["sha256"]:
+                        reason = "sha256_mismatch"
+                except OSError:
+                    reason = "file_missing"
     if reason:
         messages = {
             "not_configured": "No local executable path is configured; inspect runtime.probe and explicitly probe an existing path for this backend.",
@@ -53,6 +104,9 @@ def _executable(value, name, *, configured=False, configured_backend=None):
             "file_missing": "The selected local executable file does not exist; this does not establish that the tool is absent from every installation location.",
             "wrong_filename": "The executable path must identify sqlmap.py or the Yak engine filename required by this adapter.",
             "invalid_path": "The executable path must be a bounded string without surrounding whitespace or control characters.",
+            "admin_not_configured": "The host administrator must configure the exact trusted tool path before this adapter can run.",
+            "untrusted_path": "The selected file does not match the administrator's trusted tool path; a same-named model-selected file is not accepted.",
+            "sha256_mismatch": "The selected tool no longer matches the administrator's configured SHA-256 digest.",
         }
         raise EngineError("tool_path", messages[reason],
                           {"reason_code": reason, "execution_backend": backend, "path_field": name,
@@ -79,7 +133,8 @@ def _kill(process):
         return
     if os.name == "nt":
         subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **_process_options())
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       env=clean_environment(), **_process_options())
     else:
         process.kill()
     try:
@@ -230,6 +285,57 @@ def _finish(project, run, document, files=()):
     return {**run, "run_id": run["id"], "trust": "tool_output", "finding_status": "unverified"}
 
 
+def _target_dispatch(project, run, *, action, request_spec, effect="read_only",
+                     budget=None, max_requests=1, max_writes=None,
+                     budget_unit="request"):
+    """Persist and announce a target dispatch immediately before execution."""
+    from . import execution_coordinator as coordinator
+    request_hash = hashlib.sha256(canonical(request_spec).encode("utf-8")).hexdigest()
+    lease = coordinator.claim(project, action + ":" + run["id"])
+    try:
+        receipt = coordinator.dispatch(
+            project, lease, action=action, run_id=run["id"],
+            request_hash=request_hash, effect=effect,
+            budget=budget, max_requests=max_requests,
+            max_writes=int(effect != "read_only") if max_writes is None else max_writes,
+            budget_unit=budget_unit)
+    except Exception:
+        # No remote request has happened at this point. A pre-dispatch failure
+        # releases the local claim; an IPC failure after the durable marker uses
+        # the conservative unresolved path and leaves the lease in place.
+        try:
+            coordinator.release(project, lease)
+        except EngineError as release_error:
+            if release_error.code != "execution_effect_unknown":
+                raise
+        raise
+    run.update(
+        dispatch_attempted=True,
+        dispatch_id=receipt["id"],
+        dispatch_run_id=receipt["run_id"],
+        lease_fence=receipt["fence"],
+        dispatch_effect=receipt["effect"],
+        dispatch_budget_name=receipt["budget_name"],
+        dispatch_budget_unit=receipt["budget_unit"],
+        dispatch_requests=receipt["requests"],
+        dispatch_writes=receipt["writes"],
+    )
+    project.put("run", run)
+    return lease, receipt
+
+
+def _release_terminal(project, run, lease):
+    """Release a dispatched lease only after its successful artifact is durable."""
+    from . import execution_coordinator as coordinator
+    if lease is None:
+        return
+    if run.get("status") != "succeeded" or run.get("target_traffic_sent") is not True:
+        return
+    coordinator.release(project, lease, reconciled=True)
+    run.update(lease_reconciled=True, lease_reconciliation="terminal_success")
+    project.put("run", run)
+
+
 class MCPClient:
     """A real JSON-RPC stdio MCP connection to the locally selected Yak engine."""
     def __init__(self, yak_path, timeout=30, runtime_dir=None):
@@ -239,37 +345,67 @@ class MCPClient:
         self.exchanges = []
         self.noise = []
         self.queue = queue.Queue()
-        environment = os.environ.copy()
+        environment = clean_environment({"NO_PROXY": "*"})
         if runtime_dir:
             environment["YAKIT_HOME"] = str(runtime_dir)
             environment["YAKIT_BASE_DIR"] = str(runtime_dir)
         self.process = subprocess.Popen([str(yak_path), "mcp", "--transport", "stdio", "--tool", "http_fuzzer,httpflow,codec"],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                        text=False, bufsize=65536,
                                         env=environment, **_process_options())
         self._bytes = 0
+        self._reader_error = False
         self._lock = threading.Lock()
         threading.Thread(target=self._read, args=(self.process.stdout, True), daemon=True).start()
         threading.Thread(target=self._read, args=(self.process.stderr, False), daemon=True).start()
 
     def _read(self, stream, protocol):
-        try:
-            for line in stream:
-                with self._lock:
-                    self._bytes += len(line.encode("utf-8"))
-                    if self._bytes > MAX_LOG_BYTES:
-                        self.queue.put(EngineError("tool_output_budget", "MCP output exceeded its budget"))
+        pending = b""
+
+        def consume(raw):
+            if protocol:
+                try:
+                    value = json.loads(raw)
+                    if isinstance(value, dict) and value.get("jsonrpc") == "2.0":
+                        self.queue.put(value)
                         return
-                if protocol:
-                    try:
-                        value = json.loads(line)
-                        if isinstance(value, dict) and value.get("jsonrpc") == "2.0":
-                            self.queue.put(value)
-                            continue
-                    except ValueError:
-                        pass
-                if len(self.noise) < 200:
-                    self.noise.append(line[:1000])
+                except (ValueError, UnicodeError):
+                    pass
+            if len(self.noise) < 200:
+                self.noise.append(raw[:1000].decode("utf-8", errors="replace"))
+
+        def over_budget():
+            with self._lock:
+                if self._reader_error:
+                    return
+                self._reader_error = True
+                self.queue.put(EngineError("tool_output_budget", "MCP output or one unterminated line exceeded its budget"))
+            try:
+                _kill(self.process)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+        try:
+            while True:
+                chunk = stream.read1(65536)
+                if not chunk:
+                    if pending:
+                        consume(pending)
+                    break
+                with self._lock:
+                    self._bytes += len(chunk)
+                    exceeded = self._bytes > MAX_LOG_BYTES
+                if exceeded:
+                    over_budget()
+                    return
+                pending += chunk
+                lines = pending.split(b"\n")
+                pending = lines.pop()
+                for raw in lines:
+                    consume(raw.rstrip(b"\r"))
+                if len(pending) > MAX_MCP_LINE_BYTES:
+                    over_budget()
+                    return
         except (OSError, ValueError):
             pass
         finally:
@@ -285,9 +421,9 @@ class MCPClient:
             message["id"] = self.sequence
         self.exchanges.append({"direction": "request", "message": message})
         try:
-            self.process.stdin.write(canonical(message) + "\n")
+            self.process.stdin.write((canonical(message) + "\n").encode("utf-8"))
             self.process.stdin.flush()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError) as exc:
             raise EngineError("mcp_io", "The Yak MCP process closed its input") from exc
         if notification:
             return None
@@ -379,10 +515,11 @@ def probe(project, args):
             stdout, stderr = folder / "stdout.log", folder / "stderr.log"
             files = [stdout, stderr]
             with stdout.open("wb") as out, stderr.open("wb") as err:
-                result = subprocess.run([sys.executable, "-X", "utf8", str(executable), "--version", "--batch"],
+                result = subprocess.run([sys.executable, "-E", "-s", "-X", "utf8", str(executable), "--version", "--batch"],
                                         stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=timeout,
-                                        **_process_options())
-            text = stdout.read_text(encoding="utf-8", errors="replace")[:10000]
+                                        env=clean_environment(), **_process_options())
+            with stdout.open("rb") as stream:
+                text = stream.read(10001).decode("utf-8", errors="replace")[:10000]
             version = re.search(r"(?m)^\d+\.\d+[^\r\n]*", text)
             run.update(status="succeeded" if result.returncode == 0 and version else "failed",
                        exit_code=result.returncode, available=bool(result.returncode == 0 and version),
@@ -576,6 +713,16 @@ def sqlmap_run(project, args):
     executable = _configured_executable(project, args, "sqlmap")
     timeout = _timeout(args, 90)
     operation, url, session, resource, snapshot, location, selector, parameter = _sqlmap_target(project, args, timeout)
+    max_requests = args.get("max_requests", 200)
+    if type(max_requests) is not int or not 1 <= max_requests <= 1000:
+        raise EngineError("execution_budget", "max_requests must be an integer between 1 and 1000")
+    max_writes = args.get("max_writes", 1 if operation["method"] == "POST" else 0)
+    if type(max_writes) is not int or max_writes not in {0, 1}:
+        raise EngineError("execution_budget", "max_writes must be 0 or 1")
+    if operation["method"] == "GET" and max_writes != 0:
+        raise EngineError("execution_budget", "A GET sqlmap profile cannot reserve writes")
+    if max_writes > max_requests:
+        raise EngineError("execution_budget", "max_writes cannot exceed max_requests")
     dbms_value = args.get("dbms")
     dbms_aliases = {
         "sqlite": "SQLite", "sqlite3": "SQLite",
@@ -602,28 +749,72 @@ def sqlmap_run(project, args):
                         "metadata_only": True, "request_method": operation["method"],
                         "limitation": "No crawling, dumps, arbitrary SQL, time-based techniques or exhaustive input testing."})
     stdout, stderr, traffic = folder / "stdout.log", folder / "stderr.log", folder / "traffic.log"
+    guard_summary = folder / "guard-summary.json"
+    guard_spec = folder / "guard-spec.json"
     request_file = None
     target_args = ["-u", url]
     if operation["method"] == "POST":
         request_file = folder / "request.http"
         request_file.write_bytes(_sqlmap_request_file(snapshot))
         target_args = ["-r", str(request_file)]
-    command = [sys.executable, "-X", "utf8", str(executable), *target_args, "-p", parameter,
+    guard_argv = [*target_args, "-p", parameter,
                "--batch", "--level=1", "--risk=1", "--threads=1", "--technique=BEU",
                "--timeout=5", "--retries=0", "--ignore-redirects", "--ignore-proxy", "--disable-coloring",
                "--output-dir=" + str(folder / "output"), "-t", str(traffic)]
     if request_file is None and snapshot["headers"]:
-        command.append("--headers=" + "\n".join(k + ": " + v for k, v in snapshot["headers"].items()))
+        guard_argv.append("--headers=" + "\n".join(k + ": " + v for k, v in snapshot["headers"].items()))
     if request_file is not None and urlsplit(url).scheme == "https":
-        command.append("--force-ssl")
+        guard_argv.append("--force-ssl")
     sqlite = dbms == "SQLite"
     if dbms:
-        command.append("--dbms=" + dbms)
-    command += ["--sql-query=" + SQLITE_DATABASE_QUERY] if sqlite else ["--current-db", "--current-user"]
-    process, text = None, ""
+        guard_argv.append("--dbms=" + dbms)
+    guard_argv += ["--sql-query=" + SQLITE_DATABASE_QUERY] if sqlite else ["--current-db", "--current-user"]
+    command = [sys.executable, "-E", "-s", "-X", "utf8", "-m", "awa_ddd.sqlmap_guard", str(guard_spec)]
+    process, text, lease = None, "", None
     try:
-        with stdout.open("wb") as out, stderr.open("wb") as err:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=err, shell=False, **_process_options())
+        provider_budget = "provider-invocation:sqlmap:" + run["id"]
+        child_budget = "request-slots:sqlmap:" + run["id"]
+        lease, _receipt = _target_dispatch(
+            project, run, action="tool.sqlmap",
+            request_spec={
+                "operation_id": operation["id"],
+                "request": snapshot,
+                "parameter": parameter,
+                "dbms": dbms,
+                "profile": run["profile"],
+                "max_requests": max_requests,
+                "max_writes": max_writes,
+            },
+            effect=run["effect"], budget=provider_budget, max_requests=1,
+            max_writes=int(run["effect"] != "read_only"),
+            budget_unit="provider_invocation")
+        run.update(guard_budget_name=child_budget, max_requests=max_requests, max_writes=max_writes,
+                   dispatch_budget_name=provider_budget)
+        project.put("run", run)
+        guard_spec.write_text(canonical({
+            "workspace": str(project.workspace),
+            "project_id": project.project_id,
+            "run_id": run["id"],
+            "operation": operation,
+            "target_url": url,
+            "effect": run["effect"],
+            "executable": str(executable),
+            "argv": guard_argv,
+            "stdout_path": str(stdout),
+            "stderr_path": str(stderr),
+            "summary_path": str(guard_summary),
+            "max_requests": max_requests,
+            "max_writes": max_writes,
+            "budget_name": child_budget,
+            "lease": lease,
+        }), encoding="utf-8")
+        # The launcher owns sqlmap's two logs.  Its own stderr remains inherited
+        # so per-request dispatch IPC reaches the bridge without entering the
+        # sqlmap stderr artifact.
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=None,
+                                   shell=False, env=clean_environment(), **_process_options())
+        if True:
             deadline = time.monotonic() + timeout
             while process.poll() is None:
                 if time.monotonic() >= deadline:
@@ -648,6 +839,60 @@ def sqlmap_run(project, args):
             _kill(process)
         run.update(status="failed", exit_code=process.returncode if process else None,
                    error_code=getattr(exc, "code", "tool_process_failed"), metadata_candidates={})
+    guarded = {}
+    guard_error = None
+    if guard_summary.is_file() and guard_summary.stat().st_size <= 1024 * 1024:
+        try:
+            guarded = json.loads(guard_summary.read_text(encoding="utf-8"))
+            if not isinstance(guarded, dict) or guarded.get("schema") != "awa-sqlmap-guard/v1":
+                raise ValueError("guard schema")
+            for key in ("complete", "requests_attempted", "writes_attempted",
+                        "guarded_requests", "unguarded_socket_attempts"):
+                if key not in guarded:
+                    raise ValueError("guard field")
+            if type(guarded["complete"]) is not bool \
+                    or any(type(guarded[key]) is not int or guarded[key] < 0
+                           for key in ("requests_attempted", "writes_attempted",
+                                       "guarded_requests", "unguarded_socket_attempts")):
+                raise ValueError("guard type")
+        except (OSError, ValueError, UnicodeError) as exc:
+            guard_error = "sqlmap_guard_unreadable"
+            guarded = {}
+    child_dispatches = [
+        row for row in project.list("execution_dispatch")
+        if row.get("run_id") == run["id"] and row.get("budget_name") == run.get("guard_budget_name")
+    ]
+    guarded_requests = sum(row.get("requests", 0) for row in child_dispatches)
+    guarded_writes = sum(row.get("writes", 0) for row in child_dispatches)
+    counts_match = bool(guarded) and guarded["requests_attempted"] == guarded_requests \
+        and guarded["writes_attempted"] == guarded_writes \
+        and guarded["guarded_requests"] == guarded_requests
+    guard_complete = bool(guarded.get("complete")) and counts_match \
+        and guarded.get("unguarded_socket_attempts") == 0 and not guard_error
+    run.update(
+        requests_attempted=int(guarded.get("requests_attempted", 0)),
+        writes_attempted=int(guarded.get("writes_attempted", 0)),
+        guarded_requests=int(guarded.get("guarded_requests", 0)),
+        unguarded_socket_attempts=int(guarded.get("unguarded_socket_attempts", 0)),
+        guard_complete=guard_complete,
+        request_guard="sqlmap_urllib_do_open+socket_audit",
+        request_budget=max_requests,
+        write_budget=max_writes,
+    )
+    if signal_denials := guarded.get("denied_requests"):
+        run["guard_denials"] = signal_denials[:25]
+    if not guard_complete:
+        guard_code = guard_error or ("sqlmap_request_guard_denied" if guarded.get("denied_requests")
+                                     else "sqlmap_guard_incomplete")
+        run["guard_error"] = guard_code
+        run["status"] = "failed"
+        # A deadline, output-budget stop or explicit cancellation interrupted
+        # the launcher before it could write a complete summary. Preserve that
+        # primary terminal reason; the guard failure remains visible separately.
+        if run.get("error_code") not in {"tool_timeout", "tool_output_budget", "tool_cancelled"}:
+            run["error_code"] = guard_code
+        if process is not None:
+            run["exit_code"] = process.returncode
     # A timed-out run may have useful clues, but partial stdout is never a success
     # or negative result. Retain those clues in the unverified candidate ledger.
     if stdout.is_file() and stdout.stat().st_size <= MAX_LOG_BYTES:
@@ -664,13 +909,17 @@ def sqlmap_run(project, args):
         traffic_text = ""
     requests = len(re.findall(r"HTTP request\s*\[#\d+\]", traffic_text, re.I))
     responses = len(re.findall(r"HTTP response\s*\[#\d+\]", traffic_text, re.I))
-    run.update(target_traffic_sent=requests > 0, traffic_requests=requests, traffic_responses=responses)
+    run.update(target_traffic_sent=run["requests_attempted"] > 0,
+               traffic_requests=requests, traffic_responses=responses)
     run["verification_level"] = "executed"
     run["limitation"] = "Scanner metadata is an unverified candidate; confirm it using independent HTTP baseline/recovery/negative evidence and sql_metadata."
     _sqlmap_diagnostic(run, text)
     result = _finish(project, run, {"command": command, "operation_id": operation["id"],
-                                   "request": snapshot, "metadata_candidates": run.get("metadata_candidates", {})},
-                     (stdout, stderr, traffic, *([request_file] if request_file else [])))
+                                   "request": snapshot, "metadata_candidates": run.get("metadata_candidates", {}),
+                                   "guard": guarded},
+                     (stdout, stderr, traffic, guard_summary,
+                      *([request_file] if request_file else [])))
+    _release_terminal(project, run, lease)
     from .candidates import store_candidate
     candidate_ids = []
     for field, value in run.get("metadata_candidates", {}).items():
@@ -689,7 +938,8 @@ def sqlmap_run(project, args):
             "source": {"sha256": run["sha256"], "locator": run["artifact_path"] + "#injection_signal"},
             "reason": "Actual bounded tool signal without confirmed metadata; inspect controls and retained logs, including partial runs"})
         candidate_ids.append(candidate_id)
-    return {**result, "candidate_ids": candidate_ids}
+    return {**result, **{key: run[key] for key in ("lease_reconciled", "lease_reconciliation")
+                         if key in run}, "candidate_ids": candidate_ids}
 
 
 def yakit_replay(project, args):
@@ -704,7 +954,7 @@ def yakit_replay(project, args):
     packet = "GET " + (parsed.path or "/") + ("?" + parsed.query if parsed.query else "") + " HTTP/1.1\r\nHost: " + parsed.netloc + "\r\nConnection: close\r\n\r\n"
     run, folder = _start(project, "yakit", "http_replay", operation, session, target_url=url)
     run["executable"] = str(executable)
-    client, document = None, {}
+    client, document, lease = None, {}, None
     try:
         client = MCPClient(executable, timeout, project.base / "tools" / "runtime" / "yakit")
         initialized = client.initialize()
@@ -733,6 +983,10 @@ def yakit_replay(project, args):
         required = selected.get("inputSchema", {}).get("required", [])
         if any(key not in values for key in required):
             raise EngineError("mcp_schema", "The discovered fuzzer requires unsupported arguments")
+        lease, _receipt = _target_dispatch(
+            project, run, action="tool.yakit_replay",
+            request_spec={"method": "GET", "url": url,
+                          "tool": selected["name"], "arguments": values})
         result = client.call_tool(selected["name"], values)
         run.update(status="failed" if result.get("isError") else "succeeded", verification_level="mcp_execution",
                    tool_name=selected["name"], server_info=initialized.get("serverInfo", {}))
@@ -753,7 +1007,10 @@ def yakit_replay(project, args):
         if client:
             client.close()
             document.update(exchanges=client.exchanges, process_log=client.noise)
-    return _finish(project, run, document)
+    finished = _finish(project, run, document)
+    _release_terminal(project, run, lease)
+    return {**finished, **{key: run[key] for key in ("lease_reconciled", "lease_reconciliation")
+                           if key in run}}
 
 
 def _verify_tool_lineage(project, run, document):

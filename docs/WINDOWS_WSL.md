@@ -42,7 +42,7 @@ bridge 直接启动固定 `wsl.exe --distribution <name> --cd <package> --exec <
 
 `runtime.probe` 无需项目，只读取 native/WSL 版本、编码、发行版和工具路径。路径存在是 catalog，实际适配仍仅有 HTTP/场景、浏览器/MCP、Yakit 单包与 sqlmap 元数据工作流。没有通用 nmap/nuclei/任意命令执行器。
 
-本机验证：Kali WSL2、Python 3.14.7，`/usr/share/sqlmap/sqlmap.py --version` 返回 1.10.8#stable。nmap、curl、nikto、nuclei、ffuf、gobuster 路径可见，Node/Yak 未发现。缺 Node 时不能声称 WSL JS AST 或本地 Playwright 可用；可选择有依赖的 native 后端或实际 MCP 观察。不会自动安装工具、修改 WSL 网络配置或打开窗口。
+历史结构化记录曾覆盖 Kali WSL2、Python 3.14.7 和 sqlmap 版本探测。**当前 2.3.0 最终验收没有运行真实 WSL、真实 DSH 桌面或其它操作系统**；仓库中的适配器、合成子进程测试和 CI 定义不能替代这些实机结果。缺 Node 时不能声称 WSL JS AST 或本地 Playwright 可用；可选择有依赖且经当前环境核验的 native 后端或实际 MCP 观察。不会自动安装工具、修改 WSL 网络配置或打开窗口。
 
 ## 取消与不确定状态
 
@@ -53,7 +53,7 @@ WSL guardian 先监听无缓冲控制通道，建立本地截止时间，再创�
 - Node 返回 ABORTED/ENGINE_TIMEOUT 不把晚到成功当成功；回归另外检查 Linux engine/tool/grandchild 的已知 PID、start_time、pgid，而非仅检查 wsl.exe 关闭。
 - 杀进程不能回滚已经发送的业务写。中断 run 可能仍为 running/uncertain；先 `project.status`、`run.inspect`，必要时 `run.recover` 标为 interrupted，绝不自动重放。
 
-历史实机验收曾保持 stdin open 测试本地 deadline，并修复 daemon BufferedReader shutdown 的 `_enter_buffered_busy` 崩溃；随后另验证 Unicode、真实 sqlmap 版本、宿主取消/截止和 guardian 本地截止，检查真正 guardian、worker、engine、tool、grandchild 的 PID/start_time/pgid。旧本地日志/备份已清理，不随仓库交付，也不是当前检出的验收结果。当前回归按 [README](../README.md) 重跑；需要实际 WSL/可信本地工具的检查仍依赖当前环境，不能从历史说明或缺失日志推断通过。
+历史实机记录曾保持 stdin open 测试本地 deadline，并修复 daemon BufferedReader shutdown 的 `_enter_buffered_busy` 崩溃；随后另验证 Unicode、真实 sqlmap 版本、宿主取消/截止和 guardian 本地截止，检查 guardian、worker、engine、tool、grandchild 的 PID/start_time/pgid。旧本地日志/备份已清理，不随仓库交付，也不是当前版本的验收依赖。当前 Windows 本地 Python 1,708 tests（OK，Windows 不适用的 POSIX FIFO 跳过 1 项）覆盖可执行子进程与受控 fixture；Node 全量及源码绑定以本次冻结后的最终记录为准。真实 WSL、桌面和其它 OS 的部署验收仍须按 [README](../README.md) 单独执行，不能从历史说明推断通过。
 
 ## 网络与存储边界
 

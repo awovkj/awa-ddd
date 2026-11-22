@@ -9,6 +9,11 @@ dist/
 .tox/
 .nox/
 
+# Keep the verified Acorn runtime module; other generated dist files stay ignored.
+!awa_ddd/resources/js_parser/vendor/acorn/dist/
+awa_ddd/resources/js_parser/vendor/acorn/dist/*
+!awa_ddd/resources/js_parser/vendor/acorn/dist/acorn.mjs
+
 # Interpreter, lint and coverage caches.
 __pycache__/
 *.py[cod]
@@ -37,6 +42,13 @@ coverage/
 
 # Assessment state, generated recon/report outputs, backups and temporary files.
 projects/
+**/sessions/
+*.session.json
+session*.jsonl
+cookies*.json
+*.cookies.json
+/work/
+/recon-local8081/
 /data/
 /backup/
 /backups/

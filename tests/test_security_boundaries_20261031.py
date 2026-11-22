@@ -16,6 +16,7 @@ from awa_ddd.__main__ import dispatch
 from awa_ddd.assessment import _extract_value, evaluate, record_finding, validate_confirmation
 from awa_ddd.store import EngineError, Project, canonical, now
 from awa_ddd.transport import response_json
+from awa_test_support import guarded_runtime_result, local_observation, record_observation
 
 
 def observed_response(url, method, headers, body, timeout, max_bytes, *, response):
@@ -287,9 +288,10 @@ class BrowserPublicBoundaryTests(unittest.TestCase):
         raw = self.raw()
         with patch.object(browser, "_browser_identity", return_value=({}, self.session["headers"], self.base, [], self.session, self.actor)), \
                 patch.object(browser, "probe", return_value={"available": True, "node": "fixture-node", "module_root": "fixture-runtime"}), \
-                patch.object(browser.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(raw), "")):
+                patch.object(browser.subprocess, "run", side_effect=lambda command, **options: guarded_runtime_result(
+                    self.project, command, raw)):
             public = browser.visit(self.project, {"url": raw["url"], "actions": [{"type": "fill", "selector": "#password"}]})
-        self.assert_public(public, raw)
+        self.assert_public(public, local_observation(raw))
         self.assertEqual(self.actor["id"], public["actor_id"])
         self.assertEqual(self.session["id"], public["session_id"])
         self.assertEqual("adopted", public["page_adoption"])
@@ -364,7 +366,7 @@ class BrowserPublicBoundaryTests(unittest.TestCase):
         marker = "AWA-XSS-" + secret
         raw = self.raw(actions=[{"action": "fill", "selector": "#password", "ok": True}],
                        dialogs=[{"type": "alert", "message": marker}])
-        public = browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
+        public = record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
         self.assertEqual("unavailable", public["redaction_context_status"])
         self.assertNotIn(secret, json.dumps(public))
         self.assertEqual(marker, self.project.read_artifact(public)["dialogs"][0]["message"])
@@ -380,8 +382,8 @@ class BrowserPublicBoundaryTests(unittest.TestCase):
 
     def test_page_dispatch_and_derived_public_views_do_not_reexport_private_browser_secrets(self):
         raw = self.raw()
-        visited = browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
-                                             session=self.session, actor=self.actor)
+        visited = record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
+                                     session=self.session, actor=self.actor)
         page_id = visited["page_ids"][0]
 
         def call(action, **args):
@@ -415,8 +417,8 @@ class BrowserPublicBoundaryTests(unittest.TestCase):
         engine.add_session(self.project, {"session_id": "header-control", "actor_id": self.actor["id"],
             "headers": {"X-Actor": self.actor["id"]}, "credential_header_names": ["X-Actor"]})
         raw = self.raw(console=[{"type": "log", "text": "X-Actor " + self.actor["id"]}])
-        public = browser._record_observation(self.project, raw, "PV-control-handle", "local_playwright",
-                                            session=self.session, actor=self.actor)
+        public = record_observation(self.project, raw, "PV-control-handle", "local_playwright",
+                                    session=self.session, actor=self.actor)
         self.assertEqual("PV-control-handle", public["id"])
         self.assertEqual(self.actor["id"], public["actor_id"])
         self.assertNotIn(self.actor["id"], public["console"][0]["text"])
@@ -453,8 +455,8 @@ class BrowserPublicBoundaryTests(unittest.TestCase):
             dialogs=[{"type": "alert", "message": self.marker, "action_index": None}],
             network=[{"url": url, "method": "GET", "type": "document", "status": 200,
                       "request_headers": self.session["headers"]}])
-        public = browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
-                                            session=self.session, actor=self.actor)
+        public = record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
+                                    session=self.session, actor=self.actor)
         self.assertEqual(url, public["url"])
         self.assertEqual(self.marker, public["dialogs"][0]["message"])
         item = next(row for row in self.project.list("obligation") if row.get("kind") == "input_test"
@@ -485,8 +487,47 @@ class BrowserRunLedgerTests(unittest.TestCase):
         return {"url": self.url, "finalUrl": self.url, "status": 200, "signals": {"forms": 1},
                 "network": [{"url": self.url, "method": "GET", "type": "document", "status": 200}], **overrides}
 
+    def write_fixture(self):
+        operation = engine.register_operation(self.project, {"url": self.base + "/write", "method": "POST",
+            "auth": "public", "inputs": [{"name": "id", "location": "query", "consumer": "resource"}]})
+        actor = engine.add_actor(self.project, {"actor_id": "browser-fixture-owner", "roles": []})
+        resource = engine.add_resource(self.project, {"operation_id": operation["id"],
+            "owner_actor_id": actor["id"], "external_id": "fixture-1",
+            "request_binding": {"location": "query", "selector": "id"}})
+        return {"allow_write": True, "max_writes": 1,
+                "operation_id": operation["id"], "resource_id": resource["id"]}
+
     def visit(self, outcome, **args):
-        with patch.object(browser, "probe", return_value=self.state), patch.object(browser.subprocess, "run", side_effect=outcome):
+        def runtime(command, **options):
+            result = (
+                outcome(command, **options)
+                if callable(outcome)
+                else outcome
+            )
+            if isinstance(result, BaseException):
+                raise result
+            if result.returncode != 0:
+                return result
+            try:
+                raw = json.loads(
+                    result.stdout,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(value)
+                    ),
+                )
+            except (TypeError, ValueError):
+                return result
+            if not isinstance(raw, dict):
+                return result
+            return guarded_runtime_result(
+                self.project,
+                command,
+                raw,
+                returncode=result.returncode,
+                stderr=result.stderr,
+            )
+
+        with patch.object(browser, "probe", return_value=self.state), patch.object(browser.subprocess, "run", side_effect=runtime):
             return browser.visit(self.project, {"url": self.url, **args})
 
     def test_run_is_claimed_before_runtime_dispatch_and_success_binds_original_visit_digest(self):
@@ -504,7 +545,7 @@ class BrowserRunLedgerTests(unittest.TestCase):
         self.assertEqual(public["id"], run["page_visit_id"])
         self.assertEqual(public["id"], run["planned_page_visit_id"])
         self.assertEqual(public["sha256"], run["sha256"])
-        self.assertEqual(self.raw(), self.project.read_artifact(run))
+        self.assertEqual(local_observation(self.raw()), self.project.read_artifact(run))
         self.assertEqual(public["run_id"], self.project.get("page_visit", public["id"])["run_id"])
 
     def test_timeout_keeps_recoverable_run_and_readonly_administrative_review_sends_no_requests(self):
@@ -532,8 +573,14 @@ class BrowserRunLedgerTests(unittest.TestCase):
     def test_unknown_browser_write_cannot_be_archived_as_reviewed_by_text_only(self):
         engine.update_project(self.project, {"allow_mutation": True})
         with self.assertRaises(EngineError) as caught:
-            self.visit(subprocess.TimeoutExpired("fixture-runtime", 20), actions=[{"type": "click", "selector": "#submit"}])
+            self.visit(subprocess.TimeoutExpired("fixture-runtime", 20),
+                       actions=[{"type": "click", "selector": "#submit"}], **self.write_fixture())
         run = self.project.get("run", caught.exception.details["run_id"])
+        # Simulate a pre-fixture-binding ledger row: historical uncertainty must
+        # remain reviewable even though new writes always capture an exact fixture.
+        for field in ("operation_id", "operation_signature", "resource_id", "resource_signature"):
+            run.pop(field, None)
+        self.project.put("run", run)
         self.assertEqual("test_resource_write", run["effect"])
         self.assertTrue(run["allow_write"])
         self.assertNotIn("resource_id", run)
@@ -565,18 +612,19 @@ class BrowserRunLedgerTests(unittest.TestCase):
         self.assertEqual("interrupted", public["run_status"])
         self.assertEqual("interrupted", run["status"])
         self.assertEqual("BLOCKED", public["observation_status"])
-        self.assertEqual(raw, self.project.read_artifact(run))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(run))
         self.assertEqual(1, completeness.audit(self.project, {})["completion"]["unreconciled_runs"])
 
     def test_unknown_write_response_status_cannot_create_a_successful_browser_run(self):
         engine.update_project(self.project, {"allow_mutation": True})
-        write = {"url": self.base + "/write", "method": "POST", "status": None, "write": True}
+        write = {"url": self.base + "/write?id=fixture-1", "method": "POST", "status": None, "write": True}
         raw = self.raw(network=[self.raw()["network"][0], write], write_authorized=True,
                       write_requests=[{"url": write["url"], "method": "POST", "status": None}])
-        public = self.visit(lambda command, **options: subprocess.CompletedProcess(command, 0, json.dumps(raw), ""))
+        public = self.visit(lambda command, **options: subprocess.CompletedProcess(command, 0, json.dumps(raw), ""),
+                            **self.write_fixture())
         self.assertEqual("BLOCKED", public["observation_status"])
         self.assertEqual("interrupted", self.project.get("run", public["run_id"])["status"])
-        self.assertEqual(raw, self.project.read_artifact(public))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(public))
         self.assertEqual(1, completeness.audit(self.project, {})["completion"]["unreconciled_runs"])
 
     def test_unavailable_runtime_or_invalid_arguments_never_claim_a_dispatched_run(self):
@@ -602,7 +650,7 @@ class BrowserRunLedgerTests(unittest.TestCase):
         visit = self.project.get("page_visit", public["id"])
         self.assertEqual([secret], run["credentials"]["browser_fill_values"])
         self.assertEqual([secret], visit["credentials"]["browser_fill_values"])
-        self.assertEqual(raw, self.project.read_artifact(visit))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(visit))
 
         def call(action, **args):
             return dispatch(self.tmp.name, action, {"project_id": "run", **args})
@@ -679,7 +727,7 @@ class BrowserRunLedgerTests(unittest.TestCase):
         self.assertNotIn(run["redaction_context_sha256"], guesses)
         for digest in guesses:
             self.assertNotIn(digest, exposed)
-        self.assertEqual(raw, self.project.read_artifact(visit))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(visit))
         old_context = {"browser_fill_values": [pin]}
         self.project.put("run", {**run, "credentials": old_context,
             "redaction_context_sha256": hashlib.sha256(canonical(old_context).encode("utf-8")).hexdigest()})
@@ -708,21 +756,21 @@ class BrowserRunLedgerTests(unittest.TestCase):
                 self.assertEqual("browser_redaction_context", caught.exception.code)
                 self.assertNotIn(secret, str(caught.exception))
                 self.project.put(kind, record)
-        self.assertEqual(raw, self.project.read_artifact(self.project.get("page_visit", public["id"])))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(self.project.get("page_visit", public["id"])))
 
     def test_legacy_missing_fill_context_omits_only_related_prose_and_preserves_usable_other_visits(self):
         secret = "synthetic-legacy-unrecoverable-fill-012345"
         raw = self.raw(title=secret, console=[{"type": "log", "text": secret}],
                       source_meta={"sha256": secret, "artifact_path": secret, "created_at": secret},
                       actions=[{"index": 0, "action": "fill", "selector": "#password", "ok": True, "finalUrl": self.url}])
-        legacy = browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
+        legacy = record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
         self.assertEqual("unavailable", legacy["redaction_context_status"])
         self.assertNotIn(secret, json.dumps(legacy))
-        self.assertEqual(raw, self.project.read_artifact(legacy))
+        self.assertEqual(local_observation(raw), self.project.read_artifact(legacy))
         other_url = self.base + "/other"
         other_raw = self.raw(url=other_url, finalUrl=other_url, title="Known safe other page",
                              network=[{"url": other_url, "method": "GET", "type": "document", "status": 200}])
-        other = browser._record_observation(self.project, other_raw, self.project.id("PV"), "local_playwright")
+        other = record_observation(self.project, other_raw, self.project.id("PV"), "local_playwright")
         self.assertEqual("Known safe other page", other["title"])
         self.assertNotIn("redaction_context_status", other)
         covered = dispatch(self.tmp.name, "page.coverage", {"project_id": "run"})
@@ -967,7 +1015,7 @@ class MixedFamilyProofTests(unittest.TestCase):
         raw = {"url": url, "finalUrl": url, "status": 200, "signals": {"forms": 1}, "actions": [],
                "network": [{"url": url, "method": "GET", "type": "document", "status": 200, "request_headers": {}}],
                "dialogs": [{"type": "alert", "message": marker, "action_index": None}]}
-        visit = browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
+        visit = record_observation(self.project, raw, self.project.id("PV"), "local_playwright")
         finding = record_finding(self.project, {"mode": "analyst", "title": "Mixed-input controlled runtime", "category": "XSS",
             "impact": "Isolated input executes in its actual consumer", "remediation": "Encode output", "reviewer": "fixture reviewer",
             "reason": "Original normal/attack captures and matching runtime dialog", "obligation_id": items["xss"]["id"],

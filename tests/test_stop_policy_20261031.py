@@ -29,7 +29,7 @@ class StopPolicyTests(unittest.TestCase):
     def completed_frontier(self):
         self.fixture.close_generic()
         self.fixture.checkpoint(self.fixture.frontier())
-        return self.fixture.checkpoint(self.fixture.frontier())
+        return self.fixture.checkpoint(self.fixture.frontier(self.fixture.variant_evidence))
 
     def historical_stop(self, checkpoint, reason="user_stop", **extra):
         current = checkpoint["continuation"]
@@ -119,7 +119,7 @@ class StopPolicyTests(unittest.TestCase):
         checkpoint = self.completed_frontier()
         blocked = self.fixture.checkpoint(self.fixture.frontier(blocked=True))
         self.assertEqual(checkpoint["checkpoint"]["snapshot_id"], blocked["checkpoint"]["snapshot_id"])
-        self.assertEqual(1, blocked["continuation"]["frontier_rounds"])
+        self.assertEqual(2, blocked["continuation"]["frontier_rounds"])
         self.assertFalse(blocked["continuation"]["can_finalize"])
         with self.assertRaises(EngineError) as caught:
             self.fixture.finish(blocked)

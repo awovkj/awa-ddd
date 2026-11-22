@@ -22,6 +22,32 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function captureNextBridgeDeadline(timeoutMs) {
+  const nativeSetTimeout = globalThis.setTimeout;
+  let callback;
+  let handle;
+  globalThis.setTimeout = (next, delay, ...args) => {
+    if (!handle && delay === timeoutMs) {
+      // Keep the real Timeout handle for unref/clearTimeout compatibility, but
+      // fire the deadline only after the fixture confirms target dispatch.
+      handle = nativeSetTimeout(() => {}, Math.min(delay, 2 ** 31 - 1));
+      clearTimeout(handle);
+      callback = () => next(...args);
+      return handle;
+    }
+    return nativeSetTimeout(next, delay, ...args);
+  };
+  return {
+    fire() {
+      assert.ok(callback, 'the bridge scheduled its configured deadline');
+      callback();
+    },
+    restore() {
+      globalThis.setTimeout = nativeSetTimeout;
+    },
+  };
+}
+
 function audit(overrides = {}) {
   return { ok: true, data: { continuation: { contract_version: 2, stop_policy: 'exhaustion_only',
     stop_policy_version: 1, continue_required: true, automatic_stop_allowed: false, can_finalize: false,
@@ -144,15 +170,19 @@ function messageTasks(message) {
 }
 
 async function offlineSdkFixture(project_id, body, { expectedRequests = 0, expectedRunTotal = 0,
-  expectedUnassessed = 0, extraActions = [], responseDelayMs = 0, captureTimeoutMs } = {}) {
+  expectedUnassessed = 0, extraActions = [], responseDelayMs = 0, holdResponse = false } = {}) {
   const prefix = 'awa-host-cordis-engine-';
   const workspace = await mkdtemp(join(tmpdir(), prefix));
   const settings = { workspace, timeoutMs: 15000 };
   let requests = 0;
+  const requestArrival = deferred();
+  const responseRelease = deferred();
   const server = createServer((_request, response) => {
     requests++;
+    requestArrival.resolve();
     response.writeHead(200, { 'content-type': 'application/json' });
     if (responseDelayMs) setTimeout(() => response.end('{"fixture":true}'), responseDelayMs);
+    else if (holdResponse) responseRelease.promise.then(() => response.end('{"fixture":true}'));
     else response.end('{"fixture":true}');
   });
   const lifetime = new AbortController();
@@ -165,7 +195,6 @@ async function offlineSdkFixture(project_id, body, { expectedRequests = 0, expec
   const definitions = toolDefinitions(defineTool, settings,
     async (...args) => {
       actions.push(args[1]);
-      if (args[1] === 'http.capture' && captureTimeoutMs) return invokeEngine({ ...args[0], timeoutMs: captureTimeoutMs }, ...args.slice(1));
       return invokeEngine(...args);
     }, lifetime.signal,
     { observer: controller.observe });
@@ -178,15 +207,17 @@ async function offlineSdkFixture(project_id, body, { expectedRequests = 0, expec
     const base = `http://127.0.0.1:${server.address().port}`;
     const fixture = { settings, base, subject, controller, calls, actions, turn, lifetime,
       get requests() { return requests; },
+      requestArrival: requestArrival.promise,
+      releaseResponse: responseRelease.resolve,
       async enter(messages = [user('Assess only this finite authorized loopback fixture.')]) {
         subject.inbox.nextStep.length = 0;
         const decision = { kind: 'enter', messages };
         assert.equal(await events.waterfall('agent/pre-step', { turn: 1, step: ++step, signal: turn.signal, messages },
           async () => decision), decision);
       },
-      async call(action, input = {}) {
+      async call(action, input = {}, signal = turn.signal) {
         const definition = definitions.find(item => item.parameters.properties.action.enum.includes(action));
-        return definition.execute({ action, project_id, input }, { agent: subject, signal: turn.signal });
+        return definition.execute({ action, project_id, input }, { agent: subject, signal });
       },
       stop() { return events.serial(TURN_STOPPING_EVENT, { turn: 1, signal: turn.signal }); },
     };
@@ -286,12 +317,18 @@ test('failed run handles must match the actual arming action kind', async () => 
   }
 });
 
-test('the first real bridge timeout retains binding without a returned run handle and never replays', async () => {
-  await offlineSdkFixture('first-uncertain-timeout', async fixture => {
+test('the first real bridge cancellation after dispatch retains binding without a returned run handle and never replays', async () => {
+  await offlineSdkFixture('first-uncertain-cancellation', async fixture => {
     const operation = (await fixture.call('surface.register', { url: fixture.base + '/fixture', method: 'GET', auth: 'public',
       inputs: [{ name: 'q', location: 'query', consumer: 'business_input', test_families: ['generic'] }] })).data;
     assert.equal(fixture.controller.status().bound_projects, 0);
-    await assert.rejects(fixture.call('http.capture', { operation_id: operation.id }), error => error.code === 'ENGINE_TIMEOUT');
+    const execution = new AbortController();
+    const capture = fixture.call('http.capture', { operation_id: operation.id }, execution.signal);
+    await fixture.requestArrival;
+    assert.equal(fixture.requests, 1, 'the fixture has observed the dispatched target request before cancellation');
+    execution.abort();
+    await assert.rejects(capture, error => error.code === 'ABORTED');
+    fixture.releaseResponse();
     assert.equal(fixture.requests, 1);
     assert.equal(fixture.controller.status().bound_projects, 1);
     await fixture.stop();
@@ -299,7 +336,34 @@ test('the first real bridge timeout retains binding without a returned run handl
     assert.equal(fixture.subject.steered.length, 1);
     assert.match(fixture.subject.steered[0].content[0].text, /offline run\.inspect\/run\.recover/);
     assert.deepEqual(fixture.calls.map(call => call[1]), ['plan.audit']);
-  }, { expectedRequests: 1, expectedRunTotal: 1, responseDelayMs: 2500, captureTimeoutMs: 1000, extraActions: ['http.capture'] });
+  }, { expectedRequests: 1, expectedRunTotal: 1, holdResponse: true, extraActions: ['http.capture'] });
+});
+
+test('a real bridge deadline after dispatch becomes ENGINE_TIMEOUT and retains conservative unknown handling', async () => {
+  await offlineSdkFixture('first-uncertain-timeout', async fixture => {
+    const operation = (await fixture.call('surface.register', { url: fixture.base + '/fixture', method: 'GET', auth: 'public',
+      inputs: [{ name: 'q', location: 'query', consumer: 'business_input', test_families: ['generic'] }] })).data;
+    assert.equal(fixture.controller.status().bound_projects, 0);
+    const deadline = captureNextBridgeDeadline(fixture.settings.timeoutMs);
+    let capture;
+    try {
+      capture = fixture.call('http.capture', { operation_id: operation.id });
+      await fixture.requestArrival;
+      assert.equal(fixture.requests, 1, 'the fixture has observed the dispatched target request before the deadline fires');
+    } finally {
+      deadline.restore();
+    }
+    deadline.fire();
+    await assert.rejects(capture, error => error.code === 'ENGINE_TIMEOUT');
+    fixture.releaseResponse();
+    assert.equal(fixture.requests, 1);
+    assert.equal(fixture.controller.status().bound_projects, 1);
+    await fixture.stop();
+    assert.equal(fixture.requests, 1);
+    assert.equal(fixture.subject.steered.length, 1);
+    assert.match(fixture.subject.steered[0].content[0].text, /offline run\.inspect\/run\.recover/);
+    assert.deepEqual(fixture.calls.map(call => call[1]), ['plan.audit']);
+  }, { expectedRequests: 1, expectedRunTotal: 1, holdResponse: true, extraActions: ['http.capture'] });
 });
 
 test('98 ready plus 134 review prevents normal free-text closure after the fresh audit settles', async () => {
@@ -408,6 +472,24 @@ test('help, old project status, report-only, import and pause checkpoint calls n
   assert.equal(h.calls.length, 0);
   assert.equal(subject.steered.length, 0);
   assert.equal(h.controller.status().bound_projects, 0);
+  h.controller.dispose();
+});
+
+test('partial acceptance is an offline arm and never converts delivery into completion', async () => {
+  const h = setup();
+  const subject = agent('partial-acceptance');
+  await h.step(subject);
+  const accepted = await h.call(subject, 'plan.accept_partial', 'project-a', {
+    checkpoint_id: 'CP-fixture', accepted_by: 'fixture-owner',
+    explanation: 'Bounded delivery remains unfinished pending current review work.',
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(h.controller.status().bound_projects, 1);
+  await h.stop(subject);
+  assert.equal(subject.steered.length, 1);
+  assert.deepEqual(h.calls.map(call => call[1]), ['plan.audit']);
+  assert.match(subject.steered[0].content[0].text, /OFFLINE-only bindings/);
+  assert.match(subject.steered[0].content[0].text, /not an assessment completion/);
   h.controller.dispose();
 });
 

@@ -543,8 +543,14 @@ try {
   const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   if (typeof payload.source !== 'string' || Buffer.byteLength(payload.source) > LIMIT) throw new Error('invalid_source');
   let acorn;
-  try { acorn = await import('acorn'); }
-  catch { limitation('javascript_ast_parser_unavailable'); }
+  for (const moduleUrl of [
+    new URL('./vendor/acorn/dist/acorn.mjs', import.meta.url),
+    new URL('../awa_ddd/resources/js_parser/vendor/acorn/dist/acorn.mjs', import.meta.url),
+  ]) {
+    try { acorn = await import(moduleUrl.href); break; }
+    catch { /* try the next explicit frozen location */ }
+  }
+  if (!acorn) limitation('javascript_ast_parser_unavailable');
   if (acorn) {
     let ast;
     try { ast = acorn.parse(payload.source, {ecmaVersion:'latest', sourceType:'module', locations:true}); }

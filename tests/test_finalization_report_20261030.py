@@ -90,6 +90,8 @@ class FinalizationReportTests(unittest.TestCase):
                 "reason": "The declared isolated fixture contract supports only the modeled generic input.", **references}
                 for family in continuation.ALL_FAMILIES]}
         continuation.checkpoint(self.project, {"frontier_review": frontier})
+        for declaration in [frontier["discovery"], frontier["pages"], *frontier["categories"]]:
+            declaration["evidence_ids"] = [captures[1]["id"]]
         saved = continuation.checkpoint(self.project, {"frontier_review": frontier})
         stopped = continuation.finalize(self.project, {"checkpoint_id": saved["checkpoint"]["id"], "reason": "completed",
             "explanation": "Actual evaluated controls and evidence-bound frontier reviews exhaust the finite fixture.",
@@ -311,6 +313,7 @@ class FinalizationReportTests(unittest.TestCase):
 
         with patch("awa_ddd.continuation.require_finalization", side_effect=validate), \
                 patch("awa_ddd.continuation.control", side_effect=control), \
+                patch("awa_ddd.reporting_legacy._require_final_delivery"), \
                 patch("awa_ddd.reproduction.prepare_reproduction", side_effect=prepare), \
                 patch.object(engine, "evaluate_coverage", side_effect=lambda _project: copy.deepcopy(fixture)) as evaluate:
             result = build_report(self.project, stage="final", finalization_id="FINAL-fixture")
@@ -359,7 +362,8 @@ class FinalizationReportTests(unittest.TestCase):
                         self.assertEqual("continue_required", caught.exception.code)
                         prepare.assert_not_called()
                         continue
-                    result = build_report(self.project, stage="final", finalization_id=record["id"])
+                    with patch("awa_ddd.reporting_legacy._require_final_delivery"):
+                        result = build_report(self.project, stage="final", finalization_id=record["id"])
                 summary, manifest, _ = self.read(result)
                 self.assertEqual(expected, result["delivery_status"])
                 self.assertEqual(expected, summary["delivery_status"])
@@ -397,9 +401,30 @@ class FinalizationReportTests(unittest.TestCase):
         changed = copy.deepcopy(original)
         changed["continuation"]["review_total"] = 1
         destination = self.root / "post-preparation-control-change"
+
+        def require_current(project, evaluated, continuation, record):
+            if continuation["review_total"]:
+                denied = {
+                    **continuation,
+                    "continue_required": True,
+                    "can_finalize": False,
+                    "can_claim_complete": False,
+                    "automatic_stop_allowed": False,
+                    "finalization_id": None,
+                    "state": "continue",
+                    "reason_code": "final_report_inconsistent",
+                    "next_action": "plan.audit",
+                }
+                raise EngineError(
+                    "continue_required",
+                    "The current report source changed during preparation",
+                    {"continuation": denied, "next_action": "plan.audit"},
+                )
+
         with patch.object(engine, "evaluate_coverage", side_effect=[original, changed]), \
                 patch("awa_ddd.continuation.control", return_value=current), \
                 patch("awa_ddd.continuation.require_finalization", return_value=record), \
+                patch("awa_ddd.reporting_legacy._require_final_delivery", side_effect=require_current), \
                 patch.object(reproduction, "prepare_reproduction", wraps=reproduction.prepare_reproduction) as prepare:
             with self.assertRaises(EngineError) as caught:
                 build_report(self.project, destination, stage="final", finalization_id=record["id"])
@@ -428,7 +453,8 @@ class FinalizationReportTests(unittest.TestCase):
         current["note"] = "Cookie: sid=PRIVATE-CONTINUATION-COOKIE"
         with patch.object(engine, "evaluate_coverage", return_value=evaluated), \
                 patch("awa_ddd.continuation.require_finalization", return_value=record), \
-                patch("awa_ddd.continuation.control", return_value=current):
+                patch("awa_ddd.continuation.control", return_value=current), \
+                patch("awa_ddd.reporting_legacy._require_final_delivery"):
             result = build_report(self.project, stage="final", finalization_id=record["id"])
         summary, manifest, _ = self.read(result)
         folder = Path(result["report"]).parent
@@ -456,7 +482,8 @@ class FinalizationReportTests(unittest.TestCase):
         evaluated, current = self.mock_context(record)
         with patch.object(engine, "evaluate_coverage", return_value=evaluated), \
                 patch("awa_ddd.continuation.require_finalization", return_value=record), \
-                patch("awa_ddd.continuation.control", return_value=current):
+                patch("awa_ddd.continuation.control", return_value=current), \
+                patch("awa_ddd.reporting_legacy._require_final_delivery"):
             result = build_report(self.project, stage="final", finalization_id=record["id"])
         summary, manifest, _ = self.read(result)
         self.assertEqual("complete", summary["completion"]["status"])
@@ -583,7 +610,8 @@ class FinalizationReportTests(unittest.TestCase):
         evaluated, current = self.mock_context(record)
         with patch.object(engine, "evaluate_coverage", return_value=evaluated), \
                 patch("awa_ddd.continuation.require_finalization", return_value=record), \
-                patch("awa_ddd.continuation.control", return_value=current):
+                patch("awa_ddd.continuation.control", return_value=current), \
+                patch("awa_ddd.reporting_legacy._require_final_delivery"):
             result = build_report(self.project, stage="final", finalization_id=record["id"])
         folder = Path(result["report"]).parent
         exported = json.dumps(result) + "\n" + "\n".join(

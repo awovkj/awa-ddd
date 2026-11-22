@@ -20,11 +20,19 @@ WSL 与 Windows 引擎可能处在不同网络命名空间；连接失败时不�
 
 上述历史元数据核对没有调用扫描、`http_request` 或 `query_results`，没有查询扫描数据库，也没有清空远端项目。2026-10-31 补齐适配时另行核对了当前 **TscanPlus 3.5.4** 的空非默认项目查询结构；该结构核对阶段没有发出目标 HTTP 请求。
 
+2026-11-21 在本机 loopback MCP 在线执行 `initialize`、`notifications/initialized` 和 `tools/list`，记录了 **TscanPlus 3.5.8**、协议 `2025-03-26`、**43 个远端工具**及目录 SHA-256：
+
+```text
+bec3c772f0bedd3f8d1b19fedd0c470ff44c1dbc0a727bcc89aba8c8435779d6
+```
+
+该次在线核对没有调用 scanner tools 或结果 API，目标请求数为 0；保存的元数据用于离线核对适配器边界。每次实际读取仍必须使用当前项目 `tool.probe` 保存并校验的目录、schema 和 SHA-256。不同版本、不同 loopback 服务或磁盘上的其他 Tscan 数据都不能替换该次 probe 的绑定。
+
 当时的最终链路验收另经 Node 文件调用、Python 引擎和真实 MCP，对临时自建 loopback fixture 发出两个 GET：一个普通响应，一个 302 响应。幂等复用没有重复发包，302 不跟随，范围外 URL 在发包前拒绝；结果、摘要和 routes 仅读取专用空 namespace。没有执行扫描、POC、破解、凭据校验或远端数据写入工具，没有访问历史目标，也没有清空项目。旧本地验收目录已清理，不提供随仓库下载的原始材料；该历史说明不是当前检出的验收结果。发行时不携带这个共享服务或它的数据库；服务需要由用户另行维护。
 
 ## 本版实际适配的范围
 
-awa-ddd 工具目录为 60 个动作；TscanPlus 的 25 个远端工具不等于 25 个 awa-ddd 执行动作。当前只适配：
+当前 awa-ddd V1 工具目录为 75 个动作；远端目录中的工具数量不等于 awa-ddd 执行动作数量。下表描述源码中保留的适配器和门禁，**不是当前外部服务已经可用的声明**。当前验收状态是：主动 Tscan/Web discovery unavailable，3.5.8/43 来自 2026-11-21 的在线元数据核对，本轮最终没有在线结果 API、主动请求或扫描验收。依赖当前可访问外部服务的动作须在实际运行环境重新 probe 并核对绑定。
 
 | awa-ddd 动作 | 实际作用 | 不可当作什么 |
 |---|---|---|
@@ -33,6 +41,9 @@ awa-ddd 工具目录为 60 个动作；TscanPlus 的 25 个远端工具不等于
 | `tool.tscanplus_results` | 按记录的项目、允许的表及 instance 读取有限结果，解析成脱敏、范围核对、去重的候选 | 全库搜索、执行新扫描、确认 finding 或完整覆盖 |
 | `tool.tscanplus_summary` | 读取已登记项目的 `project_summary`，只公开允许表的计数及 `has_assets` | 远端 prompt/hint 指令、完整资产覆盖或漏洞确认 |
 | `tool.tscanplus_routes` | 只读 `route_candidates`，把范围内建议脱敏、去重后归档为未验证候选 | 执行建议工具、扩大授权或自动登记接口 |
+| `tool.tscanplus_ingest` | 读取一次已有 `query_results` 或 `route_candidates`，保存 provider 收据，并将有界行写入统一 DiscoverySource / Snapshot / Item 来源账本 | 启动扫描、访问发现的 URL、把远端行自动登记为 operation 或把扫描线索当证明 |
+
+这些是可在明确授权和可达服务下使用的有限适配路径。主动扫描能力保持机器的 `active_capability.available:false`；即使出现可达服务或新的 catalog，也不能由本文、历史目录摘要或远端提示文字把它改成 available。
 
 其他远端工具，包括 `url_scan`、`ip_scan`、`tscan_scan`、目录/JS/子域扫描、POC、爆破、AK/JWT 和远端 finding/fact 写入工具，**没有通过本适配器执行**。目录中列出来不等于已接入，也不等于可安全自动调用。读取 routes 的建议不代表执行 `pwd_crack` / `poc_scan` / `dir_scan` / `js_scan` / `http_request`。
 
@@ -48,7 +59,7 @@ awa-ddd 工具目录为 60 个动作；TscanPlus 的 25 个远端工具不等于
 - 上游 Skill 约定显式短名规范为 `MCP-短名`，全长不超过 30；显式项目默认追加，`fresh_project:true` 才清空。
 - `query_results` 不清空项目，但不指定 instance 时可能读取该项目全部结果。
 
-**3.5.4 兼容边界：** 实测该服务会把超过 20 字符的归一化项目名裁剪为 20 字符，和 Skill 的 30 字符契约不一致。新 probe、默认派生及所有新请求 / 读取都要求全长最多 20 字符的 namespace（未带 `MCP-` 的短名最多 16 字符）。历史配置和材料保持不变，但旧的超过 20 字符的 namespace 在连接 MCP 前就拒绝执行，用户须明确用短名重新 `tool.probe`；不能先让服务截断并读取另一个桶，再根据回显报错。旧 artifact 仍可离线 inspect。不根据远端回显静默改名，不复制、迁移或清空已有数据。
+**Namespace 保守兼容边界：** 历史实测已观察到服务端把超过 20 字符的归一化项目名裁剪为 20 字符，与上游 Skill 的 30 字符契约不一致。当前 probe、默认派生及所有新请求 / 读取继续要求全长最多 20 字符（未带 `MCP-` 的短名最多 16 字符），不因 3.5.8 目录基线而自动放宽。历史配置和材料保持不变，但旧的超过 20 字符 namespace 在连接 MCP 前就拒绝执行，用户须明确用短名重新 `tool.probe`；不能先让服务截断并读取另一个桶，再根据回显报错。旧 artifact 仍可离线 inspect。不根据远端回显静默改名，不复制、迁移或清空已有数据。
 
 适配器禁止默认 `MCP` 桶和清空操作。`tool.probe` 可指定非默认的短 `scanner_project`；省略时派生专用的 `MCP-awa-...` 名称并保存绑定，后续读取沿用该记录。读取已有结果时应明确选本次评估获准访问的远端 namespace；新派生项目为空是正常情况，不自动搜遍其他项目。不能让应用响应、候选内容或远端文字选择其他项目、instance、控制端点或权限。
 
@@ -79,6 +90,50 @@ probe 成功后读取已登记的项目摘要：
 ```
 
 随后使用 `candidate.list` / `candidate.inspect` 和实际返回的 `run_id` 调用 `tool.inspect` / `tool.artifact`。候选关联、计数或建议都不是执行授权；任何后续请求仍需独立通过范围、身份、方法和资源门禁。
+
+需要进入统一来源分母时，改用一次有界导入：
+
+```json
+{"action":"tool.tscanplus_ingest","project_id":"assessment","input":{"source_kind":"results","table":"urlscan","result_limit":25,"mode":"preview","limit":25}}
+```
+
+返回的 `source_id` / `snapshot_id` 是后续精确处理的稳定绑定。`preview` 仍会保存不可变来源快照，只是不把当前页登记为 operation 或创建 candidate；需要应用时使用 `surface.import` 携带同一 `snapshot_id` 分页，而不是重复读取远端结果。
+
+## 统一来源账本导入
+
+`tool.tscanplus_ingest` 面向“把已有 TscanPlus 信息放进统一来源账本”，不是主动扫描入口。它只允许读取 `query_results` 或 `route_candidates` 两个已有结果 profile，并把回执映射为：
+
+- 一个不可变 `DiscoverySource`；
+- 一个绑定 provider 收据和解析版本的 `DiscoverySnapshot`；
+- 有界的 `DiscoveryItem` 行；
+- `unverified` / `hint_only` 候选，供显式来源复核和后续正常登记流程使用。
+
+参数边界如下：
+
+| 参数 | 规则 |
+|---|---|
+| `source_kind` | `results`（默认）或 `routes` |
+| `table` | 仅 `results` 可用，默认 `urlscan`，范围与 `tool.tscanplus_results` 相同 |
+| `result_limit` | 整数 1..100，默认 25；`results` 会作为远端 `result_limit`，`routes` 只限制本地行处理 |
+| `instance_id` | 仅 `results` 可用，范围 1..100 个 ASCII 字母、数字、`_ . : -` |
+| `timeout` | 5..120 秒，默认 30；整次 MCP 控制流程共享一个截止时间 |
+| `mcp_url` / `scanner_project` | 可显式提供，但必须与当前项目已保存的 probe 精确一致 |
+| `mode` | `preview` 保存来源快照但不登记当前页；`apply`（默认）按当前页登记 |
+| `offset` / `limit` | 来源账本分页，`offset >= 0`，`limit` 为 1..100、默认 25 |
+
+`routes` 不接受 `table` 或 `instance_id`；远端 schema 没有这两个过滤能力时，适配器不会静默忽略它们。`path`、`format`、任意 MCP tool 名、POC / 端口 / 目录 / JS / 爆破 / 凭据字段都会在建立新 MCP 连接前拒绝。
+
+一次导入调用只发起一次结果读取 `tools/call`，且 `target_requests_sent:0`、`active_scan_started:false`、`scanner_invoked:false`。initialize 与 `tools/list` 仍会执行，以确认当前目录完整 SHA-256、工具 schema 和 probe 绑定未变化；目录发生变化时会在调用结果工具前阻止。工具不会调用 `tscan_scan`、`url_scan`、`http_request`、`poc_scan`、`pwd_crack`、`dir_scan`、`js_scan`，也不会对发现的 URL 发起请求。
+
+公开 provider 收据只保留固定 allowlist：provider/profile、source kind 与摘要、server/protocol version、catalog/工具 schema/输入摘要、reported/returned/processed/unretrieved 计数、完整性与 instance 回显、`remote_cursor`、`remote_may_continue`、`dispatch_attempted`、查询预算、artifact SHA-256 和捕获时间。控制端点、scanner namespace、server name 与 artifact 本地路径只留在项目私有 SQLite/artifact 上下文，不进入公开来源视图。
+
+provider 收据只证明“这次读取了什么、读取边界如何”，不证明远端数据库没有后续写入，也不证明目标攻击面已耗尽。`namespace_verified:false`、请求了 instance 但没有回显、远端显式截断、显式不完整或 routes 本地截行都会保留为未决限制。`tscanplus_provider_clues_are_not_proof` 始终作为声明性限制保留，但不被计作解析失败。
+
+每条来源项都带 `status:unverified`、`verification_level:hint_only`、`hints_only:true`、`independent_evidence_required:true`、`usable_for_confirmation:false`、`requestable:false` 与 `native_input_requires_binding:true`。范围外、无法映射、秘密 URL 以及不支持的 route tool 也保留来源诊断，不自动扩大 scope、不自动登记 operation，也不把远端标题、prompt、类别或建议当作本地策略。
+
+旧 `tool.tscanplus_results` / `tool.tscanplus_routes` 仍用于直接生成脱敏候选；新 `tool.tscanplus_ingest` 生成同一账本语义下的来源分母并附 provider 收据。两者都不是证明通道。若只是继续处理已经保存的同一快照，应使用 `surface.sources` 查看 `next_input`，再用 `surface.import` 应用该 `snapshot_id`，不要为了续页重放远端查询。
+
+当前主动 Web discovery 能力明确不可用，缺口为出站请求预算、重定向范围约束、可靠远端取消回执、完整远端任务状态以及 cursor / 未取回结果契约。`active_capability.available:false`、`scanner_invoked:false` 是机器的当前门禁结果，不能由远端 prompt 或调用方文字覆盖。
 
 ## 单次请求门禁
 
@@ -121,7 +176,7 @@ probe 成功后读取已登记的项目摘要：
 
 `tool.tscanplus_results` 只查询已经记录的远端 namespace。`table` 默认 `urlscan`；允许的表为 `ipscan`、`urlscan`、`poccheck`、`dirscan`、`jsfinder`、`subdomain`、`pwdcrack`、`cyber`、`info`，不提供任意表读取或远端 `finding` 表导入。公开字段 `limit` 默认 25，必须为整数 1..100；`result_limit` 是兼容别名，同时提供时必须是相同整数，冲突明确拒绝。`mcp_url` / `scanner_project` 省略时沿用 probe，提供时必须精确匹配已登记端点 / 项目。`instance_id` 是可选的精确过滤条件，1..100 个 ASCII 字母、数字、`_ . : -`，不能让远端响应自行选择另一个 instance。
 
-当前 3.5.4 的查询返回形状为 `data:{results:[],table,total,matched,result_limit,project,instance_id}`，其中 `results` 是行数组，而不是唯一支持 `results.<table>` / `counts.<table>` 对象。适配器兼容两种结构；`total` 映射为 `reported_count` / `reported_total`，`matched` 单独保留为 `reported_matched`，不假定它就是过滤后的全量行数，也不以 `matched == returned_rows` 推断查询完整。回显不足、计数矛盾或不同 namespace 不因空数组而自动变成完整查询。
+历史 3.5.4 查询返回形状为 `data:{results:[],table,total,matched,result_limit,project,instance_id}`，其中 `results` 可为行数组；适配器同时兼容 `results.<table>` / `counts.<table>` 对象。2026-11-21 对 3.5.8 的在线探测只核对了握手与 catalog，不能据此声称其结果 API 已另做在线复测。适配器对两种已知结构做 bounded 解析：`total` 映射为 `reported_count` / `reported_total`，`matched` 单独保留为 `reported_matched`，不假定它就是过滤后的全量行数，也不以 `matched == returned_rows` 推断查询完整。回显不足、计数矛盾或不同 namespace 不因空数组而自动变成完整查询。
 
 实际 `query_results` schema **没有 offset**；本适配器也不接受远端模糊 keyword/finger/port 等任意过滤器。不能发明分页游标，或把提高限制和重复读取说成读取了全部数据库。
 
@@ -158,7 +213,7 @@ query / summary / routes 的明确不完整状态，以及新派发 HTTP 请求�
 
 同步 MCP 请求的本地取消、超时、断连或输出预算停止，**不能保证远端任务已经停止**。不杀共享服务，不清空数据库，也不自动重放可能已经生效的 POST。
 
-当前版本没有远端取消动作；deadline/close 只关闭本地连接。记录通过 `dispatch_attempted`、`status`、`remote_may_continue`、`remote_stopped_verified` 和结果完整性区分本地派发及不确定效应。成功回执会结束本次本地等待，但 `remote_stopped_verified:false` 仍明确表示没有独立核验远端已经停止；任何取消回执也不能替代这种核验。
+当前版本没有远端取消动作；deadline/close 只关闭本地连接。记录通过 `dispatch_attempted`、`status`、`remote_may_continue`、`remote_stopped_verified` 和结果完整性区分本地派发及不确定效应。只有唯一、合法且一致的 HTTP 状态才能认定本次 HTTP 终态；`success:true,data:{}`、缺失或冲突状态保持 `target_traffic_sent:null`，写请求保留 `effect_unknown`，不执行 reconciled release。成功回执会结束本次本地等待，但 `remote_stopped_verified:false` 仍明确表示没有独立核验远端已经停止；任何取消回执也不能替代这种核验。
 
 报告保留实际的 `mcp_url`、`scanner_project`、`instance_id`、`selected_tool`、`catalog_sha256`、请求绑定摘要与上述计数/解析标记，并展示 `response_truncated` 和结果完整性；不发明未记录的远端 run ID 或终止状态。未知远端执行、未取完结果、未处置候选仍进入计划与部分评估，不把 RPC 成功当作测试耗尽。
 
@@ -166,4 +221,4 @@ query / summary / routes 的明确不完整状态，以及新派发 HTTP 请求�
 
 ## 验证口径
 
-历史验收中，2026-10-30 的真实服务核对仅限元数据握手与工具目录；2026-10-31 另核对了 3.5.4 的空非默认项目查询结构及项目名裁剪行为。请求、非空结果解析、脱敏、候选归档与报告回归使用 mock / 临时隔离 fixture；未以元数据或空项目读取冒充目标扫描、漏洞验证或全量数据库审计。旧本地日志/备份不在仓库且已清理；当前测试与发行检查应按 [README](../README.md) 重跑，并查看新生成的结果。真实 MCP 能力仍需按实际服务版本、配置和授权另行核对。
+历史验收中，2026-10-30 的真实服务核对仅限元数据握手与工具目录；2026-10-31 另核对了 3.5.4 的空非默认项目查询结构及项目名裁剪行为；2026-11-21 又在线记录了 3.5.8、43 个 catalog 工具和目录 SHA-256，scanner tools 调用数和目标请求数均为 0。当前 2.3.0 的请求、非空结果解析、脱敏、来源归档与报告回归使用 mock / 临时隔离 fixture；最终完整回归及发行检查结果见 [README](../README.md)。主动 Tscan capability 为 unavailable，真实结果 API、扫描服务、桌面/WSL 未在本轮最终验收中实测。原始会话和本轮审计聚合仍保留在用户本地目录，未随发行包携带；更早历史验收日志的清理状态不影响本轮保存材料。真实 MCP 能力按实际服务版本、配置和绑定另行核对。

@@ -99,6 +99,18 @@ test('Git keeps public environment templates, source, tests, examples and the lo
   assert.deepEqual([...await ignoredByGit(paths)], []);
 });
 
+test('Git index contains no runtime projects, sessions, reports or build artifacts', async () => {
+  const { stdout } = await run('git', ['ls-files', '-z'], { ...EXEC, cwd: ROOT });
+  const tracked = stdout.split('\0').filter(Boolean).map(name => name.replaceAll('\\', '/'));
+  const forbidden = tracked.filter(name => {
+    if (/^(?:work|recon(?:-[^/]+)?|reports?|projects|data|backups?|\.validation|node_modules|build|dist)(?:\/|$)/.test(name)) return true;
+    if (/(?:^|\/)sessions?(?:\/|$)/.test(name)) return true;
+    return /(?:\.sqlite(?:3)?(?:-(?:wal|shm|journal))?|\.db(?:-(?:wal|shm|journal))?|\.env(?:\..+)?|\.tgz|\.log)$/.test(name)
+      && !/\.env\.(?:example|sample|template)$/.test(name);
+  });
+  assert.deepEqual(forbidden, [], 'Tracked runtime or credential-bearing artifacts must stay outside the source repository');
+});
+
 test('npm dry-run excludes private artifacts while retaining public templates and source examples', async (t) => {
   const tempRoot = await realpath(tmpdir());
   const stage = await mkdtemp(join(tempRoot, TEMP_PREFIX));

@@ -7,6 +7,7 @@ import json
 import re
 import socket
 import ssl
+import threading
 import time
 import unicodedata
 from urllib.parse import urlsplit
@@ -193,20 +194,40 @@ def request(url, method="GET", headers=None, body=None, timeout=15, max_bytes=10
     conn = (http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=ssl.create_default_context())
             if u.scheme == "https" else http.client.HTTPConnection(u.hostname, u.port, timeout=timeout))
     started, stamp, raw = time.monotonic(), now(), bytearray()
+    deadline = started + timeout
     result = {"request":{"url":url,"method":method,"headers":hdrs,
                          "body_base64":base64.b64encode(data or b"").decode()},
               "response":{"status":None,"headers":[],"complete":False},
               "started_at":stamp,"completed_at":None,"complete":False,
               "transport":"python-http-client","redirect_followed":False}
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError("Total capture deadline exceeded")
+        return value
+
+    def arm_socket():
+        # A fresh per-operation socket timeout is only a backstop. The watchdog
+        # below owns the single total deadline, including getresponse()'s status
+        # line and every response-header read.
+        conn.timeout = remaining()
+        if conn.sock is not None:
+            conn.sock.settimeout(conn.timeout)
+
+    watchdog = threading.Timer(timeout, conn.close)
+    watchdog.daemon = True
     try:
+        arm_socket()
+        watchdog.start()
         conn.request(method, u.path + ("?"+u.query if u.query else ""), body=data, headers=hdrs)
+        arm_socket()
         response = conn.getresponse()
         result["response"].update(status=response.status, headers=response.getheaders())
         expected = response.length
         complete = False
         while True:
-            if time.monotonic() - started >= timeout:
-                raise TimeoutError("Total capture deadline exceeded")
+            arm_socket()
             chunk = response.read1(min(65536, max_bytes + 1 - len(raw)))
             if not chunk:
                 complete = expected is None or len(raw) == expected
@@ -218,13 +239,16 @@ def request(url, method="GET", headers=None, body=None, timeout=15, max_bytes=10
                 del raw[max_bytes:]
                 result["error"] = "capture_budget_exceeded"
                 break
+        remaining()
         result["complete"] = result["response"]["complete"] = complete
     except (OSError, TimeoutError, http.client.HTTPException) as exc:
         if isinstance(exc, http.client.IncompleteRead):
             raw.extend(exc.partial[:max_bytes-len(raw)])
-        # Error classes are safe to return; URLs or headers need not be echoed.
-        result["error"] = type(exc).__name__
+        # A watchdog close can surface as RemoteDisconnected/BadStatusLine on
+        # some Python versions. Once the total deadline expired, report timeout.
+        result["error"] = "TimeoutError" if time.monotonic() >= deadline else type(exc).__name__
     finally:
+        watchdog.cancel()
         conn.close()
     result["response"].update(length=len(raw), body_base64=base64.b64encode(raw).decode(),
                                body_sha256=hashlib.sha256(raw).hexdigest())

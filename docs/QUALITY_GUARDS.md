@@ -1,7 +1,7 @@
 # Quality guards: anti-repeat and report redaction
 
-Version 2.1.0 adds bounded guards for two failure modes observed in long
-assessments:
+Version 2.3.0 keeps bounded repeat hints and report redaction checks for two
+failure modes observed in long assessments:
 
 1. a read-only queue page being inspected repeatedly without any state or
    evidence change;
@@ -10,39 +10,39 @@ assessments:
 
 ## 1. Queue loop guard
 
-`plan.next` tracks the exact returned page signature in a private sidecar file
-under `<project>/.loop_guard/next_work.json`. A page is counted only when the
-same page (same offset/limit and same row signatures) is returned again. A
-persisted obligation change also changes the signature, so legitimate review
-work is not frozen.
+`plan.next` tracks the exact returned page signature in a private SQLite
+advisory table. Updates are atomic across processes and do not mutate domain
+entities or events. Existing `<project>/.loop_guard/next_work.json` files may
+seed the advisory counter once; they remain historical files. A page is
+counted only when the same offset/limit, row signatures and obligation facts
+are returned again. A persisted obligation change resets the repeat count.
 
 After three identical page views:
 
-- the rows are marked `execution_blocked=true`;
-- the suggested action becomes `plan.review`;
-- `no_progress_frozen` is added to `missing_prerequisites`;
-- the user must reopen or change the prerequisite before the task can progress.
+- the rows carry `repeat_advisory:true`;
+- the hint asks the caller to inspect the actual blocker or perform the
+  prepared action;
+- readiness, suggested actions and missing prerequisites retain their
+  current values.
 
-The guard never deletes obligations, evaluates evidence, or changes the
-underlying ledger. It only prevents the same queue page from being consumed
-forever.
+Repeated reads cannot manufacture a blocker or an execution attempt. Actual
+attempt results and changed prerequisites govern task readiness.
 
-`assessment.prepare` has the same signature counter. If the same preparation
-set is returned three times without a state/evidence change, its
-`preparation_state` becomes `frozen`, `assessment_action` becomes
-`plan.review`, and the caller must change a prerequisite or evidence before
-retrying.
+`assessment.prepare` has the same bounded counter. After three views of the
+same preparation set, its rows carry `repeat_advisory:true` and an inspection
+hint. The preparation state and action retain their actual values.
 
 ## 2. Preflight deduplication
 
-`http.preflight` records the exact `request_signature` in
-`<project>/.loop_guard/preflight.json`. An identical request signature may be
-preflighted once per 24 hours. A second preflight raises `already_preflighted`
-and points to `http.capture`; it never sends a request and never creates a run
-or evidence record.
+`http.preflight` atomically records the exact `request_signature` in the same
+SQLite advisory store, with a 24-hour TTL and a bounded entry count. A repeated
+signature returns `repeat_advisory:true` after the normal current preflight
+checks. It still sends no request and creates no run or evidence record.
 
-The cache is a sidecar file, not SQLite metadata, because preflight must remain
-a read-only preparation action with no entity/event/metadata mutation.
+These actions write advisory state and therefore are excluded from the Node
+pure-read concurrency set. The historical `already_preflighted` code remains
+recognized for compatibility; repeated preparation does not raise it in the
+current path.
 
 ## 3. Report redaction regression fix
 
@@ -78,6 +78,7 @@ The regression suite covers:
 - short browser fill values do not become prose aliases;
 - a short submitted field is promoted without global string replacement;
 - preflight duplicate detection is bounded and TTL-aware;
-- repetitive page views freeze only after three identical signatures;
+- repetitive page views produce bounded hints after three identical
+  signatures while preserving task readiness and actions;
 - a changed obligation state resets the loop counter;
 - report generation rejects corrupted route vocabulary.

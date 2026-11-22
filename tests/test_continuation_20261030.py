@@ -66,6 +66,7 @@ class ContinuationTests(unittest.TestCase):
             "oracle": {"type": "semantic_negative", "test_family": "generic", "selector": "/count",
                        "baseline_expected": 1, "control_expected": 2}})
         self.baseline_evidence = baseline
+        self.variant_evidence = variant
         return baseline
 
     def frontier(self, evidence=None, blocked=False):
@@ -124,7 +125,7 @@ class ContinuationTests(unittest.TestCase):
         self.assertFalse(first["continuation"]["can_finalize"])
         with self.assertRaises(EngineError):
             self.finish(first)
-        second = self.checkpoint(self.frontier())
+        second = self.checkpoint(self.frontier(self.variant_evidence))
         self.assertEqual(first["checkpoint"]["snapshot_id"], second["checkpoint"]["snapshot_id"])
         self.assertTrue(second["continuation"]["can_finalize"])
         self.assertFalse(second["continuation"]["can_claim_complete"])
@@ -192,7 +193,7 @@ class ContinuationTests(unittest.TestCase):
     def test_new_checkpoint_resumes_even_without_new_material(self):
         self.close_generic()
         self.checkpoint(self.frontier())
-        checkpoint = self.checkpoint(self.frontier())
+        checkpoint = self.checkpoint(self.frontier(self.variant_evidence))
         finished = self.finish(checkpoint)
         resumed = self.checkpoint()
         self.assertEqual(checkpoint["checkpoint"]["snapshot_id"], resumed["checkpoint"]["snapshot_id"])
@@ -207,6 +208,58 @@ class ContinuationTests(unittest.TestCase):
         with self.assertRaises(EngineError) as caught:
             self.finish(checkpoint)
         self.assertEqual("checkpoint_stale", caught.exception.code)
+
+    def test_partial_acceptance_is_current_checkpoint_bound_and_never_completion(self):
+        checkpoint = self.checkpoint(label="Current partial checkpoint")
+        accepted = continuation.accept_partial(self.project, {
+            "checkpoint_id": checkpoint["checkpoint"]["id"],
+            "accepted_by": "fixture-owner",
+            "explanation": "Deliver the bounded partial evidence with restore conditions.",
+        })
+        receipt = accepted["partial_acceptance"]
+        self.assertRegex(receipt["id"], r"^CA-[0-9a-f]{64}$")
+        self.assertEqual(checkpoint["checkpoint"]["id"], receipt["checkpoint_id"])
+        self.assertEqual(checkpoint["checkpoint"]["snapshot_id"], receipt["snapshot_id"])
+        self.assertEqual("partial_accepted", receipt["reason"])
+        self.assertFalse(receipt["can_claim_complete"])
+        self.assertFalse(receipt["automatic_stop_allowed"])
+        self.assertTrue(receipt["continue_required"])
+        self.assertTrue(accepted["continuation"]["continue_required"])
+        self.assertFalse(accepted["continuation"]["automatic_stop_allowed"])
+        self.assertFalse(accepted["continuation"]["can_claim_complete"])
+        self.assertEqual(receipt["id"], accepted["continuation"]["partial_acceptance_id"])
+        repeated = continuation.accept_partial(self.project, {
+            "checkpoint_id": checkpoint["checkpoint"]["id"],
+            "accepted_by": "fixture-owner",
+            "explanation": "Deliver the bounded partial evidence with restore conditions.",
+        })
+        self.assertEqual(receipt, repeated["partial_acceptance"])
+        self.assertEqual(1, len(self.project.list("completion_acceptance")))
+
+        self.capture(url=self.operation["url"] + "?q=changed")
+        before = len(self.project.list("completion_acceptance"))
+        with self.assertRaises(EngineError) as caught:
+            continuation.accept_partial(self.project, {
+                "checkpoint_id": checkpoint["checkpoint"]["id"],
+                "accepted_by": "replacement-owner",
+                "explanation": "A stale delivery cannot replace the current checkpoint.",
+            })
+        self.assertEqual("checkpoint_stale", caught.exception.code)
+        self.assertEqual(before, len(self.project.list("completion_acceptance")))
+
+    def test_partial_acceptance_cannot_borrow_exhausted_completion_authority(self):
+        self.close_generic()
+        self.checkpoint(self.frontier())
+        current = self.checkpoint(self.frontier(self.variant_evidence))
+        self.assertTrue(current["continuation"]["can_finalize"])
+        with self.assertRaises(EngineError) as caught:
+            continuation.accept_partial(self.project, {
+                "checkpoint_id": current["checkpoint"]["id"],
+                "accepted_by": "fixture-owner",
+                "explanation": "The completed snapshot cannot be relabeled as partial.",
+            })
+        self.assertEqual("partial_acceptance", caught.exception.code)
+        self.assertEqual([], self.project.list("completion_acceptance"))
 
     def test_repeated_captures_are_not_closure_progress_or_stop_permission(self):
         first = self.checkpoint()
@@ -469,7 +522,7 @@ class ContinuationTests(unittest.TestCase):
         result = self.checkpoint(self.frontier(), label="auth_token=private-round-value")
         self.assertNotIn("private-round-value", json.dumps(result))
         self.assertIn("private-round-value", self.project.get("checkpoint", result["checkpoint"]["id"])["label"])
-        result = self.finish(self.checkpoint(self.frontier()), explanation="password=private-stop-value", reviewer="token=private-reviewer-value")
+        result = self.finish(self.checkpoint(self.frontier(self.variant_evidence)), explanation="password=private-stop-value", reviewer="token=private-reviewer-value")
         self.assertNotIn("private-stop-value", json.dumps(result))
         self.assertNotIn("private-reviewer-value", json.dumps(result))
         self.assertIn("private-stop-value", self.project.get("finalization", result["finalization"]["id"])["explanation"])
@@ -487,7 +540,7 @@ class ContinuationTests(unittest.TestCase):
         from awa_ddd.reporting import build_report
         self.close_generic()
         self.checkpoint(self.frontier())
-        stopped = self.finish(self.checkpoint(self.frontier()))
+        stopped = self.finish(self.checkpoint(self.frontier(self.variant_evidence)))
         result = build_report(self.project, stage="final", finalization_id=stopped["finalization"]["id"])
         self.assertEqual("final-completed", result["delivery_status"])
         self.assertTrue(result["continuation"]["can_claim_complete"])
@@ -540,8 +593,8 @@ class ContinuationTests(unittest.TestCase):
 
     def test_old_frontier_history_is_not_revalidated_without_bound(self):
         self.close_generic()
-        for _ in range(2):
-            self.checkpoint(self.frontier())
+        self.checkpoint(self.frontier())
+        self.checkpoint(self.frontier(self.variant_evidence))
         with patch.object(engine, "verify_current_evidence", wraps=engine.verify_current_evidence) as verify:
             engine.evaluate_coverage(self.project)
             small = verify.call_count
@@ -555,6 +608,13 @@ class ContinuationTests(unittest.TestCase):
 
     def test_new_actions_dispatch_using_public_protocol(self):
         result = dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "label": "protocol fixture"})
+        self.assertEqual(
+            result["continuation"]["completion_decision"],
+            result["completion_decision"])
+        self.assertEqual(
+            result["completion_decision"]["id"],
+            result["continuation"]["completion_decision"]["id"])
+        self.assertFalse(result["completion_decision"]["can_finalize"])
         with self.assertRaises(EngineError) as caught:
             dispatch(self.root, "plan.finalize", {"project_id": "continuation",
                 "checkpoint_id": result["checkpoint"]["id"], "reason": "user_stop", "reviewer": "fixture user",
@@ -565,7 +625,7 @@ class ContinuationTests(unittest.TestCase):
         self.assertTrue(draft["continuation"]["continue_required"])
         self.close_generic()
         dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "frontier_review": self.frontier()})
-        result = dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "frontier_review": self.frontier()})
+        result = dispatch(self.root, "plan.checkpoint", {"project_id": "continuation", "frontier_review": self.frontier(self.variant_evidence)})
         stopped = dispatch(self.root, "plan.finalize", {"project_id": "continuation",
             "checkpoint_id": result["checkpoint"]["id"], "reason": "completed", "reviewer": "fixture user",
             "explanation": "The finite fixture obligations and current complete frontier reviews are closed."})

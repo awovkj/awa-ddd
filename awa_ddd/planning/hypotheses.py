@@ -11,6 +11,7 @@ import re
 
 from ..domain.common import digest, stable_id
 from ..domain.hypothesis import new_hypothesis
+from ..domain.taxonomy import canonical_family
 
 MAX_HYPOTHESES = 20000
 UNKNOWN_CONSUMERS = {"", "unknown", "other", "untraced", "unspecified"}
@@ -84,19 +85,28 @@ def _push(rows, seen, hypothesis):
     rows.append(hypothesis)
 
 
-def generate_hypotheses(universe, known_cases=None):
+def generate_hypotheses(universe, known_cases=None, *, campaign_id=None):
     """Return (hypotheses, limited) without writing to the repository."""
     operations = _operation_lookup(universe)
     hypothesis_rows, seen = [], set()
     limited = False
     scope_epoch = universe.get("scope_epoch")
-    target_build = universe.get("target_build") or universe.get("snapshot_hash", "")[:16]
+    target_build = universe.get("target_build") or "unknown"
+    universe_id = universe.get("id")
+
+    def create(**kwargs):
+        return new_hypothesis(
+            campaign_id=campaign_id,
+            universe_id=universe_id,
+            **kwargs,
+        )
 
     for operation in universe.get("operations", []):
         op_id = operation.get("operation_id")
         inputs = operation.get("inputs", [])
         for entry in inputs:
-            families = [family for family in entry.get("test_families") or [] if isinstance(family, str)]
+            families = [family for raw in entry.get("test_families") or []
+                        if (family := canonical_family(raw)) is not None]
             consumer_unknown = str(entry.get("consumer") or "").strip().lower() in UNKNOWN_CONSUMERS
             context = ["actual_input_consumer"] if consumer_unknown else ["normal_business_assertion", "property_specific_controls"]
             semantic = _semantic_rules(entry)
@@ -108,7 +118,7 @@ def generate_hypotheses(universe, known_cases=None):
                 planned.append(("generic", "needs_consumer", context))
             for family, prop, missing in planned:
                 status = "blocked" if consumer_unknown or any(item in {"actual_input_consumer"} for item in missing) else "ready"
-                _push(hypothesis_rows, seen, new_hypothesis(
+                _push(hypothesis_rows, seen, create(
                     family=family,
                     security_property=prop,
                     operation_id=op_id,
@@ -129,7 +139,7 @@ def generate_hypotheses(universe, known_cases=None):
         auth = operation.get("auth")
         route_text = str(operation.get("url_template") or "") + " " + str(operation.get("operation_id") or "")
         if auth and auth != "public":
-            _push(hypothesis_rows, seen, new_hypothesis(
+            _push(hypothesis_rows, seen, create(
                 family="access_control", security_property="authentication_enforcement",
                 operation_id=op_id, scope_epoch=scope_epoch, target_build=target_build,
                 source_kind="access_policy",
@@ -137,7 +147,7 @@ def generate_hypotheses(universe, known_cases=None):
                 missing_context=["verified_principal_and_roles"],
                 status="blocked"))
         if operation.get("ownership"):
-            _push(hypothesis_rows, seen, new_hypothesis(
+            _push(hypothesis_rows, seen, create(
                 family="access_control", security_property="principal_tenant_boundary",
                 operation_id=op_id, scope_epoch=scope_epoch, target_build=target_build,
                 source_kind="access_policy",
@@ -146,7 +156,7 @@ def generate_hypotheses(universe, known_cases=None):
                 status="blocked"))
         if operation.get("method") not in {"GET", "HEAD", "OPTIONS"}:
             for prop in ("state_transition_authorization", "operation_idempotency"):
-                _push(hypothesis_rows, seen, new_hypothesis(
+                _push(hypothesis_rows, seen, create(
                     family="business_logic" if prop == "operation_idempotency" else "access_control",
                     security_property=prop, operation_id=op_id, scope_epoch=scope_epoch,
                     target_build=target_build, source_kind="access_policy",
@@ -154,7 +164,7 @@ def generate_hypotheses(universe, known_cases=None):
                     missing_context=["owned_test_fixture", "state_readback", "declared_transition_policy"],
                     status="blocked"))
         if re.search(r"login|signin|auth|password|验证码|密码", route_text, re.I):
-            _push(hypothesis_rows, seen, new_hypothesis(
+            _push(hypothesis_rows, seen, create(
                 family="business_logic", security_property="authentication_retry_limits",
                 operation_id=op_id, scope_epoch=scope_epoch, target_build=target_build,
                 source_kind="access_policy",
@@ -163,7 +173,7 @@ def generate_hypotheses(universe, known_cases=None):
                 status="blocked"))
 
     for function in universe.get("functions", []):
-        _push(hypothesis_rows, seen, new_hypothesis(
+        _push(hypothesis_rows, seen, create(
             family="access_control", security_property="page_function_authorization",
             operation_id="PAGE:" + str(function.get("page_id")),
             input_key=function.get("function_id"), scope_epoch=scope_epoch, target_build=target_build,
@@ -175,12 +185,12 @@ def generate_hypotheses(universe, known_cases=None):
     for case in known_cases or []:
         case = case if isinstance(case, dict) else {}
         op_id = _known_case_operation(case, operations)
-        _push(hypothesis_rows, seen, new_hypothesis(
+        _push(hypothesis_rows, seen, create(
             family=case.get("family") or "generic",
             security_property=case.get("mechanism") or "known_case_mechanism",
             operation_id=op_id,
             input_key=case.get("dedupe_key"),
-            scope_epoch=scope_epoch, target_build=case.get("build") or target_build,
+            scope_epoch=scope_epoch, target_build=target_build,
             source_kind="known_case", source_ref=case.get("source_ref"),
             known_case_id=case.get("id"),
             statement=f"已知案例 {case.get('id')}：{case.get('mechanism')} 在 {case.get('method')} {case.get('url')} 是否真实存在；案例只作选题。",

@@ -122,6 +122,6 @@ dsh-purge 的内部组件目录保留原 [MIT 许可](../LICENSE) 内容与版�
 
 `tests/test_src_integration_20261111.py` 使用独立临时项目和合成 HTTP 证据验证 scope/exclude、批量原子性、幂等/冲突、秘密复用脱敏、来源与实际证据的区别、精确族/输入绑定和修改证据后的失效。`tests/src-mode.test.mjs` 通过实际 Python bridge 验证 v1/v2 入口。测试不调用外部目标、扫描器或利用工具。
 
-dsh-purge 仓库的 `test/redteam-embedded-engine.test.mjs` 将受管核心、内部说明文件及声明的 acorn 依赖复制到独立临时安装，实际调用其中的 Python 引擎，验证无需同级 awa-ddd、源码完整性、SRC 写入前零请求拒绝、静态 JS 不执行、候选确认声明不获得证明，以及私有上下文的并发合并和事务回滚。`test/redteam-native-assessment.test.mjs` 从隔离的 `lib` 安装验证原生初始化、当前机器证明的复核、observed 证据、SRC 停止及报告生命周期。
+dsh-purge 1.8.0 仓库的历史 `test/redteam-embedded-engine.test.mjs` 将其内嵌的 2.2.0 受管核心、内部说明文件及当时声明的 acorn 依赖复制到独立临时安装，实际调用其中的 Python 引擎，验证无需同级 awa-ddd、源码完整性、SRC 写入前零请求拒绝、静态 JS 不执行、候选确认声明不获得证明，以及私有上下文的并发合并和事务回滚。`test/redteam-native-assessment.test.mjs` 从隔离的 `lib` 安装验证原生初始化、当前机器证明的复核、observed 证据、SRC 停止及报告生命周期。本仓库 2.3.0 已改为内置 Acorn 8.19.0、MIT 许可和逐资源 SHA-256 清单，不声明直接 acorn 依赖；下游仍需在显式同步时适配并重新验收该资源布局。
 
 这些测试分别验证独立契约和内置使用路径。真实 DSH GUI、外部工具安装、实际目标及完整桌面部署需另行验收；历史验收记录不等于本次测试已通过。

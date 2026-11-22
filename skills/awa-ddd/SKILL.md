@@ -5,27 +5,19 @@ description: 使用 awa-ddd 在已有授权范围内进行证据驱动安全评�
 
 # awa-ddd
 
-awa-ddd 使用当前 dsh 模型与本地 SQLite 台账。默认 `assessmentModel:v1`（10 组、67 动作）；`v2` 注册 6 组 Campaign 工具。源码/报告维护不启动目标评估；历史材料和新建项目不提供新测试授权。
+awa-ddd 使用本地 SQLite 台账。默认 `assessmentModel:v1`（10 组、75 动作）；`v2` 注册 6 组、48 个 Campaign 动作。源码/报告维护不启动目标评估；历史和新建项目不提供新测试授权。
 
-SRC 用创建时固定的 `assessment_mode:src`；`assessmentMode:src` 或 `/src` 选新项目偏好，off 不降级旧项目。只做有界直接证据发现，确认后停止同操作，未测分母保留。dsh-purge 用 `integration.import/export` 交换候选，来源 confirmed 不成 machine；精确绑定 operation/input 后复核当前证据。细节按需读 [SRC](../../docs/SRC-MODE.md) 与 [交换](../../docs/INTEGRATION-DSH-PURGE.md)。
+SRC 用创建时固定的 `assessment_mode:src`；`assessmentMode:src` 或 `/src` 只选新项目偏好，off 不降级旧项目。只做有界直接证据发现，确认后停止同操作并保留未测分母。dsh-purge 通过 `integration.import/export` 交换候选，来源 confirmed 仍为 unverified；精确绑定后复核当前证据。细节见 [SRC](../../docs/SRC-MODE.md) 与 [交换](../../docs/INTEGRATION-DSH-PURGE.md)。
 
 ## 2.0 战役入口
 
-v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test.run → review.finding → report.matrix`。Universe 仅有来源范围；`effect_unknown` 先读回、不重放；`partial_accepted` 不是耗尽；旧 decision 迁移只成 `legacy_evaluation`，不合成 TestRun。
+v2：`campaign.start → recon → campaign.next → test.run → review → frontier → checkpoint → finish → report.matrix`。写测试先 `test.fixture_create/verify/lease`，结束 `readback/cleanup`；自动写仅发 attack，其余未观察；verify 须原 run_id 和完整 control 绑定。Universe 增量使旧完成失效；`effect_unknown` 先读回不重放；partial 非耗尽；旧 decision 仅成 `legacy_evaluation`。
 
 ## 入口与按需帮助
 
-安全评估任务才使用此入口：已有项目先 `project.status` 和 `surface.recon prepare`，缺项目才 `project.create`。已有信息基线只补变化，再读小页 `plan.next`。所有动作字段放 `input`，顶层只放 `action/project_id/input`。**帮助调用管理组：v1 awa_project，v2 awa_admin**；`action.help` 不发到其他组：
+安全评估任务才使用此入口：已有项目先 `project.status` 和 `surface.recon prepare`，缺项目才 `project.create`；补信息变化后读小页 `plan.next`。动作字段均放 `input`，顶层仅 `action/project_id/input`。**帮助入口：v1 `awa_project`，v2 `awa_admin`**；`action.help` 不发到其他组。
 
-```json
-{"action":"action.help","input":{"name":"assessment.evaluate"}}
-```
-
-陌生动作按需查帮助，不反复加载手册。先用 `assessment.prepare` 按义务/发现/证据 ID 离线复核已有控制与缺字段，再求值；它不发请求、不创建判定。旧人工发现可用 `finding.bind {finding_id,decision_id,reviewer,reason}` 关联真实当前证明并保留历史。开局示例：
-
-```json
-{"action":"plan.next","project_id":"assessment","input":{"limit":3,"parameter_limit":3,"parameter_status":"untested"}}
-```
+陌生动作按需 `action.help`。`assessment.prepare` 按义务/发现/证据 ID 离线复核控制与缺字段，不发请求、不创建判定；旧发现经 `finding.bind` 绑定当前真实证明并保留历史。
 
 主游标 `offset/next_offset` 与参数游标 `parameter_offset/parameter_coverage.next_offset` 独立。观察到字段不等于 typed 已测；`plan.build.obligations` 是计数，`obligation_items` 是明细。
 
@@ -33,11 +25,7 @@ v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test
 
 先统筹当前授权范围、站点/技术栈线索、正常页面与静态资源、接口/输入、功能流程和身份资源前提，再选择测试假设。`surface.recon` 不发请求：prepare 给收集入口；用现有 HTTP/真实 Playwright/OpenAPI/JS/HAR 工具集中采集获准材料，再 aggregate 建立可复用画像。
 
-```json
-{"action":"surface.recon","project_id":"assessment","input":{"mode":"aggregate","section":"overview"}}
-```
-
-按需读 technologies/functions/clues/collection/hypotheses。独立属性清单提示令牌生命周期、重试、金额/时间、状态授权和幂等等不同机制；声明与已有响应均不证明这些属性已测。指纹和属性均为来源 hint，未知前提保留。`baseline_reused:true` 时复用信息；画像不自动登记、执行或确认漏洞。
+按需读 technologies/functions/clues/collection/hypotheses。令牌生命周期、重试、金额/时间、状态授权和幂等等需分别验证；声明和已有响应都不证明已测。指纹/属性只是 hint，未知前提保留；`baseline_reused:true` 可复用画像，画像不会自动登记、执行或确认漏洞。
 
 ## 始终保留的边界
 
@@ -50,9 +38,9 @@ v2 模式：`campaign.start → recon.snapshot/import → campaign.next → test
 
 ## 操作、输入和判据
 
-先 `surface.import/register/batch` 建操作与精确输入，最多 50 项的批量登记返回真实 ID，不猜 ID。`surface.inspect` 检查策略和 selector，`surface.declare_consumer` 记录实际消费点及独立 `test_families`。SQL、XSS、访问控制和业务逻辑是不同义务；线索名字、评分和同名 JS sink 不是运行时证明。未知消费点或访问策略先追踪，不靠一次正常响应推断允许主体。
+本地材料先 `surface.import mode:preview` 保存不可变快照；Actuator 须显式 `base_url`。审核来源差集后，仅用返回的真实 `snapshot_id` 加 `mode:apply` 按 `next_input` 分页交接（默认 25、最多 100），不得混入 path/format/base_url；截断展示改从只读 `surface.sources` 读取 source/snapshot/status，禁止重放 import。已知未登记、历史 pending、冲突和未解析数是来源分母，不是全站或漏洞分母；模板仍须真实绑定，来源登记不关闭测试。也可 `surface.register/batch` 建精确输入（batch≤50，只用真实 ID），再以 `surface.inspect/declare_consumer` 查策略、selector 与实际消费点；SQL、XSS、访问控制和业务逻辑是独立义务，线索名、评分及同名 JS sink 不是运行时证明。完整规则见 [来源账本](../../docs/UPGRADE-20261121-SOURCE-LEDGER.md)。
 
-对照须同身份/会话代、同 fixture 和其它输入不变，只改变绑定的测试输入。JSON 字段用精确 Pointer，数组/分支不能含糊；multipart 文件名和内容分别绑定，文件名实验保持自有内容不变。复杂正文优先 `body_file` 原字节或 `body_base64`，避免 PowerShell 多层插值；multipart BOM 必须准备新的无 BOM 文件，不能静默修改旧证据。
+对照须同身份/会话代、同 fixture，只改变绑定输入；JSON 用精确 Pointer，数组/分支不得含糊。multipart 文件名与内容分别绑定，文件名单变量时内容不变；复杂正文用 `body_file`/`body_base64` 保持原字节，BOM 文件重建，不静默改旧证据。
 
 目标实验用 `http.capture/scenario.run` 留证，shell 用于本地材料准备。台账外结果只作未验证线索，先核查已有影响，再准备受控对照；不能为填账重发未知写入。
 
@@ -69,7 +57,7 @@ required 和 assisted 都要求实际 Playwright；assisted 不是可选建议�
 
 查看 `call_needed/invoke_now/stage`：capture_controls/prepare 先补控制，blocked 不绕前提，review_existing 离线复核。优先宿主 Playwright MCP；本地不可用不能否定宿主 MCP，native 先 `browser.probe`。MCP 导入不绑定 session/actor；native 不支持上传/任意 evaluate/多 context，不伪装成 click。
 
-`runtime.probe` 的 `sqlmap_candidates` 给已验证 backend/路径，按模板显式 `tool.probe`；保留当前后端，WSL 用独立台账。Yakit/sqlmap 仍受范围/身份/fixture 门禁；TscanPlus 只用 loopback、短 namespace（最多 20 字符），只读结果不执行扫描/POC/爆破/JWT 建议，断连不证明远端停止。
+外部工具仅用管理员 `trustedSqlmapPath/trustedYakPath`（可含 SHA-256），runtime candidates 仅是线索；浏览器默认只读且严格 TLS，WSL 用独立台账。TscanPlus 仅用 loopback、短 namespace。`tool.tscanplus_ingest` 只读已有 results/routes：后续用同一 `snapshot_id` 经 `surface.import` 翻页，不重读远端；行永远 unverified/hint-only，不执行扫描/POC/爆破/JWT 建议，断连不证明远端停止。
 
 ## 推进、无进展与交付
 

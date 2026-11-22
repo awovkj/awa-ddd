@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import quote, quote_plus, unquote, urlsplit
@@ -34,14 +36,24 @@ from urllib.parse import quote, quote_plus, unquote, urlsplit
 from .store import EngineError, canonical, contained, now
 from .scope import normalize_url, origin, require_scope
 from .transport import headers_map
+from .runtime import clean_environment
 
 VISIT_STATUSES = {"visited", "BLOCKED"}
 TRIGGER_STATUSES = {"triggered", "BLOCKED"}
 _SAFE_EXTRA_HEADERS = {"accept", "accept-language", "cache-control", "pragma", "dnt", "sec-gpc"}
 _INTERACTIONS = {"click", "fill", "press"}
 _ACTION_TYPES = _INTERACTIONS | {"wait", "waitForSelector", "waitForDialog", "waitForURL"}
+
+
+def _terminal_run_status(guard_complete, observation_complete):
+    if not guard_complete:
+        return "failed"
+    return "succeeded" if observation_complete else "interrupted"
 _STRUCTURAL_SIGNALS = {"hasApp", "forms", "inputs", "buttons", "links", "textLength", "selectorCount"}
 _OBSERVATION_BUDGET = 4 * 1024 * 1024
+_DOM_CAPTURE_BUDGET = 4 * 1024 * 1024
+_ATTACHMENT_BUDGET = 16 * 1024 * 1024
+_BROWSER_TLS_ENV = "AWA_DDD_ADMIN_BROWSER_IGNORE_HTTPS_ERRORS"
 
 # Candidate locations for a Node + playwright-core installation. Checked in order;
 # the first one whose chromium can actually launch wins.
@@ -135,7 +147,8 @@ def probe():
         script.write_text(_PROBE, encoding="utf-8")
         try:
             process = subprocess.run([state["node"], str(script), state["module_root"]],
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                                     env=clean_environment())
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"available": False, "reason": "probe_failed", "detail": type(exc).__name__}
     try:
@@ -152,9 +165,11 @@ def probe():
 _VISIT = r"""
 const [moduleRoot, specPath] = process.argv.slice(2);
 const fs = require('fs');
+const { spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const spec = JSON.parse(fs.readFileSync(specPath, 'utf8'));
 const BODY_DIGEST_BUDGET = 8 * 1024 * 1024;
+const DOM_CAPTURE_BUDGET = 4 * 1024 * 1024;
 function digest(data) { return createHash('sha256').update(data).digest('hex'); }
 
 // The descriptors are produced by Python's scope normalizer. Reject ambiguous
@@ -198,8 +213,11 @@ function sameOrigin(raw, base) {
 (async () => {
   const out = { url: spec.url, finalUrl: null, status: null, started_at: new Date().toISOString(),
                 headless: spec.headless !== false, console: [], dialogs: [],
-                network: [], blocked_requests: [], actions: [] };
-  let browser, context, page, actionIndex = null;
+                network: [], blocked_requests: [], actions: [],
+                requests_attempted: 0, writes_attempted: 0,
+                request_budget: spec.maxRequests, write_budget: spec.maxWrites };
+  let browser, context, page, actionIndex = null, requestOccurrence = 0;
+  let requestsAttempted = 0, writesAttempted = 0;
   function block(url, method, reason, extra) {
     if (out.blocked_requests.length < 1000) {
       out.blocked_requests.push({ url, method, reason, action_index: actionIndex, ...extra });
@@ -213,7 +231,14 @@ function sameOrigin(raw, base) {
       pick.inputs = document.querySelectorAll('input,textarea,select').length;
       pick.buttons = document.querySelectorAll('button,[role=button]').length;
       pick.links = document.querySelectorAll('a[href]').length;
-      pick.textLength = (document.body && document.body.innerText || '').length;
+      // Count text nodes incrementally instead of materializing a potentially
+      // unbounded innerText string merely to obtain its length.
+      let textLength = 0;
+      const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node && textLength <= 4 * 1024 * 1024; node = walker.nextNode()) {
+        textLength += String(node.nodeValue || '').length;
+      }
+      pick.textLength = Math.min(textLength, 4 * 1024 * 1024 + 1);
       if (s && s.selector) pick.selectorCount = document.querySelectorAll(s.selector).length;
       return pick;
     }, spec.signals || null);
@@ -224,6 +249,41 @@ function sameOrigin(raw, base) {
       out.scope_error = 'final_url_out_of_scope';
       throw new Error('final_url_out_of_scope');
     }
+  }
+  function guardRequest(url, method, entry, request) {
+    if (!spec.guardPython || !spec.guardSpecPath) throw Object.assign(new Error('request_guard_unavailable'), {reason: 'request_guard_unavailable'});
+    requestOccurrence += 1;
+    const requestPath = `${spec.guardSpecPath}.${requestOccurrence}.request.json`;
+    const payload = {
+      ...spec.guardContext,
+      occurrence: requestOccurrence,
+      request: {
+        url, method, request_body_sha256: entry.request_body_sha256 || null,
+        resource_type: entry.type || null, action_index: entry.action_index,
+        request_body_base64: entry.request_body_base64 || null,
+        content_type: entry.request_headers && entry.request_headers['content-type'] || null,
+      },
+    };
+    fs.writeFileSync(requestPath, JSON.stringify(payload), { flag: 'wx', mode: 0o600 });
+    let guarded;
+    try {
+      guarded = spawnSync(spec.guardPython,
+        ['-E', '-s', '-X', 'utf8', '-m', 'awa_ddd.request_guard', requestPath],
+        { cwd: spec.guardCwd, env: process.env,
+          encoding: 'utf8', timeout: 15000, windowsHide: true,
+          stdio: ['ignore', 'pipe', 'inherit'] });
+    } finally {
+      try { fs.unlinkSync(requestPath); } catch (_) {}
+    }
+    let decision = null;
+    try { decision = JSON.parse((guarded.stdout || '').trim().split('\n').at(-1)); } catch (_) {}
+    if (guarded.error || guarded.status !== 0 || !decision || decision.ok !== true) {
+      const reason = decision && typeof decision.reason === 'string'
+        ? decision.reason : (guarded.error && guarded.error.code === 'ETIMEDOUT'
+          ? 'request_guard_timeout' : 'request_guard_failed');
+      throw Object.assign(new Error(reason), { reason });
+    }
+    entry.guard_dispatch_id = decision.dispatch_id;
   }
   function attach(p) {
     p.on('console', m => {
@@ -241,6 +301,16 @@ function sameOrigin(raw, base) {
       }
     });
   }
+  async function writeDOM(destination) {
+    // Playwright exposes whole-document serialization, not a verified streaming
+    // reader. Preflight in the page, then recheck actual UTF-8 bytes before any
+    // artifact is accepted; oversized DOM captures remain incomplete.
+    const units = await page.evaluate(() => String(document.documentElement && document.documentElement.outerHTML || '').length);
+    if (units > DOM_CAPTURE_BUDGET) throw new Error('dom_capture_budget_exceeded');
+    const content = await page.content();
+    if (Buffer.byteLength(content, 'utf8') > DOM_CAPTURE_BUDGET) throw new Error('dom_capture_budget_exceeded');
+    fs.writeFileSync(destination, content, { flag: 'wx' });
+  }
   try {
     if (!allowed(spec.url)) throw new Error('initial_url_out_of_scope');
     const { chromium } = require(moduleRoot + '/node_modules/playwright-core');
@@ -249,7 +319,7 @@ function sameOrigin(raw, base) {
       args: ['--disable-background-networking'],
     });
     context = await browser.newContext({
-      ignoreHTTPSErrors: true, userAgent: spec.userAgent || undefined,
+      ignoreHTTPSErrors: spec.ignoreHTTPSErrors === true, userAgent: spec.userAgent || undefined,
       extraHTTPHeaders: spec.headers || {}, serviceWorkers: 'block',
       acceptDownloads: false, permissions: [],
     });
@@ -301,7 +371,36 @@ function sameOrigin(raw, base) {
           const body = request.postDataBuffer() || Buffer.alloc(0);
           entry.request_body_sha256 = digest(body);
           entry.request_body_bytes = body.length;
+          if (entry.write) {
+            if (body.length > 1024 * 1024) {
+              entry.blocked = true; entry.reason = 'write_body_budget_exceeded';
+              block(url, method, entry.reason, { type: entry.type });
+              await route.abort('blockedbyclient'); return;
+            }
+            entry.request_body_base64 = body.toString('base64');
+          }
         }
+        if (requestsAttempted >= spec.maxRequests) {
+          entry.blocked = true; entry.reason = 'request_slot_budget_exhausted';
+          block(url, method, entry.reason, { type: entry.type });
+          await route.abort('blockedbyclient'); return;
+        }
+        if (entry.write && writesAttempted >= spec.maxWrites) {
+          entry.blocked = true; entry.reason = 'write_slot_budget_exhausted';
+          block(url, method, entry.reason, { type: entry.type });
+          await route.abort('blockedbyclient'); return;
+        }
+        try {
+          guardRequest(url, method, entry, request);
+        } catch (e) {
+          entry.blocked = true; entry.reason = e.reason || 'request_guard_failed';
+          block(url, method, entry.reason, { type: entry.type });
+          await route.abort('blockedbyclient'); return;
+        }
+        requestsAttempted += 1;
+        if (entry.write) writesAttempted += 1;
+        out.requests_attempted = requestsAttempted;
+        out.writes_attempted = writesAttempted;
         // Playwright's route callback does not run on subsequent automatic
         // redirects. Fetch one response only; do not continue any redirect chain.
         const response = await route.fetch({ headers, maxRedirects: 0, maxRetries: 0, timeout: spec.timeout || 20000 });
@@ -311,17 +410,22 @@ function sameOrigin(raw, base) {
           entry.response_body_complete = false;
           const declared = entry.response_headers['content-length'];
           const declaredBytes = typeof declared === 'string' && /^\d+$/.test(declared) ? Number(declared) : null;
-          // A known oversized body is never read for proof. Unknown lengths are
-          // checked after the actual response body arrives, before hashing it.
-          if (declaredBytes === null || declaredBytes <= BODY_DIGEST_BUDGET) {
+          // APIResponse.body() materializes the complete value in this
+          // Playwright profile. Read only a known, bounded representation; an
+          // unknown-length response remains explicitly incomplete rather than
+          // being fully buffered and checked afterwards.
+          if (declaredBytes !== null && declaredBytes <= BODY_DIGEST_BUDGET) {
             try {
               const body = await response.body();
               entry.response_body_bytes = body.length;
-              if (body.length <= BODY_DIGEST_BUDGET) {
+              if (body.length <= BODY_DIGEST_BUDGET && body.length === declaredBytes) {
                 entry.response_body_sha256 = digest(body);
                 entry.response_body_complete = true;
-              }
-            } catch (_) { /* Fetch can still render; an unread body is not proof. */ }
+              } else entry.response_body_digest_status = 'length_mismatch_or_budget_exceeded';
+            } catch (_) { entry.response_body_digest_status = 'read_failed'; }
+          } else {
+            entry.response_body_digest_status = declaredBytes === null
+              ? 'not_read_unknown_length' : 'not_read_over_budget';
           }
         }
         const location = entry.response_headers.location;
@@ -412,8 +516,8 @@ function sameOrigin(raw, base) {
       out.screenshotBytes = buf.length;
       fs.writeFileSync(spec.screenshot, buf, { flag: 'wx' });
     }
-    if (spec.html) fs.writeFileSync(spec.html, await page.content(), { flag: 'wx' });
-    if (spec.afterActionsHtml) fs.writeFileSync(spec.afterActionsHtml, await page.content(), { flag: 'wx' });
+    if (spec.html) await writeDOM(spec.html);
+    if (spec.afterActionsHtml) await writeDOM(spec.afterActionsHtml);
   } catch (e) {
     out.error = String(e.message).split('\n')[0].slice(0, 300);
   } finally {
@@ -428,6 +532,8 @@ function sameOrigin(raw, base) {
     }
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
+    out.requests_attempted = requestsAttempted;
+    out.writes_attempted = writesAttempted;
     out.completed_at = new Date().toISOString();
   }
   console.log(JSON.stringify(out));
@@ -442,6 +548,14 @@ def _scope_descriptors(config, key):
         result.append({"scheme": parsed.scheme, "authority": parsed.netloc,
                        "root": unquote(parsed.path).rstrip("/"), "query": parsed.query})
     return result
+
+
+def _attachment_sha256(path):
+    with path.open("rb") as stream:
+        raw = stream.read(_ATTACHMENT_BUDGET + 1)
+    if len(raw) > _ATTACHMENT_BUDGET:
+        raise EngineError("browser_observation", "Browser attachment exceeds its bounded read budget")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _number(args, key, default, maximum, *, minimum=0):
@@ -576,9 +690,19 @@ def _visit_target(raw, page_url):
     return False, None
 
 
-def _successful(project, raw):
-    if raw.get("error") or raw.get("scope_error") or raw.get("blocked_requests") or raw.get("network_truncated"):
+def _successful(project, raw, *, require_guard=False):
+    if raw.get("error") or raw.get("scope_error") or raw.get("guard_error") \
+            or raw.get("blocked_requests") or raw.get("network_truncated"):
         return False
+    if require_guard or any(key in raw for key in (
+            "requests_attempted", "writes_attempted", "request_budget", "write_budget")):
+        attempts, writes = raw.get("requests_attempted"), raw.get("writes_attempted")
+        request_budget, write_budget = raw.get("request_budget"), raw.get("write_budget")
+        if type(attempts) is not int or type(writes) is not int \
+                or type(request_budget) is not int or type(write_budget) is not int \
+                or attempts < 0 or writes < 0 or writes > attempts \
+                or attempts > request_budget or writes > write_budget:
+            return False
     if type(raw.get("status")) is not int or not 200 <= raw["status"] < 300 or not _valid_signals(raw.get("signals")):
         return False
     mutations = raw.get("write_requests") or []
@@ -765,6 +889,8 @@ def public_metadata(project, record, *, raw=None):
                    "textLength", "selectorCount", "title", "console", "dialogs", "actions", "source_meta", "type", "message",
                    "text", "action", "selector", "index", "action_index", "ok", "error", "blocked", "reason", "location", "document_url",
                    "method", "blocked_requests", "write_requests", "write_authorized", "navigation_trail", "network_count",
+                   "requests_attempted", "writes_attempted", "request_budget", "write_budget", "guard_complete",
+                   "guard_error", "guard_dispatch_id",
                    "observation_status", "complete", "source", "trust", "machine_authenticated", "scope_enforced", "note",
                    "artifact_path", "sha256", "created_at", "started_at", "finished_at", "completed_at", "session_id", "session_generation",
                    "actor_id", "operation_id", "obligation_id", "resource_id", "page_id", "function_id", "page_visit_id", "visit_id",
@@ -969,7 +1095,14 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
     # Keep the original observation (including external declarations) exclusively
     # in the artifact. Only the explicit rendering fields become ledger metadata.
     path, digest = project.artifact(visit_id, raw)
-    succeeded = _successful(project, raw)
+    # An owned runtime visit is tied to a durable run whose request-slot
+    # receipts were checked before this helper is called. Private in-process
+    # fixtures without a run binding cannot acquire that authority from fields
+    # embedded in their observation payload.
+    succeeded = _successful(
+        project, raw,
+        require_guard=source == "local_playwright" and run_id is not None,
+    )
     network = _network(raw)
     record = {
         "id": visit_id, "kind": "page_visit", "url": raw["url"], "finalUrl": raw.get("finalUrl"),
@@ -979,7 +1112,10 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
         "write_requests": raw.get("write_requests") or [],
         "write_authorized": bool(raw.get("write_authorized")),
         "navigation_trail": _navigation_trail(raw),
-        "network_count": len(network), "observation_status": "visited" if succeeded else "BLOCKED",
+        "network_count": len(network), "requests_attempted": raw.get("requests_attempted", 0),
+        "writes_attempted": raw.get("writes_attempted", 0),
+        "request_budget": raw.get("request_budget"), "write_budget": raw.get("write_budget"),
+        "observation_status": "visited" if succeeded else "BLOCKED",
         "complete": succeeded, "source": source,
         "trust": "observed_render" if source == "local_playwright" else "imported_mcp",
         "machine_authenticated": source == "local_playwright",
@@ -991,7 +1127,8 @@ def _record_observation(project, raw, visit_id, source, *, session=None, actor=N
                  + ("Imported MCP output is an external observation, not machine-authenticated execution."
                     if source == "imported_mcp" else "All requests were subject to browser scope and method guards.")),
     }
-    for key in ("error", "scope_error", "headless", "afterActions", "network_truncated", "source_meta", "started_at", "completed_at"):
+    for key in ("error", "scope_error", "guard_error", "headless", "afterActions", "network_truncated",
+                "source_meta", "started_at", "completed_at"):
         if key in raw:
             record[key] = raw[key]
     if not succeeded:
@@ -1053,13 +1190,36 @@ def visit(project, args):
     if "allow_write" in args and not isinstance(args["allow_write"], bool):
         raise EngineError("browser_arguments", "allow_write must be a boolean")
     extra, session_headers, session_origin, credentials, session, actor = _browser_identity(project, args, url)
-    # Writes stay opt-in at project level, exactly like http.capture's
-    # allow_mutation. A single visit can opt out but cannot silently escalate.
-    allow_write = bool(project.config.get("allow_mutation")) and args.get("allow_write") is not False
-    if args.get("allow_write") is True and not project.config.get("allow_mutation"):
+    # Project permission is only a prerequisite. Every visit and every write
+    # budget remains explicitly opt-in; allow_mutation never implies page writes.
+    allow_write = args.get("allow_write") is True
+    if allow_write and not project.config.get("allow_mutation"):
         raise EngineError("browser_write_not_authorized",
-                          "Project permission is required before the browser may submit writes; "
-                          "enable allow_mutation with project.update")
+                          "Explicit per-visit write authority also requires project allow_mutation")
+    max_requests = args.get("max_requests", 100)
+    if type(max_requests) is not int or not 1 <= max_requests <= 100:
+        raise EngineError("browser_budget", "max_requests must be an integer between 1 and 100")
+    max_writes = args.get("max_writes", 0)
+    if type(max_writes) is not int or max_writes not in {0, 1}:
+        raise EngineError("browser_budget", "max_writes must be 0 or 1")
+    if not allow_write and max_writes:
+        raise EngineError("browser_write_not_authorized", "A read-only visit cannot reserve write slots")
+    if max_writes > max_requests:
+        raise EngineError("browser_budget", "max_writes cannot exceed max_requests")
+    operation = resource = None
+    if max_writes:
+        if not args.get("operation_id") or not args.get("resource_id"):
+            raise EngineError("resource_binding",
+                              "A browser write budget requires an exact operation_id and resource_id fixture binding")
+        operation = project.get("operation", args["operation_id"])
+        resource = project.get("resource", args["resource_id"])
+        if operation.get("protocol") != "http" or operation["method"] in {"GET", "HEAD", "OPTIONS"}:
+            raise EngineError("resource_binding", "The browser write operation must be a registered mutating HTTP operation")
+        if resource.get("operation_id") != operation["id"]:
+            raise EngineError("resource_mismatch", "The browser write fixture belongs to another operation")
+        if origin(operation["url"]) != origin(url):
+            raise EngineError("write_out_of_origin", "The browser write operation must use the visit origin")
+    ignore_https_errors = os.environ.get(_BROWSER_TLS_ENV) == "1"
     state = probe()
     if not state.get("available"):
         raise EngineError("browser_unavailable", "No usable browser: " + str(state.get("reason"))
@@ -1081,26 +1241,39 @@ def visit(project, args):
         "screenshot": str(screenshot) if screenshot else None, "html": str(html) if html else None,
         "executablePath": state.get("executable_path"), "actions": actions,
         "actionSettleMs": action_settle_ms, "afterActionsHtml": str(after) if after else None,
-        "allowWrite": allow_write, "holdMs": int(hold_ms),
+        "allowWrite": allow_write, "ignoreHTTPSErrors": ignore_https_errors, "holdMs": int(hold_ms),
+        "maxRequests": max_requests, "maxWrites": max_writes,
+        "operationId": operation["id"] if operation else None,
+        "resourceId": resource["id"] if resource else None,
+        "guardPython": sys.executable,
+        "guardCwd": str(Path(__file__).resolve().parents[1]),
+        "pythonPath": str(Path(__file__).resolve().parents[1]),
     }
     from .contracts import _validate_json
-    from .engine import actor_signature, credential_header_names, credential_signature, stable
+    from .engine import (actor_signature, credential_header_names, credential_signature,
+                         operation_signature, resource_signature, stable)
     from .inputs import json_document
 
     input_secrets, _ = _redaction_inputs(actions)
     redaction_context = _private_redaction_context(input_secrets)
-    run, claimed = None, False
+    run, claimed, lease = None, False, None
     try:
+        from . import execution_coordinator as coordinator
         with tempfile.TemporaryDirectory() as tmp:
             spec_path, script_path = Path(tmp) / "spec.json", Path(tmp) / "visit.cjs"
-            spec_path.write_text(json.dumps(spec, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-            script_path.write_text(_VISIT, encoding="utf-8")
+            spec["guardSpecPath"] = str(Path(tmp) / "request-guard")
             deadline = timeout + settle_ms / 1000 + hold_ms / 1000 + 15 + sum(
                 action.get("timeout", 5000) / 1000 + action.get("ms", 0) / 1000
                 + action.get("settleMs", action_settle_ms) / 1000 for action in actions)
+            run_effect = "test_resource_write" if max_writes else "read_only"
             run = {"id": project.id("RUN"), "kind": "browser", "status": "running", "started_at": now(),
-                   "method": "GET", "target_origin": origin(url), "planned_page_visit_id": visit_id,
-                   "allow_write": allow_write, "effect": "test_resource_write" if allow_write else "read_only",
+                   "method": operation["method"] if operation else "GET", "target_origin": origin(url), "planned_page_visit_id": visit_id,
+                   "operation_id": operation["id"] if operation else None,
+                   "operation_signature": operation_signature(operation) if operation else None,
+                   "resource_id": resource["id"] if resource else None,
+                   "resource_signature": resource_signature(resource) if resource else None,
+                   "allow_write": allow_write, "effect": run_effect,
+                   "max_requests": max_requests, "max_writes": max_writes,
                    "session_id": session["id"] if session else None,
                    "session_generation": session["generation"] if session else None,
                    "actor_id": actor["id"] if actor else None,
@@ -1112,14 +1285,48 @@ def visit(project, args):
                    "redaction_context_sha256": hashlib.sha256(canonical(redaction_context).encode("utf-8")).hexdigest(),
                    "request_signature": stable("BR", {"redaction_nonce": redaction_context["redaction_nonce"],
                        **{key: spec[key] for key in ("url", "scope", "exclude", "headers", "sessionHeaders", "sessionOrigin", "credentialHeaders",
-                           "actions", "allowWrite", "headless", "waitUntil", "timeout", "settleMs", "actionSettleMs")}}),
-                   "action_count": len(actions), "dispatch_attempted": True}
+                           "actions", "allowWrite", "ignoreHTTPSErrors", "operationId", "resourceId", "headless", "waitUntil", "timeout", "settleMs", "actionSettleMs",
+                           "maxRequests", "maxWrites")}}),
+                   "action_count": len(actions), "dispatch_attempted": False}
             project.claim(run)
             claimed = True
             project.event("browser.started", {"run_id": run["id"], "page_visit_id": visit_id, "allow_write": allow_write})
+            request_hash = hashlib.sha256(canonical(spec).encode("utf-8")).hexdigest()
+            lease = coordinator.claim(project, "browser.visit:" + run["id"])
+            envelope_budget = "browser-envelope:" + run["id"]
+            child_budget = "browser-request-slots:" + run["id"]
+            try:
+                receipt = coordinator.dispatch(
+                    project, lease, action="browser.visit", run_id=run["id"],
+                    request_hash=request_hash, budget=envelope_budget,
+                    effect="read_only", max_requests=max_requests, max_writes=max_writes,
+                    requests=max_requests, writes=0, budget_unit="request_slots")
+            except Exception:
+                try:
+                    coordinator.release(project, lease)
+                except EngineError as release_error:
+                    if release_error.code != "execution_effect_unknown":
+                        raise
+                raise
+            run.update(dispatch_attempted=True, dispatch_id=receipt["id"],
+                       dispatch_run_id=receipt["run_id"], lease_fence=receipt["fence"],
+                       dispatch_effect=receipt["effect"], dispatch_budget_name=envelope_budget,
+                       dispatch_budget_unit=receipt["budget_unit"],
+                       dispatch_requests=receipt["requests"], dispatch_writes=receipt["writes"],
+                       guard_budget_name=child_budget)
+            project.put("run", run)
+            spec["guardContext"] = {
+                "workspace": str(project.workspace), "project_id": project.project_id,
+                "run_id": run["id"], "action": "browser.visit", "target": url,
+                "operation": operation, "resource": resource, "bind_reads": False,
+                "lease": lease, "budget_name": child_budget,
+                "max_requests": max_requests, "max_writes": max_writes,
+            }
+            spec_path.write_text(json.dumps(spec, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+            script_path.write_text(_VISIT, encoding="utf-8")
             process = subprocess.run([state["node"], str(script_path), state["module_root"], str(spec_path)],
-                                     capture_output=True, text=True, encoding="utf-8", errors="strict",
-                                     timeout=deadline)
+                                     stdout=subprocess.PIPE, stderr=None, text=True, encoding="utf-8", errors="strict",
+                                     timeout=deadline, env=clean_environment())
         if process.returncode != 0:
             raise EngineError("browser_failed", "The owned browser runtime exited unsuccessfully")
         if not isinstance(process.stdout, str) or len(process.stdout.encode("utf-8")) > _OBSERVATION_BUDGET:
@@ -1132,24 +1339,51 @@ def visit(project, args):
         if not isinstance(raw, dict) or raw.get("url") != url:
             raise EngineError("browser_observation", "Browser output does not match the requested URL")
         _network(raw)
+        child_dispatches = [
+            row for row in project.list("execution_dispatch")
+            if row.get("run_id") == run["id"] and row.get("budget_name") == child_budget]
+        dispatched_requests = sum(row.get("requests", 0) for row in child_dispatches)
+        dispatched_writes = sum(row.get("writes", 0) for row in child_dispatches)
+        counts_match = type(raw.get("requests_attempted")) is int \
+            and type(raw.get("writes_attempted")) is int \
+            and raw["requests_attempted"] == dispatched_requests \
+            and raw["writes_attempted"] == dispatched_writes
+        guard_complete = counts_match and not raw.get("guard_error")
+        run.update(requests_attempted=raw.get("requests_attempted", 0),
+                   writes_attempted=raw.get("writes_attempted", 0),
+                   guarded_requests=dispatched_requests, guarded_writes=dispatched_writes,
+                   guard_complete=guard_complete,
+                   request_guard="playwright_route+python_slot_guard")
+        if not guard_complete:
+            guard_code = "browser_request_guard_count_mismatch" if not counts_match else raw.get("guard_error")
+            run.update(status="failed", error_code=guard_code, next_action="run.inspect")
+            raw.setdefault("guard_error", guard_code)
+            project.put("run", run)
         attachments = {}
         for key, path in (("screenshot", screenshot), ("html", html), ("after_actions_html", after)):
             if path and path.exists():
                 attachments[key] = path.relative_to(project.base).as_posix()
-                attachments[key + "_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                attachments[key + "_sha256"] = _attachment_sha256(path)
         public = _record_observation(project, raw, visit_id, "local_playwright", run_id=run["id"],
                                      session=session, actor=actor, attachments=attachments, input_secrets=input_secrets,
                                      redaction_context=redaction_context)
         saved = project.get("page_visit", visit_id)
-        run.update(status="succeeded" if saved["complete"] else "interrupted", finished_at=now(),
+        status = _terminal_run_status(guard_complete, saved["complete"])
+        run.update(status=status, finished_at=now(),
                    page_visit_id=visit_id, artifact_path=saved["artifact_path"], sha256=saved["sha256"],
                    observation_status=saved["observation_status"])
-        if not saved["complete"]:
+        if guard_complete and not saved["complete"]:
             run.update(error_code="browser_observation_incomplete", next_action="run.inspect")
         project.put("run", run)
         project.event("browser.finished", {"run_id": run["id"], "page_visit_id": visit_id, "status": run["status"]})
+        if lease is not None and run["status"] == "succeeded" and saved["complete"]:
+            coordinator.release(project, lease, reconciled=True)
+            run.update(lease_reconciled=True, lease_reconciliation="terminal_success")
+            project.put("run", run)
+            lease = None
         return {**public, "run_id": run["id"], "run_status": run["status"],
-                **({"next_action": "run.inspect"} if run["status"] != "succeeded" else {})}
+                **({"next_action": "run.inspect"} if run["status"] != "succeeded" else {}),
+                **{key: run[key] for key in ("lease_reconciled", "lease_reconciliation") if key in run}}
     except Exception as exc:
         if not claimed:
             raise
@@ -1176,7 +1410,10 @@ def import_observation(project, args):
         from .contracts import _validate_json
         from .inputs import json_document
 
-        data = path.read_bytes()
+        with path.open("rb") as stream:
+            data = stream.read(_OBSERVATION_BUDGET + 1)
+        if len(data) > _OBSERVATION_BUDGET:
+            raise EngineError("browser_import", "Observation exceeds its bounded read budget")
         raw = json_document(data)
         _validate_json(raw)
     except (EngineError, OSError, ValueError, UnicodeError, TypeError, RecursionError):
@@ -1335,7 +1572,15 @@ def _verified_visit(project, identity, page_url, *, origin_events=None):
                 raise EngineError("page_evidence_invalid", "Page visit timing differs from the original observation")
     if "navigation_trail" in visit_record and visit_record.get("navigation_trail") != _navigation_trail(raw):
         raise EngineError("page_evidence_invalid", "Page visit navigation trail differs from the original observation")
-    if not visit_record.get("complete") or visit_record.get("observation_status") != "visited" or not _successful(project, raw):
+    if not visit_record.get("complete") or visit_record.get("observation_status") != "visited" \
+            or not _successful(
+                project,
+                raw,
+                require_guard=(
+                    visit_record.get("source") == "local_playwright"
+                    and visit_record.get("run_id") is not None
+                ),
+            ):
         raise EngineError("page_visit_incomplete", "A successful, unblocked page observation is required")
     if origin_events is None:
         origin_events, _ = _adoption_history(project)

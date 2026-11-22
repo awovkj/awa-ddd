@@ -64,7 +64,17 @@ class ApplicabilityStopTests(unittest.TestCase):
             if row["test_family"] in families:
                 row["status"] = "planned"
         self.fixture.checkpoint(frontier)
-        return self.fixture.checkpoint(frontier)
+        second_evidence = getattr(self.fixture, "variant_evidence", None)
+        if second_evidence is None or second_evidence.get("id") == (
+                evidence or {}).get("id"):
+            second_evidence = self.fixture.capture(
+                url=self.fixture.operation["url"] + "?q=frontier-variant")
+            self.fixture.variant_evidence = second_evidence
+        second = self.fixture.frontier(second_evidence)
+        for row in second["categories"]:
+            if row["test_family"] in families:
+                row["status"] = "planned"
+        return self.fixture.checkpoint(second)
 
     def current_input(self, operation=None, family="generic"):
         operation = operation or self.fixture.operation
@@ -88,6 +98,7 @@ class ApplicabilityStopTests(unittest.TestCase):
             "evidence_ids": [row["id"] for row in captures], "oracle": {"type": "semantic_negative",
                 "test_family": "generic", "selector": "/count", "baseline_expected": 1, "control_expected": 2}})
         self.fixture.baseline_evidence = captures[0]
+        self.fixture.variant_evidence = captures[1]
         return captures[0]
 
     def close_current_sql(self):
@@ -250,6 +261,7 @@ class ApplicabilityStopTests(unittest.TestCase):
         self.assert_not_exhausted(applicability=0)
         self.fixture.close_generic()
         saved = self.complete_frontier()
+        self.assertEqual(2, saved["continuation"]["frontier_rounds"])
         with patch.object(engine, "request") as network:
             stopped = self.fixture.finish(saved)
             report = build_report(self.project, stage="final", finalization_id=stopped["finalization"]["id"])
@@ -320,6 +332,7 @@ class ApplicabilityStopTests(unittest.TestCase):
         self.close_current_sql()
         self.archive_unused()
         saved = self.complete_frontier(families=("generic", "sql_injection"))
+        self.assertEqual(2, saved["continuation"]["frontier_rounds"])
         self.assertEqual(0, saved["continuation"]["scope_reduction_review_total"])
         self.assertEqual(0, saved["continuation"]["applicability_review_total"])
         self.assertTrue(saved["continuation"]["can_finalize"])

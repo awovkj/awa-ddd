@@ -9,6 +9,7 @@ executable bytes stay in the private capsule.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 from .common import clone, digest, enum, fail, integer, mapping, optional_text, sequence, stable_id, string_list, text, utc_now
 
@@ -32,8 +33,13 @@ VARIABLE_RE = re.compile(r"\{\{([a-z][a-z0-9_]{0,63})\}\}")
 
 
 def new_recipe(*, hypothesis, provider, bindings, control_groups, oracle, steps, limits,
-               variables=None, private_manifest=None, created_by="engine", revision=1):
+               variables=None, private_manifest=None, created_by="engine", revision=1,
+               campaign_id=None, universe_id=None):
     """Create a frozen recipe.  The caller cannot pass a precomputed spec_hash."""
+    if campaign_id is None:
+        campaign_id = hypothesis.get("campaign_id")
+    if universe_id is None:
+        universe_id = hypothesis.get("universe_id")
     provider = mapping(provider, "provider")
     enum(provider.get("name"), "provider_name", PROVIDERS)
     text(provider.get("profile", ""), "provider_profile", maximum=128)
@@ -54,13 +60,30 @@ def new_recipe(*, hypothesis, provider, bindings, control_groups, oracle, steps,
         text(group.get("identity_role"), "control_group_identity", maximum=64)
         controls = sequence(group.get("controls"), "controls", maximum=8)
         roles = []
+        control_ids = set()
         for control in controls:
             mapping(control, "control")
+            control_id = control.get("id")
+            if not isinstance(control_id, str) or not control_id.strip() or len(control_id) > 64:
+                fail("v2_recipe_controls", "Control IDs must be nonempty strings of at most 64 characters")
+            if control_id in control_ids:
+                fail("v2_recipe_controls", "Control IDs must be unique within their group")
+            control_ids.add(control_id)
             role = enum(control.get("role"), "control_role", set(CONTROL_ROLES) | {"sensitivity"})
             roles.append(role)
+            if type(control.get("dispatch", True)) is not bool:
+                fail("v2_recipe_controls", "Control dispatch must be a boolean when declared")
             request = mapping(control.get("request"), "control_request")
             text(request.get("url"), "control_url", maximum=8192)
             text(request.get("method"), "control_method", maximum=16)
+            declared_effect = control.get("effect")
+            if declared_effect is None:
+                declared_effect = (
+                    "read_only"
+                    if str(request.get("method", "")).upper() in {"GET", "HEAD", "OPTIONS"}
+                    else "test_resource_write"
+                )
+            control["effect"] = enum(declared_effect, "control_effect", EFFECTS)
         if "normal" not in roles or "attack" not in roles or "negative" not in roles:
             fail("v2_recipe_controls", f"Control group {group_id} needs normal, attack and negative controls")
     oracle = mapping(oracle, "oracle")
@@ -80,6 +103,29 @@ def new_recipe(*, hypothesis, provider, bindings, control_groups, oracle, steps,
             fail("v2_recipe_fixture", "Write recipes require a frozen fixture binding")
     elif writes != 0:
         fail("v2_recipe_effect", "Read-only recipes cannot declare writes")
+
+    all_controls = [control for group in groups for control in group.get("controls", [])]
+    planned_controls = [control for control in all_controls if control.get("dispatch", True)]
+    skipped_controls = [control for control in all_controls if not control.get("dispatch", True)]
+    if skipped_controls:
+        strategy = "single_write_attack_only"
+        if effect != "test_resource_write" \
+                or limits.get("control_strategy") != strategy \
+                or any(group.get("execution_strategy") != strategy for group in groups):
+            fail("v2_recipe_controls",
+                 "Skipped controls require an explicit single_write_attack_only strategy")
+        if len(planned_controls) != 1 or planned_controls[0].get("role") != "attack":
+            fail("v2_recipe_controls",
+                 "single_write_attack_only dispatches exactly one attack control")
+    planned_writes = sum(
+        control.get("effect") == "test_resource_write"
+        or str((control.get("request") or {}).get("method", "")).upper()
+        not in {"GET", "HEAD", "OPTIONS"}
+        for control in planned_controls)
+    if planned_writes > writes:
+        fail("v2_recipe_write_budget",
+             "The publicly constructible controls exceed max_writes; use an explicit single-write strategy or independent fixtures",
+             planned_writes=planned_writes, max_writes=writes, requests_sent=0)
     variables = mapping(variables or {}, "variables")
     for name, rule in variables.items():
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name):
@@ -118,7 +164,14 @@ def new_recipe(*, hypothesis, provider, bindings, control_groups, oracle, steps,
                                               "variables", "rule_version")}
     recipe = {
         "schema": 2,
-        "id": stable_id("REC", {"hypothesis": hypothesis["id"], "spec": spec_hash}, length=24),
+        "id": stable_id("REC", {
+            "campaign_id": campaign_id,
+            "universe_id": universe_id,
+            "hypothesis": hypothesis["id"],
+            "spec": spec_hash,
+        }, length=24),
+        "campaign_id": campaign_id,
+        "universe_id": universe_id,
         "hypothesis_id": hypothesis["id"],
         "family": hypothesis.get("family"),
         "revision": spec["revision"],
@@ -202,13 +255,21 @@ def render(recipe, overrides=None):
     """Return the executable private manifest with only declared variables substituted."""
     values = assert_override_allowed(recipe, overrides)
 
-    def substitute(node):
+    def substitute(node, *, in_url=False):
         if isinstance(node, dict):
-            return {key: substitute(value) for key, value in node.items()}
+            return {key: substitute(value, in_url=key == "url") for key, value in node.items()}
         if isinstance(node, list):
-            return [substitute(value) for value in node]
+            return [substitute(value, in_url=in_url) for value in node]
         if isinstance(node, str):
-            return VARIABLE_RE.sub(lambda match: values.get(match.group(1), match.group(0)), node)
+            def replace(match):
+                value = values.get(match.group(1))
+                if value is None:
+                    return match.group(0)
+                # Variable placement already restricts URL variables to query values.
+                # Encode each value before interpolation so '&', '#', '=' and '%' cannot
+                # create another parameter, fragment or control request.
+                return quote(value, safe="") if in_url else value
+            return VARIABLE_RE.sub(replace, node)
         return node
 
     return substitute(clone(recipe["private_capsule"]))
@@ -268,6 +329,8 @@ def public_view(recipe, *, max_bytes=16384):
     """Bounded public capsule: references and control IDs, never credentials or request bodies."""
     view = {
         "id": recipe["id"],
+        "campaign_id": recipe.get("campaign_id"),
+        "universe_id": recipe.get("universe_id"),
         "hypothesis_id": recipe["hypothesis_id"],
         "family": recipe.get("family"),
         "revision": recipe.get("revision"),

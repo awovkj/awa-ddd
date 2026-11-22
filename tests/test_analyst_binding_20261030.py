@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from awa_ddd import browser, completeness, engine
 from awa_ddd.assessment import evaluate, record_finding
 from awa_ddd.store import EngineError, Project, now
+from awa_test_support import record_observation
 
 
 def observation(url, method, headers, body, timeout, max_bytes, *, response=None):
@@ -61,8 +62,8 @@ class AnalystBindingTests(unittest.TestCase):
                "network": [{"url": url, "method": "GET", "type": "document", "status": 200,
                             "request_headers": headers if headers is not None else session["headers"] if session else {}}],
                **overrides}
-        return browser._record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
-                                           session=session, actor=actor)
+        return record_observation(self.project, raw, self.project.id("PV"), "local_playwright",
+                                  session=session, actor=actor)
 
     def prepared(self, *, family="xss", session=None, actor=None, method="GET"):
         operation = self.operation(family=family, auth="authenticated" if session else "public", method=method)

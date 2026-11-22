@@ -41,6 +41,14 @@ class FakeClient:
 
     def list_tools(self):
         self.exchanges.append({"direction": "request", "message": {"method": "tools/list"}})
+        self.catalog_info = {
+            "complete": True,
+            "pages": 1,
+            "tool_count": len(self.tools),
+            "last_page_count": len(self.tools),
+            "continuation_received": False,
+            "limit_reason": None,
+        }
         return deepcopy(self.tools)
 
     def call_tool(self, name, arguments):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from urllib.parse import urljoin, urlsplit
 
@@ -22,11 +23,69 @@ WORKFLOW = ("scope_and_identity", "pages_assets_and_api_sources", "functions_and
             "information_baseline", "targeted_hypotheses")
 
 
+def _material_fingerprint(project, mode):
+    """Fingerprint only material that can affect the selected recon projection."""
+    with project._lock:
+        evidence_rows = project.connection.execute(
+            """SELECT kind,id,
+                      json_extract(document,'$.artifact_path'),
+                      json_extract(document,'$.sha256')
+                 FROM (
+                    SELECT kind,id,document,created_at,rowid
+                      FROM entities
+                     WHERE kind='evidence' AND json_extract(document,'$.kind')='http'
+                     ORDER BY created_at DESC,rowid DESC
+                     LIMIT ?
+                 )
+                ORDER BY created_at,rowid""",
+            (MAX_OBSERVATIONS,),
+        ).fetchall() if mode == "aggregate" else []
+        visit_rows = project.connection.execute(
+            """WITH refs(id) AS (
+                   SELECT json_extract(document,'$.page_visit_id') FROM entities
+                    WHERE kind='page' AND json_type(document,'$.page_visit_id')='text'
+                   UNION SELECT json_extract(document,'$.visit_id') FROM entities
+                    WHERE kind='page' AND json_type(document,'$.visit_id')='text'
+                   UNION SELECT json_extract(function.value,'$.page_visit_id')
+                     FROM entities,json_each(entities.document,'$.functions') AS function
+                    WHERE entities.kind='page'
+                      AND json_type(entities.document,'$.functions')='array'
+                      AND json_type(function.value,'$.page_visit_id')='text'
+                   UNION SELECT json_extract(function.value,'$.visit_id')
+                     FROM entities,json_each(entities.document,'$.functions') AS function
+                    WHERE entities.kind='page'
+                      AND json_type(entities.document,'$.functions')='array'
+                      AND json_type(function.value,'$.visit_id')='text'
+               )
+               SELECT visit.kind,visit.id,
+                      json_extract(visit.document,'$.artifact_path'),
+                      json_extract(visit.document,'$.sha256')
+                 FROM entities AS visit JOIN refs ON refs.id=visit.id
+                WHERE visit.kind='page_visit'
+                ORDER BY visit.id"""
+        ).fetchall()
+    rows = [*evidence_rows, *visit_rows]
+    entries = []
+    for kind, identity, path, digest in rows:
+        metadata = None
+        if isinstance(path, str) and path:
+            try:
+                stat = (project.base / path).stat(follow_symlinks=False)
+                metadata = [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+            except OSError:
+                metadata = None
+        entries.append([kind, identity, digest, metadata])
+    project.metrics["artifact_stats"] = project.metrics.get("artifact_stats", 0) + len(entries)
+    return hashlib.sha256(canonical(entries).encode("utf-8")).hexdigest()
+
+
 def _arguments(args):
     if not isinstance(args, dict):
         raise EngineError("arguments", "surface.recon input must be an object")
-    if set(args) - {"project_id", "mode", "section", "offset", "limit"}:
-        raise EngineError("arguments", "surface.recon accepts only mode, section, offset and limit")
+    if set(args) - {"project_id", "mode", "section", "offset", "limit", "refresh"}:
+        raise EngineError("arguments", "surface.recon accepts only mode, section, offset, limit and refresh")
+    if type(args.get("refresh", False)) is not bool:
+        raise EngineError("arguments", "refresh must be a boolean")
     mode, section = args.get("mode", "prepare"), args.get("section", "overview")
     offset, limit = args.get("offset", 0), args.get("limit", 10)
     if mode not in ("prepare", "aggregate") or section not in SECTIONS:
@@ -200,10 +259,16 @@ def _build(project, mode):
     by_operation = {row["id"]: row for row in operations}
     all_pages = project.list("page")
     pages = [row for row in all_pages if _scoped(config, row.get("url"))]
-    all_evidence = [row for row in project.list("evidence") if row.get("kind") == "http"]
+    with project._lock:
+        evidence_total = project.connection.execute("SELECT COUNT(*) FROM entities WHERE kind='evidence' AND json_extract(document,'$.kind')='http'").fetchone()[0]
+        evidence_rows = project.connection.execute("SELECT document FROM entities WHERE kind='evidence' AND json_extract(document,'$.kind')='http' "
+            "ORDER BY created_at DESC,rowid DESC LIMIT ?", (MAX_OBSERVATIONS,)).fetchall() if mode == "aggregate" else []
+    all_evidence = [json.loads(row[0]) for row in reversed(evidence_rows)]
     technologies, clues, html_sources, observed, unusable = {}, {}, {}, set(), 0
     observed_evidence_by_operation = {}
     out_of_scope_clues = omitted_clues = parse_errors = processed = truncated = 0
+    parse_cache_hits = parsed_artifacts = 0
+    hashed_before = project.metrics["artifact_bytes_hashed"]
     selected = all_evidence[-MAX_OBSERVATIONS:] if mode == "aggregate" else []
 
     for record in selected:
@@ -218,7 +283,19 @@ def _build(project, mode):
                 continue
             response = artifact["response"]
             body = base64.b64decode(response.get("body_base64", ""), validate=True)
-            parsed = parse_response(requested, response.get("headers", []), body, max_bytes=MAX_BODY_BYTES)
+            cache_version = "recon-response/v2:" + str(MAX_BODY_BYTES)
+            with project._lock:
+                cached = project.connection.execute("SELECT document FROM artifact_parse_cache WHERE sha256=? AND parser_version=?",
+                                                    (evidence["sha256"], cache_version)).fetchone()
+            parsed = json.loads(cached[0]) if cached else None
+            if isinstance(parsed, dict) and all(key in parsed for key in ("technologies", "clues", "truncated", "parse_errors")):
+                parse_cache_hits += 1
+            else:
+                parsed = parse_response(requested, response.get("headers", []), body, max_bytes=MAX_BODY_BYTES)
+                with project.transaction():
+                    project.connection.execute("INSERT OR REPLACE INTO artifact_parse_cache VALUES(?,?,?)",
+                                               (evidence["sha256"], cache_version, canonical(parsed)))
+                parsed_artifacts += 1
         except (EngineError, OSError, ValueError, TypeError, KeyError):
             unusable += 1
             continue
@@ -331,15 +408,15 @@ def _build(project, mode):
     from .security_hypotheses import build as security_hypotheses
     hypothesis_profile = security_hypotheses(project, operations, observed_evidence_by_operation)
     hypothesis_items = hypothesis_profile["items"]
-    limited = len(all_evidence) > MAX_OBSERVATIONS or bool(truncated or omitted_clues or parse_errors or limited_api_references or hypothesis_profile["limited"])
+    limited = evidence_total > MAX_OBSERVATIONS or bool(truncated or omitted_clues or parse_errors or limited_api_references or hypothesis_profile["limited"])
     summary = {"origin_total": len(origins), "operation_total": len(operations), "page_total": len(pages),
         "function_total": len(functions), "input_total": sum(item.get("input_total", 0) for item in functions),
         "technology_total": len(technology_items), "clue_total": len(clue_items), "collection_task_total": len(tasks),
         "hypothesis_total": len(hypothesis_items), "hypothesis_limited": hypothesis_profile["limited"],
-        "http_observation_total": len(all_evidence), "processed_observation_total": processed,
+        "http_observation_total": evidence_total, "processed_observation_total": processed,
         "current_observation_total": processed - unusable if mode == "aggregate" else None,
         "unusable_observation_total": unusable if mode == "aggregate" else None,
-        "omitted_observation_total": max(0, len(all_evidence) - MAX_OBSERVATIONS) if mode == "aggregate" else 0,
+        "omitted_observation_total": max(0, evidence_total - MAX_OBSERVATIONS) if mode == "aggregate" else 0,
         "unobserved_operation_total": len(operations) - len(observed) if mode == "aggregate" else None,
         "unvisited_page_total": len(bad_pages & {row["id"] for row in pages}),
         "unregistered_ui_page_total": len(unregistered_ui),
@@ -362,21 +439,52 @@ def _build(project, mode):
     return {"overview": overview, "technologies": technology_items, "functions": functions, "clues": clue_items,
             "collection": tasks, "hypotheses": hypothesis_items, "summary": summary, "stage": stage, "baseline_id": baseline_id,
             "baseline_reused": reused, "baseline_changed": changed, "delta": delta,
-            "next_action": "surface.recon" if mode == "prepare" else tasks[0]["action"] if tasks else "plan.next"}
+            "next_action": "surface.recon" if mode == "prepare" else tasks[0]["action"] if tasks else "plan.next",
+            "parsing_work": {"parsed_artifacts": parsed_artifacts, "parse_cache_hits": parse_cache_hits,
+                             "bytes_hashed": project.metrics["artifact_bytes_hashed"] - hashed_before}}
 
 
 def profile(project, args):
     mode, section, offset, limit = _arguments(args)
-    # This baseline is preparation metadata, separate from security closure state.
-    # It is rebuilt from current material on every call; cache reuse never skips verification.
+    # Pages read a durable advisory projection. The fingerprint covers bounded
+    # projection inputs; selected aggregate evidence is strongly read on rebuild.
     with project.transaction():
-        built = _build(project, mode)
-    items = built.pop(section)
-    for key in SECTIONS:
-        built.pop(key, None)
-    return {**built, "mode": mode, "section": section, "items": items[offset:offset + limit],
-        "total": len(items), "offset": offset, "limit": limit,
-        "next_offset": offset + limit if offset + limit < len(items) else None,
+        kinds = ("operation", "page", "page_visit", "evidence", "actor", "session", "resource", "run")
+        generation = project.generation(kinds)
+        config_key = hashlib.sha256(canonical(project.config).encode("utf-8")).hexdigest()
+        name = "recon/" + mode
+        built = project.projection_get(name, generation, schema_version=3)
+        reusable = bool(built and built.get("config_key") == config_key and not args.get("refresh", False))
+        material_fingerprint = _material_fingerprint(project, mode)
+        reused = bool(reusable and built.get("material_fingerprint") == material_fingerprint)
+        if not reused:
+            built = _build(project, mode)
+            project.connection.execute("DELETE FROM recon_projection_items WHERE mode=?", (mode,))
+            for name_section in SECTIONS:
+                project.connection.executemany("INSERT INTO recon_projection_items VALUES(?,?,?,?)",
+                    [(mode, name_section, index, canonical(item)) for index, item in enumerate(built.pop(name_section))])
+            built["config_key"] = config_key
+            built["material_fingerprint"] = material_fingerprint
+            built["refreshed_at"] = now()
+            project.projection_put(name, generation, built, schema_version=3)
+        total = project.connection.execute("SELECT COUNT(*) FROM recon_projection_items WHERE mode=? AND section=?", (mode, section)).fetchone()[0]
+        rows = project.connection.execute("SELECT document FROM recon_projection_items WHERE mode=? AND section=? "
+            "ORDER BY position LIMIT ? OFFSET ?", (mode, section, limit, offset)).fetchall()
+    built = dict(built)
+    built.pop("config_key", None)
+    built.pop("material_fingerprint", None)
+    if reused:
+        built["baseline_reused"], built["baseline_changed"] = built.get("baseline_id") is not None, False
+        built["delta"] = {
+            key: 0 for key in built.get("delta", {})
+            if key.startswith(("new_", "removed_")) and key.endswith("_total")
+        }
+        built["parsing_work"] = {"parsed_artifacts": 0, "parse_cache_hits": 0, "bytes_hashed": 0}
+    return {**built, "mode": mode, "section": section, "items": [json.loads(row[0]) for row in rows],
+        "total": total, "offset": offset, "limit": limit,
+        "next_offset": offset + limit if offset + limit < total else None,
+        "projection_reused": reused, "projection_revision": generation,
+        "material_verification": "cached_advisory" if reused else "strong_artifacts",
         "workflow": list(WORKFLOW), "requests_sent": 0,
         "automatic_execution_allowed": False, "profile_is_security_evidence": False,
         "completion_claim_allowed": False, "unknown_surface_exhausted": False,

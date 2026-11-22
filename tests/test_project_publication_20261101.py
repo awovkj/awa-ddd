@@ -15,6 +15,7 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 from awa_ddd import __main__ as entry, browser, engine, publication
+from awa_ddd.contracts import action_help
 from awa_ddd.store import EngineError, Project, canonical, now
 
 
@@ -89,6 +90,98 @@ class ProjectPublicationTests(unittest.TestCase):
         self.assertTrue(row["locator_requires_binding"])
         self.assertTrue(row["native_input_requires_binding"])
         self.assertFalse(row["requestable"])
+
+    def test_tool_probe_publishes_complete_catalog_receipt_fields(self):
+        result = {
+            "id": self.project.id("RUN"),
+            "adapter": "tscanplus",
+            "action": "probe",
+            "status": "succeeded",
+            "available": True,
+            "scanner_project": "awa-fixture",
+            "tool_count": 3,
+            "catalog_sha256": "a" * 64,
+            "catalog_complete": True,
+            "catalog_pages": 2,
+            "catalog_returned_count": 3,
+            "catalog_continuation_received": False,
+        }
+        public = publication.publish(self.project, "tool.probe", result)
+        for key in (
+            "catalog_sha256",
+            "catalog_complete",
+            "catalog_pages",
+            "catalog_returned_count",
+            "catalog_continuation_received",
+        ):
+            self.assertEqual(result[key], public[key])
+        self.network.assert_not_called()
+
+    def test_receipt_resolvers_bind_exact_version_namespace_and_length(self):
+        valid = (
+            ("review_proof_receipt", "review_proof_receipt", "RPR-" + "1" * 64),
+            ("v2_review_proof_receipt", "review_proof_receipt", "RPR-" + "2" * 24),
+            ("frontier_receipt", "frontier_receipt", "FRC-" + "3" * 64),
+            ("v2_frontier_receipt", "frontier_receipt", "FRC-" + "4" * 24),
+            ("completion_acceptance", "completion_acceptance", "CA-" + "5" * 64),
+            ("v2_completion_acceptance", "completion_acceptance", "CA-" + "6" * 24),
+            ("v2_completion_acceptance", "completion_acceptance", "CDA-" + "7" * 24),
+        )
+        wrong_store = (
+            ("v2_review_proof_receipt", "review_proof_receipt", "RPR-" + "a" * 64),
+            ("review_proof_receipt", "review_proof_receipt", "RPR-" + "b" * 24),
+            ("v2_frontier_receipt", "frontier_receipt", "FRC-" + "c" * 64),
+            ("frontier_receipt", "frontier_receipt", "FRC-" + "d" * 24),
+            ("v2_completion_acceptance", "completion_acceptance", "CA-" + "e" * 64),
+            ("completion_acceptance", "completion_acceptance", "CA-" + "f" * 24),
+            ("completion_acceptance", "completion_acceptance", "CDA-" + "8" * 64),
+        )
+        for store_kind, _kind, identity in valid + wrong_store:
+            self.project.put(store_kind, {"id": identity})
+
+        context = publication.PublicationContext(self.project)
+        for _store_kind, kind, identity in valid:
+            with self.subTest(kind=kind, identity=identity):
+                self.assertTrue(context.bound_handle(kind, identity))
+        for _store_kind, kind, identity in wrong_store:
+            with self.subTest(kind=kind, identity=identity):
+                self.assertFalse(context.bound_handle(kind, identity))
+        for kind, identity in (
+            ("review_proof_receipt", "RPR-" + "9" * 25),
+            ("frontier_receipt", "FRC-" + "9" * 63),
+            ("completion_acceptance", "CDA-" + "9" * 64),
+        ):
+            with self.subTest(kind=kind, identity=identity):
+                self.assertFalse(context.bound_handle(kind, identity))
+
+    def test_coverage_method_operations_have_a_discoverable_bounded_page(self):
+        for index in range(4):
+            self.register("/items/item" + str(index).zfill(4))
+
+        for action in ("project.status", "report.coverage"):
+            with self.subTest(action=action):
+                fields = action_help({"name": action})["fields"]
+                self.assertIn("default 0", fields["method_operation_offset"])
+                self.assertIn("1..100", fields["method_operation_limit"])
+                self.assertIn("default 10", fields["method_operation_limit"])
+
+                public = self.call(action, method_operation_offset=1, method_operation_limit=2)
+                self.assertEqual(1, public["method_operation_offset"])
+                self.assertEqual(2, public["method_operation_limit"])
+                method = next(row for row in public["method_coverage"] if row["registered_methods"] == ["GET"])
+                self.assertEqual(4, method["operations_total"])
+                self.assertEqual(1, method["operation_offset"])
+                self.assertEqual(2, method["operation_limit"])
+                self.assertEqual(3, method["operation_next_offset"])
+                self.assertEqual(2, len(method["operations"]))
+
+                default = self.call(action)
+                self.assertEqual(0, default["method_operation_offset"])
+                self.assertEqual(10, default["method_operation_limit"])
+                default_method = next(row for row in default["method_coverage"] if row["registered_methods"] == ["GET"])
+                self.assertEqual(4, len(default_method["operations"]))
+                self.assertIsNone(default_method["operation_next_offset"])
+        self.network.assert_not_called()
 
     def test_session_bearer_is_private_in_surface_views_without_changing_the_source(self):
         secret = "synthetic-publication-session-secret"

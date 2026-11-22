@@ -261,6 +261,8 @@ class SessionReplayTests(unittest.TestCase):
         first = self.invoke("plan.checkpoint", frontier_review=frontier)
         self.assertEqual(1, first["continuation"]["frontier_rounds"])
         self.assert_continuing(first["continuation"])
+        for declaration in [frontier["discovery"], frontier["pages"], *frontier["categories"]]:
+            declaration["evidence_ids"] = [variant["id"]]
         second = self.invoke("plan.checkpoint", frontier_review=frontier)
         self.assertEqual(first["checkpoint"]["snapshot_id"], second["checkpoint"]["snapshot_id"])
         self.assertEqual(2, second["continuation"]["frontier_rounds"])

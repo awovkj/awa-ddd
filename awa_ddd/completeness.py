@@ -134,8 +134,34 @@ def _scope_key(item, operation):
 
 
 def _unknown_policy_replacements(project, obligations):
-    """Recognize the first actual plan transaction replacing unknown-policy work."""
+    """Exclude accesses removed in the same transition to an unknown policy.
+
+    New plans carry monotonic generations because Windows clock granularity can
+    collapse several plan transactions onto one timestamp. Legacy records keep
+    the timestamp-derived fallback until they are rebuilt.
+    """
     from .engine import stamp
+
+    candidates = [item for item in obligations if item.get("kind") == "access" and item.get("superseded")]
+    review_generations = {}
+    for review in obligations:
+        generation = review.get("superseded_generation")
+        if review.get("kind") == "auth_review" and review.get("superseded") and type(generation) is int:
+            operation_id = review.get("operation_id")
+            review_generations[operation_id] = max(generation, review_generations.get(operation_id, generation))
+    explicit = set()
+    legacy = []
+    for item in candidates:
+        access_generation = item.get("superseded_generation")
+        if type(access_generation) is not int:
+            legacy.append(item)
+            continue
+        if type(item.get("known_policy_generation")) is int:
+            continue
+        if access_generation == review_generations.get(item.get("operation_id")):
+            explicit.add(item["id"])
+    if not legacy:
+        return explicit
 
     with project._lock:
         metadata = project.connection.execute(
@@ -170,9 +196,11 @@ def _unknown_policy_replacements(project, obligations):
         if cycle is not None and created is not None and created < cycle \
                 and (item.get("kind") == "identity_setup" or item.get("kind") == "baseline" and item.get("actor_id")):
             prior_known.add(item["operation_id"])
-    return {item["id"] for item in obligations if item.get("kind") == "access" and item.get("superseded")
-            and item["operation_id"] not in prior_known and item["operation_id"] in replacements
-            and generation(item["id"], 1) == replacements[item["operation_id"]]}
+    legacy_ids = {item["id"] for item in legacy}
+    explicit.update({item["id"] for item in obligations if item["id"] in legacy_ids
+                     and item["operation_id"] not in prior_known and item["operation_id"] in replacements
+                     and generation(item["id"], 1) == replacements[item["operation_id"]]})
+    return explicit
 
 
 def _historically_closed(project, item, decisions, key):
@@ -203,6 +231,11 @@ def _historically_closed(project, item, decisions, key):
 
 def _consumer_requirements(operations, obligations):
     result = []
+    by_input = {}
+    for item in obligations:
+        if not item.get("superseded") and item.get("kind") in {"input_test", "input_review"}:
+            key = (item.get("operation_id"), item.get("input_location"), item.get("input_selector"), item.get("schema_branch"))
+            by_input.setdefault(key, []).append(item["id"])
     for operation in operations.values():
         for entry in operation.get("inputs", []):
             probe = {"operation_id": operation["id"], "input_location": entry.get("location"),
@@ -213,9 +246,8 @@ def _consumer_requirements(operations, obligations):
                 or family == "sql_injection" and "test_families" in entry and "sql_injection" not in families
             if not missing:
                 continue
-            references = [item["id"] for item in obligations if not item.get("superseded")
-                          and item.get("operation_id") == operation["id"] and item.get("kind") in {"input_test", "input_review"}
-                          and all(item.get(key) == value for key, value in probe.items())]
+            references = by_input.get((operation["id"], probe["input_location"], probe["input_selector"],
+                                       probe["schema_branch"]), [])
             result.append({**probe, "test_family": family, "consumer": entry.get("consumer"),
                            "scope_key": (operation["id"], "input_test", probe["input_location"], probe["input_selector"],
                                          probe["schema_branch"], family), "source_obligation_ids": references})
@@ -257,18 +289,22 @@ def _scope_reductions(project, obligations, operations, decisions, consumer_requ
     return result
 
 
-def _inventory(project, evaluated):
+def _inventory(project, evaluated, *, operations=None, all_obligations=None):
     from . import browser, engine
     from .parameter_coverage import ObservationProfiles, annotate_queue, snapshot as parameter_snapshot
 
-    operations = {operation["id"]: operation for operation in project.list("operation")}
+    operations = {operation["id"]: operation for operation in
+                  (project.list("operation") if operations is None else operations)}
     gaps = {gap["id"]: gap for gap in evaluated["gaps"]}
-    all_obligations = project.list("obligation")
+    if all_obligations is None:
+        all_obligations = project.list("obligation")
     obligations = [item for item in all_obligations if not item.get("superseded")]
     # A current source authenticates the observation, not the caller's assertion
     # that the whole obligation is inapplicable. Invalid sources already reopen
     # the ordinary obligation gap and must not create a second review row.
-    applicability_reviews = [item for item in obligations if _status(item, gaps) == "not_applicable"]
+    from .applicability import current as applicability_current
+    applicability_reviews = [item for item in obligations if _status(item, gaps) == "not_applicable"
+                             and not (item.get("applicability_receipt_id") and applicability_current(project, item))]
     decisions = {decision["id"]: decision for decision in project.list("decision")}
     consumer_requirements = _consumer_requirements(operations, all_obligations)
     scope_reductions = _scope_reductions(project, all_obligations, operations, decisions, consumer_requirements)
@@ -293,7 +329,10 @@ def _inventory(project, evaluated):
     current_observations = []
     method_observations = []
     parameter_profiles = ObservationProfiles(operations)
-    for evidence in project.list("evidence"):
+    # Capture order is part of the control sequence. A timestamp alone is not
+    # unique on Windows, so fall back to durable insertion order instead of a
+    # random evidence ID when several observations share the same timestamp.
+    for evidence in project.list_chronological("evidence"):
         try:
             current, artifact = engine.verify_current_evidence(project, evidence["id"])
             method_observations.append(current)
@@ -360,16 +399,19 @@ def _inventory(project, evaluated):
         except (EngineError, OSError, ValueError, TypeError, KeyError) as exc:
             row.update(adopt_ready=False, review_reason_code=getattr(exc, "code", "page_evidence_invalid"))
         orphan_visits.append(row)
-    pending_runs = [run for run in project.list("run") if run.get("status") in {"running", "interrupted"}
+    runs = project.list("run")
+    pending_runs = [run for run in runs if run.get("status") in {"running", "interrupted"}
                     or run.get("status") == "failed" and run.get("kind") in {"http", "scenario"}]
-    partial_tools = [run for run in project.list("run") if run.get("adapter") in {"sqlmap", "yakit"}
+    partial_tools = [run for run in runs if run.get("adapter") in {"sqlmap", "yakit"}
         and run.get("status") == "failed" and (run.get("target_traffic_sent") or run.get("traffic_requests")
                                              or run.get("effect") == "test_resource_write")
         and (run.get("error_code") in {"tool_timeout", "tool_output_budget", "tool_cancelled"}
              or run.get("diagnostic") == "timeout" or run.get("injection_signal") or run.get("metadata_candidates"))]
-    partial_tools.extend(run for run in project.list("run") if run.get("adapter") == "tscanplus"
+    partial_tools.extend(run for run in runs if run.get("adapter") == "tscanplus"
         and run.get("status") not in {"running", "interrupted"} and _tscanplus_incomplete(run))
     config = project.config
+    from .source_inventory import inventory as source_inventory
+    sources = source_inventory(project, operations=operations)
     inventory = {"operations": operations, "obligations": obligations, "gaps": gaps, "decisions": decisions,
             "valid_decisions": valid_decisions, "current_findings": current_findings,
             "observations": current_observations, "method_observations": method_observations, "unassessed": unassessed,
@@ -380,6 +422,7 @@ def _inventory(project, evaluated):
             "partial_tools": partial_tools, "applicability_reviews": applicability_reviews,
             "scope_reductions": scope_reductions,
             "consumer_requirements": consumer_requirements,
+            "source_inventory": sources,
             "parameter_profiles": parameter_profiles,
             "browser_scope_config": {"scope": config.get("scope", []), "exclude": config.get("exclude", [])}}
     from .continuation import apply_reviews
@@ -431,6 +474,12 @@ def _security(inventory):
             "note_zh": "安全义务不包含正常基线；完成仅限登记的具体假设及代表样本，不能证明其他类别、输入或资源安全。"}, matrix
 
 
+def _source_conflicts(inventory):
+    unresolved_candidates = {row["id"] for row in inventory.get("candidates", [])}
+    return [row for row in inventory.get("source_inventory", {}).get("items", []) if row["status"] == "conflict"
+            and (row["pending_import"] or row.get("candidate_id") in unresolved_candidates)]
+
+
 def _completion(inventory, security, evaluated):
     pending = {
         "open_obligations": evaluated["open"] + evaluated["blocked"],
@@ -448,6 +497,9 @@ def _completion(inventory, security, evaluated):
         "scope_reduction_review_total": len(inventory.get("scope_reductions", [])) + len(inventory.get("consumer_requirements", [])),
         "limited_ownership_sampling": sum(operation.get("ownership_sampling", {}).get("limited") is True
                                           for operation in inventory["operations"].values()),
+        "unimported_source_items": inventory["source_inventory"]["summary"]["pending_import_total"],
+        "source_conflict_total": len(_source_conflicts(inventory)),
+        "source_unresolved_total": inventory["source_inventory"]["summary"]["unresolved_total"],
     }
     names = {"open_obligations": "登记义务仍未闭环", "unresolved_candidates": "候选线索仍待复核",
              "unassessed_observations": "有效 HTTP 观察尚未归档为判据或结论",
@@ -457,7 +509,10 @@ def _completion(inventory, security, evaluated):
              "unreconciled_runs": "执行记录仍需检查或恢复，不能自动重放", "failed_partial_tools": "工具失败、远端执行未决或结果未完整归档仍需复核",
              "limited_ownership_sampling": "权限测试超过有界样本预算",
              "applicability_review_total": "人工不适用声明尚未形成可验证的测试闭环",
-             "scope_reduction_review_total": "未测义务因计划缩减而被隐藏，仍需恢复真实测试边界"}
+             "scope_reduction_review_total": "未测义务因计划缩减而被隐藏，仍需恢复真实测试边界",
+             "unimported_source_items": "已知来源项尚未完成登记或候选交接",
+             "source_conflict_total": "来源声明与已有接口或输入策略冲突仍待处理",
+             "source_unresolved_total": "来源映射未完整解析或保存的来源项缺失"}
     reasons = [f"{label}：{pending[key]} 项。" for key, label in names.items() if pending[key]]
     if security["operations_without_security_tests"]:
         reasons.append(f"{security['operations_without_security_tests']} 个操作仅登记或仅有基线，没有明确的安全测试义务。")
@@ -468,7 +523,9 @@ def _completion(inventory, security, evaluated):
     status = "partial" if reasons else "complete"
     if not inventory["operations"] and not inventory["observations"] and not inventory["current_findings"] \
             and not inventory["orphan_visits"] and not inventory["page_coverage"]["pages"] \
-            and not inventory["candidates"] and not inventory["pending_runs"] and not inventory["partial_tools"]:
+            and not inventory["candidates"] and not inventory["pending_runs"] and not inventory["partial_tools"] \
+            and not inventory["source_inventory"]["summary"]["snapshot_total"] \
+            and not inventory["source_inventory"]["summary"]["source_total"]:
         status = "not_started"
     return {"status": status, "label_zh": {"partial": "部分完成，仍有覆盖或归档缺口",
             "complete": "已登记安全任务完成闭环（不代表目标完整安全）", "not_started": "尚未建立可评价的测试清单"}[status],
@@ -493,21 +550,24 @@ def evaluate_with_inventory(project):
     return evaluated, inventory
 
 
-def summarize(project, evaluated):
+def summarize(project, evaluated, *, operations=None, all_obligations=None):
     """Consume an existing evaluator result; do not recurse into evaluate_coverage."""
     from . import engine
 
-    inventory = _inventory(project, evaluated)
+    inventory = _inventory(project, evaluated, operations=operations, all_obligations=all_obligations)
     security, _ = _security(inventory)
     completion = _completion(inventory, security, evaluated)
     tested_operations = {item["operation_id"] for item in inventory["obligations"]
                          if item.get("status") == "evaluated" and item["id"] not in inventory["gaps"]}
     from .continuation import control
     result = {"security_coverage": security, "completion": completion,
+            "source_inventory": inventory["source_inventory"]["summary"],
             "parameter_coverage_summary": inventory["parameter_coverage_snapshot"]["summary"],
             "method_coverage": engine._method_coverage(project, tested_operations,
-                                                     current_observations=inventory["method_observations"]),
+                                                     current_observations=inventory["method_observations"],
+                                                     operations=inventory["operations"].values()),
             "continuation": control(project, evaluated, inventory=inventory, security=security, completion=completion)}
+    result["completion_decision"] = result["continuation"]["completion_decision"]
     receiver = _INVENTORY_RECEIVER.get()
     if receiver is not None and receiver[0] is project:
         receiver[1].append(inventory)
@@ -520,7 +580,47 @@ def _review_id(kind, identity):
 
 def _checklist(inventory):
     from .browser_policy import for_page
+    from .source_inventory import _unresolved_snapshot
     rows = []
+    sources = inventory.get("source_inventory", {})
+    by_snapshot = {}
+    conflicts = {row["id"] for row in _source_conflicts(inventory)}
+    for item in sources.get("items", []):
+        if item["pending_import"] or item["id"] in conflicts:
+            by_snapshot.setdefault(item["snapshot_id"], []).append(item)
+    for snapshot in sources.get("snapshots", {}).values():
+        pending = by_snapshot.get(snapshot["id"], [])
+        source = sources.get("sources", {}).get(snapshot["source_id"], {})
+        missing = sources.get("snapshot_issues", {}).get(snapshot["id"], 0)
+        unresolved = _unresolved_snapshot(snapshot) if not missing and source.get("latest_snapshot_id") == snapshot["id"] else 0
+        if not pending and not unresolved and not missing:
+            continue
+        apply_ready = any(item["pending_import"] for item in pending) and not missing
+        apply_input = {"snapshot_id": snapshot["id"], "mode": "apply"}
+        if apply_ready:
+            pending_ids = {item["id"] for item in pending if item["pending_import"]}
+            offset = next(index for index, identity in enumerate(snapshot["item_ids"]) if identity in pending_ids)
+            if offset:
+                apply_input["offset"] = offset
+        rows.append({"id": _review_id("discovery_source", snapshot["id"]), "kind": "discovery_source", "status": "open",
+            "discovery_source_id": snapshot["source_id"], "snapshot_id": snapshot["id"],
+            "label_zh": "将已保存来源快照交接到接口与候选账本" if apply_ready else "检查来源解析或策略冲突",
+            "reason_zh": "按精确快照应用已检查的来源材料；来源登记不产生目标请求，也不关闭安全测试。" if apply_ready
+                         else "原始来源和已有策略均保留；修正明确的来源或输入声明，不能用行政复核移除缺口。",
+            "action": "surface.import" if apply_ready else "surface.sources",
+            "suggested_action": "surface.import" if apply_ready else "surface.sources",
+            "input_template": apply_input if apply_ready else {"snapshot_id": snapshot["id"],
+                                **({"source_id": snapshot["source_id"]} if source else {})},
+            "help_input": {"name": "surface.import" if apply_ready else "surface.sources"},
+            "administrative_review_allowed": False, "automatic_execution_allowed": False,
+            "source_item_total": len(pending) + missing, "unresolved_item_total": unresolved,
+            "missing_item_total": missing})
+    for source_id, missing in sources.get("source_issues", {}).items():
+        rows.append({"id": _review_id("discovery_source", source_id), "kind": "discovery_source", "status": "open",
+            "discovery_source_id": source_id, "label_zh": "检查缺失的来源快照", "reason_zh": "来源记录指向的快照已缺失；恢复可信材料后重新导入，不能将未知清单按零项关闭。",
+            "action": "surface.sources", "suggested_action": "surface.sources", "input_template": {"source_id": source_id},
+            "help_input": {"name": "surface.sources"}, "administrative_review_allowed": False, "automatic_execution_allowed": False,
+            "source_item_total": 0, "unresolved_item_total": missing, "missing_item_total": missing})
     queue = {item["obligation_id"]: item for item in inventory.get("queue", [])}
     labels = {"baseline": "补齐正常业务基线", "input_review": "追踪真实输入消费点", "input_test": "完成具体输入安全假设",
               "access": "验证身份或角色访问边界", "ownership": "验证资源所有权与租户边界",
@@ -666,14 +766,13 @@ def _checklist(inventory):
                 row.update(status="blocked", reason_code=item.get("review_reason_code"),
                            reason_zh="曾归档的 HTTP 来源或血缘失效，必须修复或保留明确受阻，不能从闭环台账中消失。")
             rows.append(row)
+    security_operations = {item.get("operation_id") for item in inventory["obligations"] if item.get("kind") != "baseline"}
     for operation in inventory["operations"].values():
         if operation.get("ownership_sampling", {}).get("limited"):
             rows.append({"id": _review_id("ownership_sample_limit", operation["id"]), "kind": "ownership_sample_limit",
                          "status": "blocked", "label_zh": "权限测试样本预算不足", "reason_zh": "部分租户、角色或请求绑定上下文未纳入有界计划，不能宣称全部覆盖。",
                          "operation_id": operation["id"], "action": "surface.inspect"})
-        security_items = [item for item in inventory["obligations"] if item.get("operation_id") == operation["id"]
-                          and item.get("kind") != "baseline"]
-        if not security_items:
+        if operation["id"] not in security_operations:
             rows.append({"id": _review_id("security_plan_missing", operation["id"]), "kind": "security_plan_missing",
                          "status": "open", "label_zh": "操作没有明确安全测试义务", "reason_zh": "正常基线不能替代权限、具体输入假设或业务安全检查。",
                          "operation_id": operation["id"], "action": "surface.inspect"})
@@ -764,6 +863,11 @@ def _blindspots(inventory, matrix):
 
 
 def audit(project, args):
+    from .read_model import audit as projected_audit
+    return projected_audit(project, args)
+
+
+def _audit_strong(project, args):
     from . import engine
     from .reporting import safe_metadata
     from .parameter_coverage import public_page as parameter_page
@@ -782,6 +886,7 @@ def audit(project, args):
     return safe_metadata({"project_id": project.project_id, "requests_sent": 0,
         "continuation": evaluated["continuation"],
         "completion": _completion(inventory, security, evaluated), "security_coverage": security,
+        "source_inventory": inventory["source_inventory"]["summary"],
         "layers": {"registered": {"operations": len(inventory["operations"]), "inputs": evaluated["inputs"]},
                    "observed": {"operations": len(observed_operations), "http_observations": len(inventory["observations"]),
                                 "browser_visits": len(project.list("page_visit"))},

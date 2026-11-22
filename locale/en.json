@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AWA evidence assessment",
+    "description": "Run evidence-driven web assessments with scoped HTTP and browser execution, immutable evidence, and strict completion gates. Configure the plugin under Settings > Plugins, then use the awa_* tools in a session. Target requests run only for explicitly scoped actions; project data stays in the configured local workspace. Browser writes and external tools require separate permission, and unavailable providers remain unverified. Disabling the plugin stops new registrations but preserves existing assessment data."
+  }
+}

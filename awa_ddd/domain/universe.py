@@ -38,8 +38,17 @@ def _route_template(url):
 
 
 def new_universe(*, scope_epoch, origins, routes, pages, functions, operations, inputs,
-                 consumers, sources, unknown_counts, completeness_level="declared_only"):
+                 consumers, sources, unknown_counts, completeness_level="declared_only",
+                 target_build=None, target_build_provenance=None,
+                 site_wide_discovery_allowed=False):
     enum(completeness_level, "completeness_level", COMPLETENESS_LEVELS)
+    target_build = (optional_text(target_build, "target_build", maximum=256)
+                    or "unknown")
+    provenance = mapping(target_build_provenance or {
+        "status": "unknown",
+        "source": "none",
+        "observed_at": None,
+    }, "target_build_provenance")
     document = {
         "schema": 2,
         "version": 1,
@@ -54,13 +63,19 @@ def new_universe(*, scope_epoch, origins, routes, pages, functions, operations, 
         "sources": sequence(sources, "sources", maximum=1024),
         "unknown_counts": mapping(unknown_counts, "unknown_counts"),
         "completeness_level": completeness_level,
-        "site_wide_discovery_allowed": completeness_level == "complete_snapshot",
+        # A single complete source snapshot is still only a source-bound
+        # inventory.  Site-wide authority needs a separate, explicit input;
+        # build_universe deliberately leaves this disabled.
+        "site_wide_discovery_allowed": bool(site_wide_discovery_allowed),
+        "target_build": target_build,
+        "target_build_provenance": provenance,
         "created_at": utc_now(),
         "limitations": [],
     }
     document["snapshot_hash"] = digest({key: document[key] for key in (
         "scope_epoch", "origins", "routes", "pages", "functions", "operations", "inputs",
-        "consumers", "sources", "unknown_counts", "completeness_level")})
+        "consumers", "sources", "unknown_counts", "completeness_level",
+        "site_wide_discovery_allowed", "target_build", "target_build_provenance")})
     document["id"] = stable_id("UNI", document["snapshot_hash"])
     return document
 
@@ -124,6 +139,16 @@ def operation_record(operation, consumers=None):
         "url_template": template,
         "protocol": operation.get("protocol", "http"),
         "auth": operation.get("auth"),
+        "ownership": operation.get("ownership"),
+        "allowed_roles": sequence(operation.get("allowed_roles") or [],
+                                  "allowed_roles", maximum=128),
+        "state_scope": operation.get("state_scope"),
+        "security_context": {
+            "ownership": operation.get("ownership"),
+            "allowed_roles": sequence(operation.get("allowed_roles") or [],
+                                      "allowed_roles", maximum=128),
+            "state_scope": operation.get("state_scope"),
+        },
         "operation_signature": None,
         "dynamic_segments": dynamic,
         "inputs": inputs,
@@ -160,6 +185,8 @@ def summary(universe):
         "version": universe.get("version"),
         "snapshot_hash": universe.get("snapshot_hash"),
         "completeness_level": universe.get("completeness_level"),
+        "target_build": universe.get("target_build"),
+        "target_build_provenance": universe.get("target_build_provenance"),
         "site_wide_discovery_allowed": bool(universe.get("site_wide_discovery_allowed")),
         "origin_total": len(universe.get("origins", [])),
         "route_total": len(universe.get("routes", [])),
@@ -170,3 +197,31 @@ def summary(universe):
         "consumer_total": len(universe.get("consumers", [])),
         "unknown_counts": dict(universe.get("unknown_counts", {})),
     }
+
+
+def validate_operation_context(universe):
+    """Ensure scheduler-facing security policy survived the Universe boundary."""
+    for operation in universe.get("operations", []):
+        context = operation.get("security_context")
+        if not isinstance(context, dict):
+            from .common import fail
+            fail("v2_universe_context", "Operation is missing its authorization context")
+        for key in ("ownership", "allowed_roles", "state_scope"):
+            if operation.get(key) != context.get(key):
+                from .common import fail
+                fail("v2_universe_context",
+                     f"Operation security context mismatch for {key}",
+                     operation_id=operation.get("operation_id"))
+    build = universe.get("target_build")
+    provenance = universe.get("target_build_provenance")
+    if not isinstance(build, str) or not build:
+        from .common import fail
+        fail("v2_universe_build", "Universe requires an explicit target_build or unknown")
+    if not isinstance(provenance, dict) or provenance.get("status") not in {
+            "unknown", "declared", "observed", "verified"}:
+        from .common import fail
+        fail("v2_universe_build", "Universe requires target-build provenance")
+    if build == "unknown" and provenance.get("status") != "unknown":
+        from .common import fail
+        fail("v2_universe_build", "Unknown target build cannot claim a proved provenance")
+    return True

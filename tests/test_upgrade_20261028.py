@@ -20,6 +20,7 @@ from urllib.parse import quote
 from unittest.mock import patch
 
 from awa_ddd import browser, engine
+from awa_test_support import record_observation
 from awa_ddd.assessment import (
     _error_channel,
     _metadata_expression,
@@ -213,7 +214,7 @@ class SpaNavigationTests(ProjectFixture):
                             "finalUrl": self.base + "/admin/merchants"}],
                "network": [{"url": self.base + "/admin/login", "method": "GET", "status": 200},
                            {"url": self.base + "/admin/merchants", "method": "GET", "status": 200}]}
-        visit = browser._record_observation(self.project, raw, "PV-spa", "local_playwright")
+        visit = record_observation(self.project, raw, "PV-spa", "local_playwright")
         page = browser.register_page(self.project, {"url": self.base + "/admin/merchants"})
         marked = browser.mark(self.project, {"page_id": page["id"], "target": "page",
                                              "status": "visited", "page_visit_id": visit["id"]})

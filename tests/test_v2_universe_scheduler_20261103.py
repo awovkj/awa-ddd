@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import v2_fixtures as fx
 from awa_ddd.domain.repository import Repository
+from awa_ddd.domain.universe import new_universe
 from awa_ddd.planning import campaign as campaign_planning
 from awa_ddd.planning import coverage, scheduler
 from awa_ddd.planning.hypotheses import family_applicability, generate_hypotheses
@@ -66,6 +67,115 @@ class UniverseAndSchedulerTests(unittest.TestCase):
         self.assertEqual(1, universe["unknown_counts"]["unknown_consumer_total"])
         unknown = [item for item in universe["consumers"] if item["status"] == "unknown"]
         self.assertEqual(1, len(unknown))
+
+    def test_complete_snapshot_alone_never_enables_site_wide_discovery(self):
+        universe = new_universe(
+            scope_epoch="scope",
+            origins=["http://fixture.invalid"],
+            routes=[], pages=[], functions=[], operations=[], inputs=[],
+            consumers=[], sources=[], unknown_counts={},
+            completeness_level="complete_snapshot",
+        )
+        self.assertEqual("complete_snapshot", universe["completeness_level"])
+        self.assertFalse(universe["site_wide_discovery_allowed"])
+
+    def test_saved_snapshot_advances_universe_and_invalidates_old_authority(self):
+        temporary, root = fx.workspace()
+        self.addCleanup(temporary.cleanup)
+        project = fx.project(root)
+        fx.register(project, "http://fixture.invalid/render", "GET", "public", [{
+            "name": "label", "location": "query", "selector": "label",
+            "consumer": "template_engine",
+            "test_families": ["template_injection"],
+        }])
+        project.close()
+        with patch.object(campaign_planning, "_gaps", return_value=[]):
+            started = fx.start(root)
+        real_family_matrix = coverage.family_applicability
+
+        def single_mechanism_family_matrix(hypotheses):
+            rows = real_family_matrix(hypotheses)
+            for row in rows:
+                if not row["total"]:
+                    row["status"] = "not_applicable"
+            return rows
+
+        self.enterContext(patch.object(
+            coverage, "family_applicability",
+            new=single_mechanism_family_matrix))
+        campaign_id = started["campaign"]["id"]
+        recipe_id = fx.dispatch(root, "campaign.next", {
+            "project_id": "v2", "campaign_id": campaign_id, "limit": 1,
+        })["recipes"][0]["recipe"]["id"]
+        with patch("awa_ddd.engine.request", side_effect=fx.Sequence([
+                {"value": "AWA-NORMAL"}, {"value": "49"},
+                {"value": "AWA-NORMAL-2"}])):
+            run = fx.dispatch(root, "test.run", {
+                "project_id": "v2", "campaign_id": campaign_id,
+                "recipe_id": recipe_id, "idempotency_key": "before-advance",
+            })
+        self.assertEqual("supported", run["outcome"])
+        reviewed = fx.dispatch(root, "campaign.review_frontier", {
+            "project_id": "v2", "campaign_id": campaign_id,
+        })
+        self.assertEqual(1, reviewed["frontier_rounds"])
+        checkpoint = fx.dispatch(root, "campaign.checkpoint", {
+            "project_id": "v2", "campaign_id": campaign_id,
+        })
+        before = fx.dispatch(root, "campaign.status", {
+            "project_id": "v2", "campaign_id": campaign_id,
+        })
+        self.assertEqual(1, before["continuation"]["frontier_rounds"])
+
+        fx.dispatch(root, "surface.register", {
+            "project_id": "v2",
+            "url": "http://fixture.invalid/new-operation",
+            "method": "GET", "auth": "public",
+            "inputs": [{
+                "name": "q", "location": "query", "selector": "q",
+                "consumer": "business_input", "test_families": ["generic"],
+            }],
+        })
+        snapshot = fx.dispatch(root, "recon.snapshot", {
+            "project_id": "v2", "campaign_id": campaign_id, "save": True,
+        })
+        self.assertNotEqual(
+            before["universe"]["id"], snapshot["universe"]["id"])
+        after = fx.dispatch(root, "campaign.status", {
+            "project_id": "v2", "campaign_id": campaign_id,
+        })
+        self.assertEqual(snapshot["universe"]["id"], after["universe"]["id"])
+        self.assertEqual(0, after["continuation"]["frontier_rounds"])
+        self.assertTrue(after["continuation"]["frontier_review_required"])
+        self.assertFalse(after["completion_decision"]["checkpoint_current"])
+        self.assertIn(
+            "checkpoint_stale",
+            after["completion_decision"]["reason_codes"],
+        )
+        self.assertGreater(after["open_hypothesis_count"], 0)
+        self.assertFalse(after["continuation"]["can_finalize"])
+
+        project = fx.project(root)
+        try:
+            repository = Repository(project)
+            hypotheses = repository.list_campaign(
+                "hypothesis", campaign_id, limit=None)[0]
+            current = [row for row in hypotheses
+                       if row.get("universe_id") == after["universe"]["id"]
+                       and not row.get("superseded")]
+            carried = next(
+                row for row in current
+                if row.get("family") == "template_injection")
+            self.assertIn(run["run"]["id"], carried["run_ids"])
+            self.assertTrue(any(row.get("family") == "generic"
+                                for row in current))
+            old = repository.get("checkpoint", checkpoint["checkpoint_id"])
+            self.assertEqual(
+                before["universe"]["snapshot_hash"],
+                old["universe_snapshot_hash"],
+            )
+        finally:
+            project.close()
 
     def test_hypothesis_generation_keeps_needs_consumer_and_all_families_visible(self):
         row = fx.project(self.root)

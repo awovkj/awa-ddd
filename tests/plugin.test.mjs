@@ -70,7 +70,7 @@ test('every engine action appears in exactly one native tool enum', () => {
   const actions = GROUPS.flatMap(group => group.actions);
   assert.equal(actions.length, new Set(actions).size);
   assert.deepEqual([...actions].sort(), [...ACTIONS].sort());
-  assert.equal(actions.length, 67);
+  assert.equal(actions.length, ACTIONS.length);
 });
 
 test('actual dsh defineTool validates action enums before calling the Python bridge', async () => {
@@ -111,6 +111,38 @@ test('conflicting project aliases fail and mutating operations are not marked co
   assert.equal(execute.isConcurrencySafe({ action: 'run.inspect', project_id: 'p', input: { run_id: 'RUN-1' } }), true);
 });
 
+test('storage previews are concurrent reads while applied changes remain serial', () => {
+  const definitions = toolDefinitions(defineTool, config, async () => { throw new Error('must not invoke'); });
+  const project = definitions.find(tool => tool.name === 'awa_project');
+  const execute = definitions.find(tool => tool.name === 'awa_execute');
+  assert.equal(project.isConcurrencySafe({ action: 'project.migrate', input: {} }), true);
+  assert.equal(project.isConcurrencySafe({ action: 'project.migrate', input: { mode: 'dry_run' } }), true);
+  assert.equal(project.isConcurrencySafe({ action: 'project.migrate', input: { mode: 'apply' } }), false);
+  assert.equal(project.isConcurrencySafe({ action: 'project.projection', input: {} }), true);
+  assert.equal(project.isConcurrencySafe({ action: 'project.projection', input: { mode: 'compare' } }), true);
+  assert.equal(project.isConcurrencySafe({ action: 'project.projection', input: { mode: 'rebuild' } }), false);
+  assert.equal(project.isConcurrencySafe({ action: 'project.rollback', input: { ledger_id: 'SMIG-id' } }), false);
+  assert.equal(execute.isConcurrencySafe({ action: 'execution.reconcile', input: {
+    run_id: 'RUN-1', evidence_ids: ['E-1'] } }), false);
+});
+
+test('actions that persist loop-guard sidecars stay serial despite having no target side effects', () => {
+  const definitions = toolDefinitions(defineTool, config, async () => { throw new Error('must not invoke'); });
+  const plan = definitions.find(tool => tool.name === 'awa_plan');
+  const execute = definitions.find(tool => tool.name === 'awa_execute');
+  const assess = definitions.find(tool => tool.name === 'awa_assess');
+  for (const [definition, action] of [
+    [plan, 'plan.next'],
+    [execute, 'http.preflight'],
+    [assess, 'assessment.prepare'],
+  ]) {
+    assert.equal(definition.isConcurrencySafe({ action }), false,
+      `${action} writes .loop_guard state and must not run through the read-only scheduler`);
+  }
+  assert.equal(execute.isConcurrencySafe({ action: 'scenario.preflight' }), true,
+    'scenario.preflight does not use the persistent queue/preflight sidecars');
+});
+
 test('misplaced action fields fail visibly instead of silently changing pagination or experiments', async () => {
   let calls = 0;
   const definitions = toolDefinitions(defineTool, config, async () => { calls += 1; return { ok: true, data: {} }; });
@@ -137,7 +169,7 @@ test('candidate work is read-mostly: listing is concurrency-safe, linking and di
   assert.equal(candidate.isConcurrencySafe({ action: 'candidate.reopen', project_id: 'p' }), false);
 });
 
-test('offline help, readiness, preflight and artifact actions route through their native groups', async () => {
+test('offline help, readiness and artifact actions route through their native groups', async () => {
   const calls = [];
   const definitions = toolDefinitions(defineTool, config, async (_settings, action, args) => {
     calls.push({ action, args });
@@ -148,8 +180,6 @@ test('offline help, readiness, preflight and artifact actions route through thei
     ['awa_external', 'runtime.probe', {}, undefined],
     ['awa_surface', 'surface.list', {}, 'p'],
     ['awa_surface', 'surface.inspect', { operation_id: 'OP-1' }, 'p'],
-    ['awa_plan', 'plan.next', { limit: 10 }, 'p'],
-    ['awa_execute', 'http.preflight', { operation_id: 'OP-1' }, 'p'],
     ['awa_execute', 'scenario.preflight', { scenario: { steps: [] } }, 'p'],
     ['awa_external', 'tool.artifact', { run_id: 'RUN-1', name: 'stdout' }, 'p'],
   ]) {
@@ -230,6 +260,7 @@ test('checkpoint, administrative review and guarded finalization route as persis
   for (const [action, input] of [
     ['plan.checkpoint', { label: 'Round one' }],
     ['plan.review', { checklist_id: 'CL-1', status: 'blocked', reviewer: 'local-reviewer', reason: 'Needs actual fixture' }],
+    ['plan.accept_partial', { checkpoint_id: 'CP-1', accepted_by: 'local-reviewer', explanation: 'Bounded partial delivery remains unfinished' }],
     ['plan.finalize', { checkpoint_id: 'CP-1', reason: 'completed', explanation: 'Registered scope exhausted', reviewer: 'local-reviewer' }],
   ]) {
     await plan.execute({ action, project_id: 'p', input }, {});
@@ -556,16 +587,103 @@ test('minimal oversized fallback still retains continuation and recovery for an 
   assert.equal(rendered.render_recovery.pages[0].input.limit, 1);
 });
 
-test('shortened method and artifact pages retain their own current-offset recovery', () => {
-  const method = { ok: true, data: { method_coverage: Array.from({ length: 25 }, (_, index) =>
-    ({ operation_id: `O-${index}`, reason: 'x'.repeat(5000) })), method_offset: 10, method_next_offset: 35 } };
-  const renderedMethod = JSON.parse(renderToolResult({ action: 'project.status' }, method)[0].text);
-  assert.deepEqual(renderedMethod.render_recovery.pages[0].input,
-    { offset: 0, limit: 1, method_offset: 10, method_limit: 5 });
+test('oversized method rows recover both row and nested-operation cursors', () => {
+  const methodRow = {
+    path_shape: ['https', 'shop.test', '/api/items/{}'],
+    auth: 'user',
+    registered_methods: ['GET', 'PUT'],
+    observed_methods: ['GET'],
+    tested: ['GET'],
+    untested_registered_methods: ['PUT'],
+    untested_siblings: ['POST'],
+    operations: Array.from({ length: 2000 }, (_, index) => `OP-${index}-${'x'.repeat(48)}`),
+    operations_total: 2000,
+    operation_offset: 40,
+    operation_limit: 10,
+    operation_next_offset: 50,
+  };
+  const value = { ok: true, data: {
+    method_coverage: [methodRow],
+    method_total: 1,
+    method_offset: 3,
+    method_next_offset: null,
+    method_operation_offset: 40,
+    method_operation_limit: 10,
+    offset: 5,
+    limit: 4,
+  } };
+  const original = JSON.stringify(value);
+  const [{ text }] = renderToolResult({ action: 'project.status', project_id: 'p', input: {
+    offset: 5, limit: 4, method: 'GET', auth: 'user',
+    method_offset: 3, method_limit: 5, method_operation_offset: 40, method_operation_limit: 10,
+  } }, value);
+  const rendered = JSON.parse(text);
+  assert.ok(Buffer.byteLength(text, 'utf8') <= MAX_RENDER_BYTES);
+  assert.equal(rendered.data.method_offset, 3);
+  assert.equal(rendered.data.method_operation_offset, 40);
+  assert.equal(rendered.data.method_operation_limit, 10);
+  assert.deepEqual(rendered.render_recovery.pages[0], {
+    action: 'project.status',
+    fields: ['method_coverage'],
+    filters: { method: 'GET', auth: 'user' },
+    input: { method: 'GET', auth: 'user', offset: 5, limit: 1,
+      method_offset: 3, method_limit: 1, method_operation_offset: 40, method_operation_limit: 1 },
+    canonical_next_offset: null,
+  });
+  assert.equal(JSON.stringify(value), original);
+});
+
+test('a single oversized method record never recommends an identical retry', () => {
+  const value = { ok: true, data: {
+    method_coverage: [{
+      path_shape: ['https', 'shop.test', '/api/items/{}'],
+      auth: 'admin',
+      registered_methods: ['GET'],
+      observed_methods: [],
+      tested: [],
+      untested_registered_methods: ['GET'],
+      untested_siblings: [],
+      operations: ['OP-' + 'x'.repeat(30000)],
+      operations_total: 1,
+      operation_offset: 7,
+      operation_limit: 1,
+      operation_next_offset: null,
+    }],
+    method_total: 1,
+    method_offset: 9,
+    method_next_offset: null,
+    method_operation_offset: 7,
+    method_operation_limit: 1,
+    offset: 2,
+    limit: 1,
+  } };
+  const original = JSON.stringify(value);
+  const [{ text }] = renderToolResult({ action: 'project.status', input: {
+    offset: 2, limit: 1, method: 'GET', auth: 'admin',
+    method_offset: 9, method_limit: 1, method_operation_offset: 7, method_operation_limit: 1,
+  } }, value);
+  const rendered = JSON.parse(text);
+  const recovery = rendered.render_recovery.pages[0];
+  assert.ok(Buffer.byteLength(text, 'utf8') <= MAX_RENDER_BYTES);
+  assert.equal(recovery.retry_same_page, false);
+  assert.equal(recovery.projection_limit, 'single_record');
+  assert.equal(recovery.current_offset, 9);
+  assert.equal(recovery.current_operation_offset, 7);
+  assert.deepEqual(recovery.filters, { method: 'GET', auth: 'admin' });
+  assert.equal(Object.hasOwn(recovery, 'input'), false);
+  assert.deepEqual(recovery.detail_action, { action: 'action.help', input: { name: 'project.status' } });
+  assert.equal(JSON.stringify(value), original);
+});
+
+test('shortened artifact pages retain their own current-offset recovery', () => {
   const artifact = { ok: true, data: { content: 'x'.repeat(30000), offset: 4000, limit: 8000, next_offset: 12000 } };
   const renderedArtifact = JSON.parse(renderToolResult({ action: 'tool.artifact', input: { run_id: 'RUN-1', name: 'stdout' } }, artifact)[0].text);
   assert.deepEqual(renderedArtifact.render_recovery.pages[0].input,
     { run_id: 'RUN-1', name: 'stdout', offset: 4000, limit: 1200 });
+  const renderedReport = JSON.parse(renderToolResult({ action: 'report.artifact',
+    input: { handle: 'artifact://reports/report.md' } }, artifact)[0].text);
+  assert.deepEqual(renderedReport.render_recovery.pages[0].input,
+    { handle: 'artifact://reports/report.md', offset: 4000, limit: 1200 });
 });
 
 test('small presentations retain the ordinary result shape', () => {

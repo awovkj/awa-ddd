@@ -13,6 +13,7 @@ import math
 import re
 from datetime import datetime, timezone
 
+from ..error_registry import require_validator_code
 from ..store import EngineError, canonical, now
 
 
@@ -26,13 +27,14 @@ def fail(code: str, message: str, **details):
 
 
 def text(value, name, *, maximum=MAX_TEXT, allow_empty=False):
+    code = require_validator_code("text", name)
     if not isinstance(value, str):
-        fail("v2_" + name, f"{name} must be a string")
+        fail(code, f"{name} must be a string")
     value = value.strip()
     if not allow_empty and not value:
-        fail("v2_" + name, f"{name} must be nonempty")
+        fail(code, f"{name} must be nonempty")
     if len(value) > maximum:
-        fail("v2_" + name, f"{name} exceeds {maximum} characters")
+        fail(code, f"{name} exceeds {maximum} characters")
     return value
 
 
@@ -44,47 +46,55 @@ def optional_text(value, name, *, maximum=MAX_TEXT):
 
 def identifier(value, name):
     if not isinstance(value, str) or not _ID_RE.match(value):
+        # The repository has no static identifier-validator call sites, so
+        # these names are intentionally left to publication's error fallback.
         fail("v2_" + name, f"{name} must be a stable identifier")
     return value
 
 
 def enum(value, name, choices):
+    code = require_validator_code("enum", name)
     if value not in choices:
-        fail("v2_" + name, f"{name} must be one of: " + ", ".join(sorted(choices)))
+        fail(code, f"{name} must be one of: " + ", ".join(sorted(choices)))
     return value
 
 
 def integer(value, name, *, minimum=0, maximum=None):
+    code = require_validator_code("integer", name)
     if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
-        fail("v2_" + name, f"{name} must be an integer in {minimum}..{maximum if maximum is not None else 'inf'}")
+        fail(code, f"{name} must be an integer in {minimum}..{maximum if maximum is not None else 'inf'}")
     return value
 
 
 def boolean(value, name):
+    code = require_validator_code("boolean", name)
     if type(value) is not bool:
-        fail("v2_" + name, f"{name} must be a boolean")
+        fail(code, f"{name} must be a boolean")
     return value
 
 
 def mapping(value, name):
+    code = require_validator_code("mapping", name)
     if not isinstance(value, dict):
-        fail("v2_" + name, f"{name} must be an object")
+        fail(code, f"{name} must be an object")
     return value
 
 
 def sequence(value, name, *, maximum=4096):
+    code = require_validator_code("sequence", name)
     if not isinstance(value, list) or len(value) > maximum:
-        fail("v2_" + name, f"{name} must be an array of at most {maximum} entries")
+        fail(code, f"{name} must be an array of at most {maximum} entries")
     return value
 
 
 def string_list(value, name, *, maximum=256, allowed=None):
+    code = require_validator_code("text", name)
     sequence(value, name, maximum=maximum)
     result = []
     for item in value:
         item = text(item, name, maximum=256)
         if allowed is not None and item not in allowed:
-            fail("v2_" + name, f"{name} contains unsupported value")
+            fail(code, f"{name} contains unsupported value")
         if item not in result:
             result.append(item)
     return result

@@ -137,13 +137,15 @@ class SqlmapPathRecoveryTests(unittest.TestCase):
             with patch.object(external.subprocess, "Popen", side_effect=self.fixture.fake_process("current database: 'audit_db'\n")) as process:
                 result = external.sqlmap_run(self.project, reused)
             command = process.call_args.args[0]
-            self.assertEqual(str(self.fixture.executable.resolve()), command[3])
-            self.assertEqual(original["url"], command[command.index("-u") + 1])
-            self.assertEqual("sort", command[command.index("-p") + 1])
+            guard = json.loads(Path(command[-1]).read_text(encoding="utf-8"))
+            argv = guard["argv"]
+            self.assertEqual(str(self.fixture.executable.resolve()), guard["executable"])
+            self.assertEqual(original["url"], argv[argv.index("-u") + 1])
+            self.assertEqual("sort", argv[argv.index("-p") + 1])
             for option in ("--level=1", "--risk=1", "--threads=1", "--technique=BEU", "--ignore-proxy",
                            "--ignore-redirects", "--current-db", "--current-user"):
-                self.assertIn(option, command)
-            self.assertFalse(any(option.startswith(("--crawl", "--dump", "--sql-query", "--proxy", "--os-")) for option in command))
+                self.assertIn(option, argv)
+            self.assertFalse(any(option.startswith(("--crawl", "--dump", "--sql-query", "--proxy", "--os-")) for option in argv))
             self.assertEqual("BEU", result["profile"]["techniques"])
             self.assertEqual(configuration, self.project.get("tool_config", "sqlmap"))
             self.assertEqual(original, self.fixture.args)

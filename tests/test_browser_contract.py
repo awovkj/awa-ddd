@@ -410,7 +410,17 @@ class BrowserContractTests(unittest.TestCase):
         self.assertEqual(["/ui"], [call[1] for call in self.server.calls])
         self.assertEqual("BLOCKED", blocked["observation_status"])
         engine.update_project(self.project, {"allow_mutation": True})
-        observed = self.drive(actions=[{"type": "click", "selector": "#save"}])
+        operation = engine.register_operation(self.project, {"url": self.base + "/ui/save", "method": "POST",
+            "auth": "public", "inputs": [{"name": "id", "location": "query", "consumer": "resource"}]})
+        actor = engine.add_actor(self.project, {"actor_id": "fixture-owner", "roles": []})
+        resource = engine.add_resource(self.project, {"operation_id": operation["id"],
+            "owner_actor_id": actor["id"], "external_id": "fixture-1",
+            "request_binding": {"location": "query", "selector": "id"}})
+        self.server.documents["/ui"] = {"click_requests": {"#save": [
+            {"url": self.base + "/ui/save?id=fixture-1", "method": "POST", "body": body}]}}
+        observed = self.drive(actions=[{"type": "click", "selector": "#save"}],
+                              allow_write=True, max_writes=1,
+                              operation_id=operation["id"], resource_id=resource["id"])
         raw = self.project.read_artifact(self.project.get("page_visit", observed["id"]))
         entry = next(item for item in raw["network"] if item["method"] == "POST")
         self.assertEqual(len(body.encode("utf-8")), entry["request_body_bytes"])

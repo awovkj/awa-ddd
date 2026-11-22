@@ -433,7 +433,7 @@ class BlockerReconciliationTests(unittest.TestCase):
         visit, receipt = self.legacy_browser_archive(raw)
         self.assert_legacy_browser_blocked(visit, receipt, "resolved_explicit_browser_request_boundary")
         self.fixture.checkpoint(self.fixture.frontier())
-        checkpoint = self.fixture.checkpoint(self.fixture.frontier())
+        checkpoint = self.fixture.checkpoint(self.fixture.frontier(self.fixture.variant_evidence))
         with self.assertRaises(EngineError) as caught:
             self.fixture.finish(checkpoint)
         self.assertEqual("assessment_partial", caught.exception.code)
@@ -516,14 +516,24 @@ class BlockerReconciliationTests(unittest.TestCase):
     def test_offline_successful_page_adoption_preserves_existing_uncertain_native_write_ledger(self):
         self.fixture.close_generic()
         state = {"available": True, "node": "fixture-node", "module_root": "fixture-runtime"}
+        operation = engine.register_operation(self.project, {"url": self.fixture.base + "/write", "method": "POST",
+            "auth": "public", "inputs": [{"name": "id", "location": "query", "consumer": "resource"}]})
+        actor = engine.add_actor(self.project, {"actor_id": "legacy-browser-owner", "roles": []})
+        resource = engine.add_resource(self.project, {"operation_id": operation["id"],
+            "owner_actor_id": actor["id"], "external_id": "fixture-1",
+            "request_binding": {"location": "query", "selector": "id"}})
         with patch.object(browser, "probe", return_value=state), patch.object(browser.subprocess, "run",
                 side_effect=subprocess.TimeoutExpired("isolated-fixture-runtime", 20)):
             with self.assertRaises(EngineError) as caught:
                 dispatch(self.fixture.root, "browser.visit", {"project_id": self.project.project_id,
-                    "url": self.fixture.base + "/uncertain-ui", "allow_write": True,
+                    "url": self.fixture.base + "/uncertain-ui", "allow_write": True, "max_writes": 1,
+                    "operation_id": operation["id"], "resource_id": resource["id"],
                     "actions": [{"type": "click", "selector": "#submit"}]})
         self.assertEqual("browser_timeout", caught.exception.code)
         run = self.project.get("run", caught.exception.details["run_id"])
+        for field in ("operation_id", "operation_signature", "resource_id", "resource_signature"):
+            run.pop(field, None)
+        self.project.put("run", run)
         self.assertEqual("interrupted", run["status"])
         self.assertEqual("test_resource_write", run["effect"])
         visit = self.imported_browser(self.successful_write_browser_raw())

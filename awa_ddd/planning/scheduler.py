@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from ..domain.hypothesis import requires_preparation
 from ..domain.repository import Repository
-from ..domain.common import digest, fail, integer, text, utc_now
+from ..domain.common import fail, integer, stable_id, text, utc_now
 
 FAMILY_COST = {
     "sql_injection": 1.0, "xss": 1.4, "ssrf": 1.2, "xxe": 1.1,
@@ -20,13 +20,34 @@ EXPLOITABILITY = {
     "business_logic": 1.1, "generic": 0.75,
 }
 _PREP_ACTIONS = {
-    "actual_input_consumer": ("surface.declare_consumer", "确认并声明该输入的实际消费点"),
-    "verified_principal_and_roles": ("identity.verify", "核验独立主体的服务端角色与租户"),
-    "verified_tenant_membership": ("identity.verify", "核验服务端租户成员关系"),
-    "owned_test_fixture": ("identity.resource", "创建并绑定可回退的自有测试资源"),
-    "state_readback": ("review.disposition", "准备同身份只读读回绑定"),
-    "exact_authorized_url": ("recon.snapshot", "绑定精确的授权 URL 与请求方法"),
-    "current_http_observation": ("recon.snapshot", "收集当前正常业务观察"),
+    "actual_input_consumer": (
+        "surface.declare_consumer",
+        "Identify and declare the input's actual consumer.",
+    ),
+    "verified_principal_and_roles": (
+        "identity.verify",
+        "Verify the principal and its server-side role binding.",
+    ),
+    "verified_tenant_membership": (
+        "identity.verify",
+        "Verify the principal's server-side tenant membership.",
+    ),
+    "owned_test_fixture": (
+        "identity.resource",
+        "Create and bind a disposable test resource.",
+    ),
+    "state_readback": (
+        "scenario.preflight",
+        "Prepare same-identity, same-resource readbacks around the state change.",
+    ),
+    "exact_authorized_url": (
+        "recon.snapshot",
+        "Bind the exact authorized URL and request method.",
+    ),
+    "current_http_observation": (
+        "recon.snapshot",
+        "Collect a current normal-business HTTP observation.",
+    ),
 }
 
 
@@ -96,7 +117,14 @@ def _operation_importance(universe, hypothesis):
 def candidates(project, campaign, universe):
     """Return (ready, preparation) lists; never mutates attempt history."""
     repository = Repository(project)
-    hypotheses = [row for row in repository.list("hypothesis", limit=None)[0] if not row.get("superseded")]
+    if campaign.get("universe_id") != universe.get("id"):
+        fail("v2_campaign_scope", "Scheduler universe does not belong to the campaign")
+    hypotheses = [
+        row for row in repository.list_campaign(
+            "hypothesis", campaign["id"], limit=None)[0]
+        if not row.get("superseded")
+        and row.get("universe_id") == universe.get("id")
+    ]
     family_totals, family_tested = {}, {}
     for row in hypotheses:
         family_totals[row["family"]] = family_totals.get(row["family"], 0) + 1
@@ -110,11 +138,18 @@ def candidates(project, campaign, universe):
         stopped = stop_receipt(project, operation) if operation is not None else None
         if project_mode(project) == "src" and operation is not None \
                 and (stopped or operation["method"] not in {"GET", "HEAD", "OPTIONS"}):
-            preparation.append({"hypothesis_id": hypothesis["id"], "family": hypothesis["family"],
-                                "operation_id": operation["id"], "reason": "stopped_at_evidence" if stopped else "src_write_denied",
-                                "next_action": "review.evidence" if stopped else "recon.snapshot",
-                                "automatic_execution_allowed": False,
-                                "detail": "SRC 保留直接证据与未测范围，不为补齐覆盖度而继续利用。"})
+            preparation.append({
+                "hypothesis_id": hypothesis["id"],
+                "family": hypothesis["family"],
+                "operation_id": operation["id"],
+                "reason": "stopped_at_evidence" if stopped else "src_write_denied",
+                "next_action": "review.evidence" if stopped else "recon.snapshot",
+                "automatic_execution_allowed": False,
+                "detail": (
+                    "SRC mode preserves direct evidence and untested scope; "
+                    "it does not execute denied writes to pad coverage."
+                ),
+            })
             continue
         if hypothesis.get("status") not in {"ready", "unplanned"}:
             if requires_preparation(hypothesis):
@@ -132,7 +167,10 @@ def candidates(project, campaign, universe):
                 "hypothesis_id": hypothesis["id"], "family": hypothesis["family"],
                 "reason": "attempt_cooldown",
                 "next_action": "campaign.next",
-                "detail": "连续两次无进展；换族/换操作或修复前提后再试，不重复同一任务。",
+                "detail": (
+                    "Two consecutive attempts made no progress. Change the "
+                    "family, operation or prerequisite before retrying."
+                ),
             })
             continue
         score_row = score(hypothesis, family_totals=family_totals, family_tested=family_tested,
@@ -142,25 +180,34 @@ def candidates(project, campaign, universe):
         family_rows.sort(key=lambda item: (-item[0]["score"], item[1]["id"]))
     return by_family, preparation
 
-
 def _preparation_entry(hypothesis):
     missing = hypothesis.get("missing_context") or []
     actions = []
     for item in missing:
-        if item in _PREP_ACTIONS:
-            action, reason = _PREP_ACTIONS[item]
-            actions.append({"missing_context": item, "action": action, "reason": reason})
+        action, reason = _PREP_ACTIONS.get(
+            item,
+            (
+                "action.help",
+                "Inspect the exact inputs, existing evidence and collection path.",
+            ),
+        )
+        actions.append({
+            "missing_context": item,
+            "action": action,
+            "reason": reason,
+            "help_input": {"name": action},
+            "automatic_execution_allowed": False,
+        })
     return {
         "hypothesis_id": hypothesis["id"],
         "family": hypothesis["family"],
         "operation_id": hypothesis.get("operation_id"),
         "missing_context": missing,
         "status": hypothesis.get("status"),
-        "next_action": actions[0]["action"] if actions else "review.disposition",
+        "next_action": actions[0]["action"] if actions else "action.help",
         "preparation_actions": actions,
         "automatic_execution_allowed": False,
     }
-
 
 def next_hypotheses(project, campaign, universe, *, limit=3):
     """Return complete scheduling rows in fair family order.
@@ -209,9 +256,24 @@ def next_hypotheses(project, campaign, universe, *, limit=3):
     }
 
 
-def claim(project, hypothesis_id, *, worker_id, ttl_seconds=300):
+def claim(project, hypothesis_id, *, worker_id, ttl_seconds=300,
+          campaign_id=None, expected_revision=None):
     repository = Repository(project)
     hypothesis = repository.get("hypothesis", hypothesis_id)
+    campaign = repository.get("campaign", campaign_id or hypothesis.get("campaign_id"))
+    if hypothesis.get("campaign_id") != campaign.get("id"):
+        fail("v2_campaign_scope", "Hypothesis does not belong to the requested campaign")
+    if campaign.get("state") != "active":
+        fail("v2_campaign_state", "Only an active campaign can claim hypotheses")
+    if hypothesis.get("universe_id") != campaign.get("universe_id"):
+        fail("v2_campaign_scope", "Hypothesis universe does not belong to the campaign")
+    if hypothesis.get("superseded") or hypothesis.get("status") in {
+            "supported", "refuted", "inconclusive", "not_applicable"}:
+        fail("v2_scheduler_claim", "Only non-terminal hypotheses can be claimed")
+    live_revision = repository.get_revision("hypothesis", hypothesis["id"])
+    if expected_revision is not None and live_revision != expected_revision:
+        fail("revision_conflict", "Hypothesis changed after it was read",
+             expected_revision=expected_revision, current_revision=live_revision)
     lease = hypothesis.get("lease")
     if lease and lease.get("expires_at"):
         try:
@@ -221,20 +283,39 @@ def claim(project, hypothesis_id, *, worker_id, ttl_seconds=300):
         if expires_at is not None and expires_at > _now() and lease.get("worker_id") != worker_id:
             fail("v2_scheduler_lease", "Hypothesis is already claimed by another worker")
     from datetime import timedelta
-    hypothesis["lease"] = {"worker_id": text(worker_id, "worker_id", maximum=128),
-                           "claimed_at": utc_now(),
-                           "expires_at": (_now() + timedelta(seconds=integer(
-                               ttl_seconds, "ttl_seconds", minimum=1, maximum=86400))).isoformat()}
-    repository.save("hypothesis", hypothesis)
+    worker_id = text(worker_id, "worker_id", maximum=128)
+    claimed_at = utc_now()
+    ttl_seconds = integer(ttl_seconds, "ttl_seconds", minimum=1, maximum=86400)
+    hypothesis["lease"] = {
+        "worker_id": worker_id,
+        "campaign_id": campaign["id"],
+        "fence": stable_id("HLS", {
+            "hypothesis_id": hypothesis["id"],
+            "campaign_id": campaign["id"],
+            "worker_id": worker_id,
+            "expected_revision": live_revision,
+            "claimed_at": claimed_at,
+        }),
+        "claimed_at": claimed_at,
+        "expires_at": (_now() + timedelta(seconds=ttl_seconds)).isoformat(),
+    }
+    repository.save("hypothesis", hypothesis, expected_revision=live_revision)
     return hypothesis["lease"]
 
 
-def release(project, hypothesis_id, *, worker_id):
+def release(project, hypothesis_id, *, worker_id, campaign_id=None, fence=None):
     repository = Repository(project)
     hypothesis = repository.get("hypothesis", hypothesis_id)
+    campaign = repository.get("campaign", campaign_id or hypothesis.get("campaign_id"))
+    if hypothesis.get("campaign_id") != campaign.get("id"):
+        fail("v2_campaign_scope", "Hypothesis does not belong to the requested campaign")
     lease = hypothesis.get("lease") or {}
     if lease.get("worker_id") != worker_id:
         fail("v2_scheduler_lease", "Only the claiming worker can release this hypothesis")
+    if fence is not None and lease.get("fence") != fence:
+        fail("v2_scheduler_fence", "Hypothesis lease fence does not match")
+    revision = repository.get_revision("hypothesis", hypothesis["id"])
     hypothesis["lease"] = None
-    repository.save("hypothesis", hypothesis)
-    return {"hypothesis_id": hypothesis_id, "released": True}
+    repository.save("hypothesis", hypothesis, expected_revision=revision)
+    return {"hypothesis_id": hypothesis_id, "released": True,
+            "campaign_id": campaign["id"]}

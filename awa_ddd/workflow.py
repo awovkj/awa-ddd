@@ -42,11 +42,12 @@ def operation_view(operation, *, detail=False):
 
 
 def list_surfaces(project, args):
-    rows = [operation_view(operation) for operation in project.list("operation")
-            if (not args.get("method") or operation["method"] == str(args["method"]).upper())
-            and (not args.get("auth") or operation["auth"] == args["auth"])]
-    window = page(rows, args)
-    return {"operations": window.pop("items"), "operation_total": window.pop("total"), **window,
+    offset, limit = page_args(args)
+    filters = {key: str(args[key]).upper() if key == "method" else args[key]
+               for key in ("method", "auth") if args.get(key)}
+    window = project.list_page("operation", offset=offset, limit=limit, filters=filters, cursor=args.get("cursor"))
+    return {"operations": [operation_view(operation) for operation in window.pop("items")],
+            "operation_total": window.pop("total"), **window,
             "next_action": "surface.inspect", "registration_is_testing": False}
 
 
@@ -127,7 +128,28 @@ def plan_page(project, result, args):
             "obligation_items": window.pop("items"), "obligation_total": window.pop("total"), **window,
             "coverage_ratio": result["coverage_ratio"], "surface_coverage": result["surface_coverage"],
             "security_coverage": result["security_coverage"], "completion": result["completion"],
+            "source_inventory": result["source_inventory"],
             "gap_total": len(result["gaps"]), "next_action": "plan.next"}
+
+
+def method_page_args(args):
+    offset, limit = page_args({"offset": args.get("method_offset", 0), "limit": args.get("method_limit", 10)})
+    operation_offset, operation_limit = page_args({"offset": args.get("method_operation_offset", 0),
+                                                  "limit": args.get("method_operation_limit", 10)})
+    return offset, limit, operation_offset, operation_limit
+
+
+def method_operation_page(rows, args):
+    """Bound nested method memberships while preserving the complete matrix."""
+    _, _, offset, limit = method_page_args(args)
+    result = []
+    for row in rows:
+        identities = row.get("operations", [])
+        selected = identities[offset:offset + limit]
+        result.append({**row, "operations": selected, "operations_total": len(identities),
+                       "operation_offset": offset, "operation_limit": limit,
+                       "operation_next_offset": offset + len(selected) if offset + len(selected) < len(identities) else None})
+    return result
 
 
 def coverage_view(result, args, *, include_gaps=True, default=25):
@@ -138,14 +160,20 @@ def coverage_view(result, args, *, include_gaps=True, default=25):
                historical_findings=sum(item.get("current") is not True for item in result["findings"]))
     if include_gaps:
         row.update(gaps=safe_metadata(window.pop("items")), **{k: v for k, v in window.items() if k != "total"})
-    methods = page(result.get("method_coverage", []),
-                   {"offset": args.get("method_offset", 0), "limit": args.get("method_limit", 10)})
-    row.update(method_coverage=safe_metadata(methods["items"]), method_total=methods["total"],
-               method_offset=methods["offset"], method_next_offset=methods["next_offset"])
+    method_offset, method_limit, operation_offset, operation_limit = method_page_args(args)
+    methods = page(result.get("method_coverage", []), {"offset": method_offset, "limit": method_limit})
+    row.update(method_coverage=safe_metadata(method_operation_page(methods["items"], args)), method_total=methods["total"],
+               method_offset=methods["offset"], method_next_offset=methods["next_offset"],
+               method_operation_offset=operation_offset, method_operation_limit=operation_limit)
     return row
 
 
 def project_status(project, args):
+    from .read_model import project_status as projected_status
+    return projected_status(project, args)
+
+
+def _project_status_strong(project, args):
     evaluated = engine.evaluate_coverage(project)
     row = coverage_view(evaluated, args, include_gaps=False, default=10)
     candidates = Counter(item.get("status", "unverified") for item in project.list("candidate"))
@@ -173,14 +201,9 @@ def project_status(project, args):
 
 def capture_preflight(project, args):
     prepared = engine.preflight_capture(project, args)
-    if loop_guard.preflight_seen(project, prepared["request_signature"]):
-        raise EngineError(
-            "already_preflighted",
-            "An identical request signature was already preflighted; use http.capture once with this exact prepared request, or change the tested input/resource instead of repeating preflight.",
-            {"request_signature": prepared["request_signature"], "next_action": "http.capture"},
-        )
+    repeated = loop_guard.preflight_seen(project, prepared["request_signature"])
     session, resource, operation = (prepared[key] for key in ("session", "resource", "operation"))
-    return {"ready": True, "requests_sent": 0, "operation_id": operation["id"], "method": operation["method"],
+    return {"ready": True, "repeat_advisory": repeated, "requests_sent": 0, "operation_id": operation["id"], "method": operation["method"],
             "url": safe_url(prepared["url"]), "request_signature": prepared["request_signature"],
             "body_bytes": prepared["body_bytes"], "auth_mode": prepared["auth_mode"],
             "session_id": session["id"] if session else None, "resource_id": resource["id"] if resource else None,
@@ -778,11 +801,18 @@ def _compact_work_item(row):
 
 
 def _compact_followup(row):
-    fields = ("id", "kind", "action", "label_zh", "operation_id", "obligation_id", "candidate_id", "evidence_id")
+    fields = ("id", "kind", "action", "label_zh", "operation_id", "obligation_id", "candidate_id", "evidence_id",
+              "discovery_source_id", "snapshot_id", "source_item_total", "unresolved_item_total", "missing_item_total",
+              "suggested_action", "input_template", "administrative_review_allowed", "automatic_execution_allowed")
     return {key: row[key] for key in fields if key in row}
 
 
 def next_work(project, args):
+    from .read_model import next_work as projected_next
+    return projected_next(project, args)
+
+
+def _next_work_strong(project, args):
     offset, limit = page_args(args, default=10, maximum=25)
     include_blocked = args.get("include_blocked", False)
     compact = args.get("compact", False)
@@ -797,25 +827,15 @@ def next_work(project, args):
     blocked = _fair_work_items([row for row in rows if row["queue_status"] == "blocked"])
     if include_blocked:
         selected += blocked
-    closure = followups(project, evaluated, min(limit, 10), inventory=inventory)
+    closure = followups(project, evaluated, min(limit, 3), inventory=inventory)
     window = selected[offset:offset + limit]
-    # Anti-repeat guard: a page repeatedly rendered without any change becomes
-    # a bounded blocked sample instead of an endless loop.  The guard only sees
-    # the exact returned page, so normal sequential pagination is unaffected.
+    # Display repetition is advisory; only real prerequisites affect readiness.
     frozen_ids = loop_guard.observe_next_page(project, offset, limit, window)
     if frozen_ids:
-        old_status = {row.get("obligation_id"): row.get("queue_status") for row in window
-                      if row.get("obligation_id") in frozen_ids}
-        frozen = loop_guard.mark_frozen(window, frozen_ids)
-        for obligation_id, status in old_status.items():
-            if status in counts:
-                counts[status] -= 1
-        counts["blocked"] += len(frozen)
-        selected = [row for row in selected if row.get("obligation_id") not in frozen_ids]
-        window = [row for row in window if row.get("obligation_id") not in frozen_ids]
-        blocked = [row for row in blocked if row.get("obligation_id") not in frozen_ids] + frozen
+        loop_guard.mark_frozen(window, frozen_ids)
     if compact:
         return {"continuation": evaluated["continuation"],
+                "completion": evaluated["completion"], "source_inventory": evaluated["source_inventory"],
                 "work_items": [_compact_work_item(row) for row in window],
                 "review_followups": [_compact_followup(row) for row in closure.get("review_followups", [])[:5]],
                 "queue_total": len(selected), "ready_total": counts["ready"],
@@ -837,6 +857,7 @@ def next_work(project, args):
             "blocked_sample": blocked[:min(5, limit)], **closure,
             "requests_sent": 0, "coverage_ratio": evaluated["coverage_ratio"],
             "security_coverage": evaluated["security_coverage"], "completion": evaluated["completion"],
+            "source_inventory": evaluated["source_inventory"],
             "parameter_coverage": parameter_page(inventory["parameter_coverage_snapshot"],
                 {"parameter_limit": min(limit, 3), **args}),
             "queue_policy": "coverage_first", "queue_fairness": "family_and_operation_round_robin", "closure_action": "plan.audit",

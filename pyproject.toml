@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "awa-ddd"
-version = "2.2.0"
+version = "2.4.0"
 description = "Evidence-driven security assessment engine for DeepSeek Harness: Universe, Hypothesis, Recipe and Campaign"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
 
 [project.scripts]
@@ -16,3 +17,15 @@ awa-ddd = "awa_ddd.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["awa_ddd*"]
+
+[tool.setuptools.package-data]
+"awa_ddd.resources" = [
+  "js_parser/manifest.json",
+  "js_parser/parse-js.mjs",
+  "js_parser/vendor/acorn/LICENSE",
+  "js_parser/vendor/acorn/package.json",
+  "js_parser/vendor/acorn/dist/acorn.mjs",
+]
+
+[tool.setuptools]
+include-package-data = false

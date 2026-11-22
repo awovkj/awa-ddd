@@ -2,7 +2,7 @@
 
 ## 必须调用的情况
 
-用户要求：对于需要用浏览器测试的漏洞，或浏览器会明显有利于测试的漏洞，必须调用 Playwright。此策略保留现有 60 个动作、授权与证据规则，不新增浏览器确认 oracle，也不为源码维护、报告维护或用户禁止测试的任务自动访问目标。
+用户要求：对于需要用浏览器测试的漏洞，或浏览器会明显有利于测试的漏洞，必须调用 Playwright。此策略保留当前 V1 的 75 个动作、授权与证据规则，不新增浏览器确认 oracle，也不为源码维护、报告维护或用户禁止测试的任务自动访问目标。
 
 | 情况 | 策略 | 为什么需要实际浏览器 |
 |---|---|---|
@@ -70,7 +70,7 @@ unsafe `run_code` 不是默认安全入口；它可能执行任意脚本或请�
 
 ## Native 的实际限制
 
-`browser.visit` 提供隔离本地 Playwright 访问与有界 click/fill/press/wait/waitForSelector 动作。每个访问保留 scope/exclude 检查；读取也不绕过范围，写入还需 `allow_mutation` 且只允许访问 origin。`allow_write:false` 可以让一次访问维持只读。
+`browser.visit` 提供隔离本地 Playwright 访问与有界 click/fill/press/wait/waitForSelector 动作。每个访问保留 scope/exclude 检查；读取也不绕过范围。默认 `allow_write:false`、`max_writes:0`，项目 `allow_mutation` 不再隐式开启页面写；写入必须显式 `allow_write:true`，并满足访问 origin、operation/resource 和请求预算门禁。HTTPS 默认严格校验，只有管理员显式配置才允许特定环境例外。
 
 本轮不增加本地上传动作、任意 evaluate、独立多 context 生命周期/控制或下载测试。30x 跳转、跨 origin 写入、WebSocket 与 service worker 仍阻断。现有会话凭据头绑定同 origin，但注入 Cookie header 不等于真实 cookie jar 的 SameSite/HttpOnly/Secure 验证。复杂浏览器机制若受这些限制影响，应使用具备能力且已授权的宿主 MCP 或保留 BLOCKED，不能伪称本地已验证。
 

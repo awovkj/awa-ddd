@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   invokeEngine, resolveConfig, validateRequest, validateJson, redactResult, safeErrorText, safeErrorDetails,
-  PACKAGE_ROOT, MAX_REQUEST_BYTES, MAX_JSON_DEPTH, ACTIONS, ENGINE_DISPATCH_UNCERTAIN,
+  PACKAGE_ROOT, MAX_REQUEST_BYTES, MAX_JSON_DEPTH, ACTIONS, ENGINE_DISPATCH_UNCERTAIN, ENGINE_DISPATCH_PHASE,
 } from '../src/bridge.mjs';
 
 const config = { workspace: join(tmpdir(), 'awa-ddd-bridge-test-state'), timeoutMs: 5000 };
@@ -15,6 +16,70 @@ function synthetic(source, inspect = () => {}) {
     inspect(executable, argv, options);
     return spawn(process.execPath, ['-e', source], options);
   };
+}
+
+function syntheticIpc({ phases = [], output = '{"ok":true,"data":{}}', exitCode = 0, hold = false } = {},
+  inspect = () => {}) {
+  const source = `
+    const { createHash } = require('node:crypto');
+    const { writeSync } = require('node:fs');
+    let input = '';
+    let started = false;
+    process.stdin.setEncoding('utf8');
+    const run = () => {
+      if (started) return;
+      started = true;
+      const newline = input.indexOf('\\n');
+      const wire = newline >= 0 ? input.slice(0, newline + 1) : input;
+      const request = JSON.parse(wire);
+      const nonce = process.env.AWA_DDD_REQUEST_NONCE;
+      if (typeof nonce !== 'string' || !/^[a-f0-9]{64}$/.test(nonce)) process.exit(3);
+      const requestHash = createHash('sha256').update(wire, 'utf8').digest('hex');
+      let seq = 0;
+      for (const spec of ${JSON.stringify(phases)}) {
+        if (spec.plain !== undefined) {
+          writeSync(2, spec.plain + '\\n');
+          continue;
+        }
+        if (spec.malformed === true) {
+          writeSync(2, '{"schema":"awa-ddd-ipc/v1","nonce":"' + nonce + '","phase":\\n');
+          continue;
+        }
+        seq += 1;
+        const phase = spec.phase;
+        const receipt = {
+          schema: spec.schema ?? 'awa-ddd-ipc/v1',
+          nonce: spec.nonce ?? nonce,
+          phase,
+          seq: spec.seq ?? seq,
+        };
+        if (phase === 'accepted' || phase === 'dispatch') {
+          receipt.action = spec.action ?? request.action;
+          receipt.request_hash = spec.request_hash ?? requestHash;
+        }
+        if (phase === 'dispatch') {
+          receipt.run_id = spec.run_id ?? 'RUN-ipc-fixture';
+          receipt.dispatch_hash = spec.dispatch_hash ?? 'd'.repeat(64);
+        }
+        Object.assign(receipt, spec.extra || {});
+        for (const key of spec.omit || []) delete receipt[key];
+        writeSync(2, JSON.stringify(receipt) + '\\n');
+      }
+      if (${hold}) {
+        setInterval(() => {}, 1000);
+      } else if (${output === null ? 'true' : 'false'}) {
+        process.exit(${exitCode});
+      } else {
+        process.stdout.write(${JSON.stringify(output)}, () => process.exit(${exitCode}));
+      }
+    };
+    process.stdin.on('data', chunk => {
+      input += chunk;
+      if (input.includes('\\n')) run();
+    });
+    process.stdin.on('end', run);
+  `;
+  return synthetic(source, inspect);
 }
 
 test('configuration separates state from code and accepts an executable path, never a shell command', () => {
@@ -107,6 +172,45 @@ test('the packaged Python help catalog exactly matches native action enums witho
   assert.match(help.data.fields.headers, /non-authentication/);
   assert.match(help.data.fields.body_base64, /base64/);
   assert.match(help.data.fields.body_file, /exact bytes/);
+});
+
+test('real child bridge accepts a current partial checkpoint without granting completion', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'awa-ddd-partial-bridge-'));
+  const realConfig = { workspace, timeoutMs: 15000 };
+  const projectId = 'partial-e2e';
+  try {
+    await invokeEngine(realConfig, 'project.create', {
+      project_id: projectId, target: 'http://fixture.invalid',
+    });
+    await invokeEngine(realConfig, 'surface.register', {
+      project_id: projectId, url: 'http://fixture.invalid/items?q=fixture', method: 'GET', auth: 'public',
+      inputs: [{ name: 'q', location: 'query', consumer: 'business_input', test_families: ['generic'] }],
+    });
+    const checkpoint = await invokeEngine(realConfig, 'plan.checkpoint', {
+      project_id: projectId, label: 'Bounded partial fixture',
+    });
+    const input = {
+      project_id: projectId, checkpoint_id: checkpoint.data.checkpoint.id,
+      accepted_by: 'fixture-owner',
+      explanation: 'Current partial evidence is deliverable while review work remains.',
+    };
+    const accepted = await invokeEngine(realConfig, 'plan.accept_partial', input);
+    const repeated = await invokeEngine(realConfig, 'plan.accept_partial', input);
+    assert.match(accepted.data.partial_acceptance.id, /^CA-[a-f0-9]{64}$/);
+    assert.equal(repeated.data.partial_acceptance.id, accepted.data.partial_acceptance.id);
+    assert.equal(accepted.data.partial_acceptance.can_claim_complete, false);
+    assert.equal(accepted.data.partial_acceptance.automatic_stop_allowed, false);
+    assert.equal(accepted.data.partial_acceptance.continue_required, true);
+    assert.equal(accepted.data.continuation.continue_required, true);
+    assert.equal(accepted.data.continuation.can_claim_complete, false);
+    assert.equal(accepted.data.continuation.partial_acceptance_id, accepted.data.partial_acceptance.id);
+    await assert.rejects(invokeEngine(realConfig, 'plan.finalize', {
+      project_id: projectId, checkpoint_id: checkpoint.data.checkpoint.id,
+      reason: 'partial_accepted', explanation: 'Delivery must remain partial', reviewer: 'fixture-reviewer',
+    }), { code: 'stop_reason' });
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
 });
 
 test('argv is fixed, shell is disabled, and payload punctuation is carried only in JSON stdin', async () => {
@@ -309,22 +413,206 @@ test('extra stdout, malformed envelopes and missing Python produce explicit erro
     { code: 'PYTHON_START_FAILED' });
 });
 
-test('only bridge-owned uncertain outcomes carry dispatch uncertainty, never backend assertions', async () => {
+test('IPC phases distinguish a read before dispatch from an unproven or dispatched write', async () => {
   await assert.rejects(invokeEngine(config, 'project.list', {}, {
-    spawnProcess: synthetic("process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('not-json'))"),
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }], output: 'not-json' }),
   }), error => {
     assert.equal(error.code, 'INVALID_RESPONSE');
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'started');
+    assert.notEqual(error[ENGINE_DISPATCH_UNCERTAIN], true);
+    return true;
+  });
+  await assert.rejects(invokeEngine(config, 'http.capture', { project_id: 'fixture' }, {
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }], output: 'not-json' }),
+  }), error => {
+    assert.equal(error.code, 'INVALID_RESPONSE');
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'started');
+    assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true);
+    return true;
+  });
+  await assert.rejects(invokeEngine(config, 'http.capture', { project_id: 'fixture' }, {
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }, { phase: 'accepted' }], output: null, exitCode: 2 }),
+  }), error => {
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'accepted');
     assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true);
     return true;
   });
   await assert.rejects(invokeEngine(config, 'project.list', {}, {
-    spawnProcess: synthetic("process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write(JSON.stringify({ok:false,error:{code:'arguments',message:'Preflight failed',details:{engine_dispatch_uncertain:true}}}));process.exitCode=2})"),
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'dispatch' }],
+      output: null, exitCode: 2 }),
+  }), error => {
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'dispatched');
+    assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true);
+    return true;
+  });
+});
+
+test('mode-dependent storage mutations retain uncertainty through the serialized bridge request', async () => {
+  for (const [action, args, uncertain] of [
+    ['project.migrate', { project_id: 'fixture', mode: 'apply', confirm: true }, true],
+    ['project.migrate', { project_id: 'fixture', mode: 'dry_run' }, false],
+    ['project.projection', { project_id: 'fixture', mode: 'rebuild' }, true],
+    ['project.projection', { project_id: 'fixture', mode: 'compare' }, false],
+  ]) {
+    await assert.rejects(invokeEngine(config, action, args, {
+      spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }], output: 'not-json' }),
+    }), error => {
+      assert.equal(error.code, 'INVALID_RESPONSE');
+      assert.equal(error[ENGINE_DISPATCH_PHASE], 'started');
+      assert.equal(error[ENGINE_DISPATCH_UNCERTAIN] === true, uncertain,
+        `${action}:${args.mode} must derive uncertainty from the parsed request arguments`);
+      return true;
+    });
+  }
+});
+
+test('valid IPC receipts are nonce-scoped, hash the exact newline-delimited request and tolerate private diagnostics', async () => {
+  const nonces = [];
+  const result = await invokeEngine(config, 'project.create', { project_id: 'fixture', target: 'http://fixture.invalid' }, {
+    spawnProcess: syntheticIpc({
+      phases: [{ plain: 'private ordinary diagnostic' }, { phase: 'startup' }, { plain: 'between receipts' },
+        { phase: 'accepted' }, { phase: 'dispatch' }],
+    }, (_executable, _argv, options) => nonces.push(options.env.AWA_DDD_REQUEST_NONCE)),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.data)), {});
+  assert.match(nonces[0], /^[a-f0-9]{64}$/);
+  await invokeEngine(config, 'project.list', {}, {
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }] },
+      (_executable, _argv, options) => nonces.push(options.env.AWA_DDD_REQUEST_NONCE)),
+  });
+  assert.notEqual(nonces[0], nonces[1], 'each invocation receives a fresh nonce');
+});
+
+test('facade execution accepts only its actual nested dispatch receipts and preserves multiple attempts', async () => {
+  const result = await invokeEngine(config, 'scenario.run', {
+    project_id: 'fixture',
+    scenario: { steps: [] },
+  }, {
+    spawnProcess: syntheticIpc({ phases: [
+      { phase: 'startup' },
+      { phase: 'accepted' },
+      { phase: 'dispatch', action: 'http.capture', run_id: 'RUN-first' },
+      { phase: 'dispatch', action: 'http.capture', run_id: 'RUN-second',
+        dispatch_hash: 'e'.repeat(64) },
+    ] }),
+  });
+  assert.equal(result.ok, true);
+  await assert.rejects(invokeEngine(config, 'scenario.run', {
+    project_id: 'fixture',
+    scenario: { steps: [] },
+  }, {
+    spawnProcess: syntheticIpc({ phases: [
+      { phase: 'startup' },
+      { phase: 'accepted' },
+      { phase: 'dispatch', action: 'project.status' },
+    ] }),
+  }), { code: 'ENGINE_IPC_INVALID' });
+});
+
+test('browser and sqlmap preserve provider and request-slot receipts under exact request binding', async () => {
+  for (const [action, args] of [
+    ['browser.visit', { project_id: 'fixture', url: 'http://fixture.invalid/' }],
+    ['tool.sqlmap', { project_id: 'fixture', operation_id: 'OP-fixture', url: 'http://fixture.invalid/' }],
+  ]) {
+    const result = await invokeEngine(config, action, args, {
+      spawnProcess: syntheticIpc({ phases: [
+        { phase: 'startup' },
+        { phase: 'accepted' },
+        { phase: 'dispatch', action, run_id: 'RUN-provider',
+          dispatch_hash: 'd'.repeat(64) },
+        { phase: 'dispatch', action, run_id: 'RUN-provider',
+          dispatch_hash: 'e'.repeat(64) },
+      ] }),
+    });
+    assert.equal(result.ok, true);
+    await assert.rejects(invokeEngine(config, action, args, {
+      spawnProcess: syntheticIpc({ phases: [
+        { phase: 'startup' },
+        { phase: 'accepted' },
+        { phase: 'dispatch', action, run_id: 'RUN-provider',
+          dispatch_hash: 'd'.repeat(64) },
+        { phase: 'dispatch', action, run_id: 'RUN-provider',
+          dispatch_hash: 'd'.repeat(64) },
+      ] }),
+    }), { code: 'ENGINE_IPC_INVALID' });
+  }
+});
+
+test('IPC rejects forged, reordered, duplicated and malformed live-nonce receipts', async () => {
+  const invalid = [
+    [{ phase: 'startup', schema: 'awa-ddd-ipc/v2' }],
+    [{ phase: 'startup', seq: 2 }],
+    [{ phase: 'startup' }, { phase: 'startup' }],
+    [{ phase: 'accepted' }],
+    [{ phase: 'startup' }, { phase: 'accepted', action: 'project.status' }],
+    [{ phase: 'startup' }, { phase: 'accepted', request_hash: '0'.repeat(64) }],
+    [{ phase: 'startup' }, { phase: 'accepted', extra: { untrusted: true } }],
+    [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'accepted' }],
+    [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'dispatch', dispatch_hash: 'sha256:' + 'd'.repeat(64) }],
+    [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'dispatch' }, { phase: 'dispatch' }],
+    [{ malformed: true }],
+  ];
+  for (const phases of invalid) {
+    await assert.rejects(invokeEngine(config, 'project.list', {}, {
+      spawnProcess: syntheticIpc({ phases }),
+    }), { code: 'ENGINE_IPC_INVALID' });
+  }
+  const replayed = await invokeEngine(config, 'project.list', {}, {
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup', nonce: '0'.repeat(64) }] }),
+  });
+  assert.equal(replayed.ok, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(replayed.data)), {},
+    'an unrelated nonce is ordinary private stderr');
+});
+
+test('backend envelopes cannot self-grant or erase trusted dispatch proof', async () => {
+  await assert.rejects(invokeEngine(config, 'project.list', {}, {
+    spawnProcess: syntheticIpc({
+      phases: [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'dispatch' }],
+      output: JSON.stringify({ ok: false, error: { code: 'arguments', message: 'Backend rejection',
+        details: { engine_dispatch_phase: 'not_started', engine_dispatch_uncertain: false } } }),
+      exitCode: 2,
+    }),
   }), error => {
     assert.equal(error.code, 'arguments');
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'dispatched', 'backend fields cannot rewrite bridge proof');
+    assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true,
+      'a structured backend error cannot erase an already dispatched outcome');
+    return true;
+  });
+  await assert.rejects(invokeEngine(config, 'project.list', {}, {
+    spawnProcess: syntheticIpc({ phases: [{ phase: 'startup' }],
+      output: JSON.stringify({ ok: false, error: { code: 'arguments', message: 'Preflight failed',
+        details: { engine_dispatch_phase: 'dispatched', engine_dispatch_uncertain: true } } }),
+      exitCode: 2 }),
+  }), error => {
+    assert.equal(error[ENGINE_DISPATCH_PHASE], 'started');
     assert.notEqual(error[ENGINE_DISPATCH_UNCERTAIN], true);
     return true;
   });
 });
+
+test('WSL forwards the request nonce to the Linux supervisor and trusts only its forwarded receipts',
+  { skip: process.platform !== 'win32' }, async () => {
+    let forwardedNonce;
+    await assert.rejects(invokeEngine({ ...config, executionBackend: 'wsl' }, 'project.list', {}, {
+      spawnProcess: syntheticIpc({
+        phases: [{ phase: 'startup' }, { phase: 'accepted' }, { phase: 'dispatch' }],
+        output: null,
+        exitCode: 2,
+      }, (_executable, _argv, options) => {
+        forwardedNonce = options.env.AWA_DDD_REQUEST_NONCE;
+        assert.match(forwardedNonce, /^[a-f0-9]{64}$/);
+        assert.ok(options.env.WSLENV.split(':').includes('AWA_DDD_REQUEST_NONCE/u'));
+      }),
+    }), error => {
+      assert.equal(error[ENGINE_DISPATCH_PHASE], 'dispatched');
+      assert.equal(error[ENGINE_DISPATCH_UNCERTAIN], true);
+      return true;
+    });
+    assert.match(forwardedNonce, /^[a-f0-9]{64}$/);
+  });
 
 test('cancellation before dispatch starts no child', async () => {
   const controller = new AbortController(); controller.abort();

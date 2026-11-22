@@ -1,6 +1,6 @@
 # AWA-DDD 2.0 架构
 
-版本：2.0.0。设计输入：`awa-ddd-2.0-refactor-plan.md`（0.13）与 `awa-ddd-2.0-plan-review.md`（21 项评审）。本文件描述实际实现，不把方向稿当成已完成事实。
+设计基线：2.0.0；当前实现：2.4.0。设计输入：`awa-ddd-2.0-refactor-plan.md`（0.13）与 `awa-ddd-2.0-plan-review.md`（21 项评审）。本文件描述实际实现；2.4.0 证明、fixture、Universe 与运行时加固见 [加固说明](UPGRADE-20261122-HARDENING.md)，历史回归与发行采用条件见 [升级说明](UPGRADE-20261121-SOURCE-LEDGER.md#验证状态)。
 
 ## 1. 主线
 
@@ -18,7 +18,7 @@ Campaign
 
 ## 2. 为什么这样分层
 
-- **Universe 不是全站真值**：`source_completeness` 只声明来源清点等级；没有 `complete_snapshot` 时，`site_wide_discovery_allowed=false`，所有发现率都只对“已知分母”负责。`unknown_counts` 与 `unresolved/truncated` 永久可见。
+- **Universe 不是全站真值**：`source_completeness` 只声明来源清点等级；即使为 `complete_snapshot`，也不自动获得全站发现权限，`site_wide_discovery_allowed` 默认保持 false。所有发现率都只对“已知分母”负责，`unknown_counts` 与 `unresolved/truncated` 永久可见；Universe 增量推进会失效旧 checkpoint/frontier/final authority。
 - **Hypothesis 身份不是 statement**：身份键 = `family/security_property + operation/protocol + input location/selector/schema_branch + actor/resource relation + business precondition + scope_epoch + target_build + source_kind`。改措辞不加新任务，改机制/输入/角色关系才产生新身份。
 - **TestRecipe 冻结**：`spec_hash` 覆盖 provider/version、operation signature、scope epoch、session generation、resource/fixture revision、oracle ID/version、全部控制与私有 manifest。`test.run` 只接受声明过的 caller data 变量；URL 路径、方法、身份、资源、fixture、oracle、expected 和 provider 不可覆盖。
 - **durable run**：`prepared → claimed → dispatch_started → response_saved → evaluation_pending → evaluated → published`；写请求在 dispatch 后失联进入 `effect_unknown`，保留 `run_id/evidence_ids`，绝不自动重放。
@@ -31,9 +31,9 @@ Campaign
 |---|---|---|
 | 领域 | `awa_ddd/domain/` | universe/hypothesis/test_recipe/test_run/finding/coverage_claim/known_case/gap/review/campaign；`repository.py` 提供同库文档与索引 |
 | 规划 | `awa_ddd/planning/` | `route_parser` 静态路由解析；`known_cases` 三轨导入；`hypotheses` 12 族/字段语义/needs_consumer；`scheduler` 公平轮转/attempt 冷却/lease；`coverage` 五维矩阵；`campaign` 生命周期；`migration` legacy 投影 |
-| 执行 | `awa_ddd/execution/` | `recipe_builder`、`test_runner`、`oracle_profiles`、`review_engine`、`fixtures`、`capabilities`、`browser_provider`、`external_provider` |
+| 执行 | `awa_ddd/execution/` | `recipe_builder`、`test_runner`、`oracle_profiles`、`review_engine`、`fixtures`、`fixture_api`、`capabilities`、`browser_provider`、`external_provider` |
 | 报告 | `awa_ddd/reporting/` | `matrix.py` 五维矩阵/中文报告；`__init__.py` 兼容旧 `reporting.py` 全部导出（原文件保留为 `reporting_legacy.py`） |
-| 工具面 | `awa_ddd/v2api.py` + `contracts.py` | v2 动作 dispatch；旧 63 动作保留 |
+| 工具面 | `awa_ddd/v2api.py` + `contracts.py` | v2 动作 dispatch；V1 75 个动作保留 |
 | Node | `src/actions.mjs`、`src/tools.mjs` | `assessmentModel:v1` 注册 10 组旧工具；`assessmentModel:v2` 注册 6 组 v2 工具 |
 
 ## 4. 工具面
@@ -42,14 +42,14 @@ v2 模式（`assessmentModel: "v2"`）注册六组：
 
 | 工具 | 动作 |
 |---|---|
-| `awa_campaign` | `campaign.start/status/next/checkpoint/finish/migrate/rollback` |
+| `awa_campaign` | `campaign.start/status/next/checkpoint/review_frontier/finish/migrate/rollback` |
 | `awa_recon` | `recon.snapshot/import/routes/hypotheses/capabilities` |
-| `awa_test` | `test.run/run_browser/run_scenario/run_external/record_external/inspect` |
+| `awa_test` | `test.run/run_browser/run_scenario/run_external/record_external/inspect`、`test.fixture_create/verify/lease/inspect/readback/cleanup`、`execution.reconcile` |
 | `awa_review` | `review.evidence/finding/bind/disposition` |
-| `awa_report` | `report.matrix/build/compare` |
+| `awa_report` | `report.matrix/build/compare/artifact` |
 | `awa_admin` | 旧 project/identity/resource/help 动作 |
 
-默认 `v1` 保持原 10 组 63 动作。v2 动作在 Python `ALL_CONTRACTS` 校验；`action.help` 默认返回 v1 目录，`action.help {catalog:"v2"}` 返回六组目录。旧项目不需要重新创建。
+默认 `v1` 提供 10 组 75 个动作；v2 为六组 48 个动作，与 V1 共享 17 个，并集 106 个。v2 动作在 Python `ALL_CONTRACTS` 校验；`action.help` 默认返回 v1 目录，`action.help {catalog:"v2"}` 返回六组目录。旧项目不需要重新创建。
 
 ## 5. Proof profile（对 R01 的落地）
 
@@ -67,11 +67,11 @@ v2 模式（`assessmentModel: "v2"`）注册六组：
 - **Hypothesis**：`unplanned → ready → running → supported|refuted|inconclusive|blocked`；`not_applicable` 必须有业务事实依据；`blocked` 必须有具体 `missing_context`。`inconclusive` 可由结构化人工复核升级为 `supported`（仍不是 machine proof）。
 - **Finding**：machine_confirmed / reviewed_confirmed / rejected / withdrawn；`current` 与 lifecycle 追加，不重写旧证据。
 - **CoverageClaim**：引擎计算；依赖 universe snapshot hash、recipe spec、oracle version、evidence digest 与 target build。任何输入变化后旧 claim 不能沿用。
-- **Campaign**：`partial_accepted` 是交付，不是耗尽；`completed` 要求零 remaining hypothesis/family/route/gap 且当前 checkpoint。
+- **Campaign**：`partial_accepted` 是交付，不是耗尽；`completed` 要求零 remaining hypothesis/family/route/gap、两个语义不同的 current FrontierReceipt 和包含它们的当前 checkpoint。`campaign.review_frontier` 提供公开构造路径，finish 使用门控原始 revision 防双交付。
 
 ## 7. 安全边界
 
-- 目标写入必须同时满足：项目 `allow_mutation`、campaign `allow_mutation`、recipe `effect:test_resource_write`、`max_writes:1`、冻结 fixture revision、fixture verified/leased 状态和 worker lease。
+- 目标写入必须同时满足：项目 `allow_mutation`、campaign `allow_mutation`、recipe `effect:test_resource_write`、`max_writes:1`、冻结 fixture revision、同一 worker 的有效 fixture lease 和 fence。自动写配方只派发单次 attack，normal/negative 明确未分派；fixture readback/cleanup 必须由真实 evidence 驱动。
 - 外部工具输出（Yakit/TscanPlus/sqlmap/local script）只进入 unverified candidate/receipt，不直接成为 Finding；`record_external` 保存来源与 digest，标记 `unverified_external`。
 - 浏览器导入的 MCP JSON 不绑定 session/actor；authenticated XSS 需要本地真实 visit + application-triggered dialog + 真实消费页。
 - 私有 recipe capsule 不进入公开投影；公开投影只含控制 ID、request locator hash、oracle ID/version、limits 和 private_ref。原始凭据由 `identity.session` 私有上下文提供。

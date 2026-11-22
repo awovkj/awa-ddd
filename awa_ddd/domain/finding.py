@@ -11,7 +11,8 @@ SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
 def new_finding(*, hypothesis_id, run_id=None, review_id=None, mode, severity, title,
                 category, impact, remediation, evidence_ids, proof_scope,
-                confidence=None, limitations=None, decision_id=None, legacy_unlinked=False):
+                confidence=None, limitations=None, decision_id=None, legacy_unlinked=False,
+                campaign_id=None, proof_receipt_id=None):
     enum(mode, "finding_mode", MODES)
     enum(severity, "finding_severity", SEVERITIES)
     title = text(title, "title", maximum=512)
@@ -27,15 +28,18 @@ def new_finding(*, hypothesis_id, run_id=None, review_id=None, mode, severity, t
         from .common import fail
         fail("v2_finding_review", "reviewed finding requires an accepted review contract")
     status = "machine_confirmed" if mode == "machine" else "reviewed_confirmed"
-    identity = {"hypothesis": hypothesis_id, "run": run_id, "review": review_id,
+    identity = {"campaign": campaign_id, "hypothesis": hypothesis_id, "run": run_id,
+                "review": review_id, "proof_receipt": proof_receipt_id,
                 "title": title, "category": category}
     return {
         "id": stable_id("FND", identity),
         "schema": 2,
+        "campaign_id": optional_text(campaign_id, "campaign_id", maximum=128),
         "hypothesis_id": text(hypothesis_id, "hypothesis_id", maximum=128),
         "run_id": optional_text(run_id, "run_id", maximum=128),
         "test_run_id": optional_text(run_id, "test_run_id", maximum=128),
         "review_id": optional_text(review_id, "review_id", maximum=128),
+        "proof_receipt_id": optional_text(proof_receipt_id, "proof_receipt_id", maximum=128),
         "decision_id": optional_text(decision_id, "decision_id", maximum=128),
         "mode": mode,
         "status": status,
